@@ -22,6 +22,24 @@ use rlx_core::weight_loader::GgufLoader;
 use rlx_qwen3::sampling::{SampleOpts, sample_token};
 
 /// How many vocab rows to score for sampling (partial LM head).
+/// Rotate a single hidden row into the LM head's basis.
+///
+/// Ternary Bonsai 2 stores `output.weight` Hadamard-folded, so these
+/// host paths must apply the same activation transform the graph
+/// builder does. Uses the butterfly rather than the `[block, block]`
+/// matmul — it is one row, and this runs per decoded token.
+///
+/// Returns `hidden` untouched for every other checkpoint.
+fn lm_head_input<'a>(weights: &Qwen35Weights, hidden: &'a [f32]) -> std::borrow::Cow<'a, [f32]> {
+    let Some(fold) = weights.output_fold.as_ref() else {
+        return std::borrow::Cow::Borrowed(hidden);
+    };
+    let mut v = hidden.to_vec();
+    let width = v.len();
+    crate::prism_hadamard::apply_activation_transform(&mut v, width, fold);
+    std::borrow::Cow::Owned(v)
+}
+
 pub fn sample_lm_cap(opts: &SampleOpts, n_vocab: usize) -> usize {
     if opts.greedy {
         return 1;
@@ -50,6 +68,9 @@ fn lm_topk(
             hidden.len()
         ));
     }
+
+    let hidden = lm_head_input(weights, hidden);
+    let hidden = hidden.as_ref();
 
     match &weights.output {
         Some(MatWeight::F32(data)) => Ok(rlx_cpu::lm_head::f32_tied_lm_topk(
@@ -91,7 +112,7 @@ fn lm_topk(
             )),
             None => Ok(rlx_cpu::lm_head::f32_tied_lm_topk(
                 hidden,
-                &weights.token_embd,
+                weights.token_embd(),
                 n_embd,
                 n_vocab,
                 cap,
@@ -115,6 +136,9 @@ pub fn greedy_lm_head_argmax(
             hidden.len()
         ));
     }
+
+    let hidden = lm_head_input(weights, hidden);
+    let hidden = hidden.as_ref();
 
     match &weights.output {
         Some(MatWeight::F32(data)) => {
@@ -160,7 +184,7 @@ pub fn greedy_lm_head_argmax(
             None => {
                 let (idx, val) = rlx_cpu::lm_head::f32_tied_lm_argmax(
                     hidden,
-                    &weights.token_embd,
+                    weights.token_embd(),
                     n_embd,
                     n_vocab,
                 );
@@ -216,6 +240,9 @@ pub fn lm_head_logits_row(
     }
     let mut logits = vec![0f32; n_vocab];
 
+    let hidden = lm_head_input(weights, hidden);
+    let hidden = hidden.as_ref();
+
     match &weights.output {
         Some(MatWeight::F32(data)) => {
             matmul_row(hidden, data, n_embd, n_vocab, &mut logits);
@@ -256,7 +283,7 @@ pub fn lm_head_logits_row(
             Some(MatWeight::F32(data)) => {
                 matmul_row(hidden, data, n_embd, n_vocab, &mut logits);
             }
-            None => matmul_row(hidden, &weights.token_embd, n_embd, n_vocab, &mut logits),
+            None => matmul_row(hidden, weights.token_embd(), n_embd, n_vocab, &mut logits),
         },
     }
     Ok(logits)

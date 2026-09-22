@@ -1,0 +1,35 @@
+[package]
+name = "rlx-dsv41"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "DeepSeek-V4.1-Flash CLI — CSA2 attention, Engram n-gram memory, hyper-connections, paged MoE"
+keywords = ["deepseek", "llm", "moe", "inference"]
+categories = ["science"]
+
+[dependencies]
+anyhow = { workspace = true }
+rlx-cli = { workspace = true }
+rlx-core = { workspace = true, features = ["tokenizer"] }
+rlx-runtime = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[features]
+default = []
+metal = ["rlx-core/metal", "rlx-runtime/metal"]
+mlx = ["rlx-core/mlx", "rlx-runtime/mlx"]
+cuda = ["rlx-core/cuda", "rlx-runtime/cuda"]
+rocm = ["rlx-core/rocm", "rlx-runtime/rocm"]
+gpu = ["rlx-core/gpu", "rlx-runtime/gpu"]
+
+[[bin]]
+name = "rlx-dsv41"
+path = "src/bin/rlx_dsv41.rs"
+
+[lints]
+workspace = true

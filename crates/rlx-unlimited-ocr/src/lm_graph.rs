@@ -81,6 +81,10 @@ struct LayerSpec {
     moe_intermediate_size: usize,
     n_shared_experts: usize,
     keep_packed: bool,
+    /// Decode only: attention reads an explicit `[batch, past_seq + 1]` binary
+    /// keep-mask (`MaskKind::Custom`) instead of `MaskKind::Causal`, so one
+    /// compiled graph serves every position in a KV bucket.
+    custom_mask: bool,
     pack: Option<Arc<PackedLmWeights>>,
     typed: TypedParamSink,
 }
@@ -97,7 +101,7 @@ pub fn build_unlimited_ocr_prefill_built(
     batch: usize,
     seq: usize,
 ) -> Result<BuiltModel> {
-    build_prefill_inner(cfg, weights, None, batch, seq)
+    build_prefill_inner(cfg, weights, None, batch, seq, false)
 }
 
 /// Prefill using a host pack — keeps Q8_0/Q4_0 in IR when applicable.
@@ -107,21 +111,38 @@ pub fn build_unlimited_ocr_prefill_built_from_pack(
     batch: usize,
     seq: usize,
 ) -> Result<BuiltModel> {
+    build_unlimited_ocr_prefill_built_from_pack_ext(cfg, pack, batch, seq, false)
+}
+
+/// [`build_unlimited_ocr_prefill_built_from_pack`] that also publishes the
+/// post-final-norm hidden state as a trailing side output (after the KV taps).
+///
+/// FastMTP's draft head consumes exactly that tensor, so tapping it here lets a
+/// speculative loop seed itself from the target's own forward.
+pub fn build_unlimited_ocr_prefill_built_from_pack_ext(
+    cfg: &UnlimitedOcrConfig,
+    pack: &Arc<PackedLmWeights>,
+    batch: usize,
+    seq: usize,
+    with_hidden: bool,
+) -> Result<BuiltModel> {
     let mut loader = pack.loader();
     let pack_opt = if pack.keeps_quants_in_ir() {
         Some(Arc::clone(pack))
     } else {
         None
     };
-    build_prefill_inner(cfg, &mut loader, pack_opt, batch, seq)
+    build_prefill_inner(cfg, &mut loader, pack_opt, batch, seq, with_hidden)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_prefill_inner(
     cfg: &UnlimitedOcrConfig,
     weights: &mut dyn WeightLoader,
     pack: Option<Arc<PackedLmWeights>>,
     batch: usize,
     seq: usize,
+    with_hidden: bool,
 ) -> Result<BuiltModel> {
     cfg.validate().context("unlimited-ocr prefill config")?;
     validate_heads(cfg)?;
@@ -147,6 +168,8 @@ fn build_prefill_inner(
     let (cos_data, sin_data) = nn::rope_tables(cfg.max_position_embeddings, dh, cfg.rope_theta);
 
     let kv_sink = SideOutputs::new();
+    // Same sink, so the hidden lands after the KV taps in the output list.
+    let hidden_sink = with_hidden.then(|| kv_sink.clone());
 
     let mut flow = ModelFlow::new("unlimited_ocr_prefill")
         .with_profile(profile)
@@ -169,6 +192,7 @@ fn build_prefill_inner(
             eps,
             hidden_shape.clone(),
             keep_packed,
+            false,
             pack.clone(),
             typed.clone(),
         );
@@ -183,7 +207,8 @@ fn build_prefill_inner(
     let pack_head = pack.clone();
     let vocab = cfg.vocab_size;
     let mut built = if keep_packed {
-        flow.gather_last_token_at(batch, seq)
+        maybe_tap(flow, &hidden_sink)
+            .gather_last_token_at(batch, seq)
             .final_norm(eps)
             .plugin_named("unlimited_ocr.lm_head", move |emit, hidden| {
                 emit_lm_head(
@@ -199,7 +224,8 @@ fn build_prefill_inner(
             .build(&mut WeightLoaderSource(weights))?
             .with_extra_hir_outputs(kv_sink.drain())
     } else {
-        flow.gather_last_token_at(batch, seq)
+        maybe_tap(flow, &hidden_sink)
+            .gather_last_token_at(batch, seq)
             .final_norm(eps)
             .raw_stage(FlowStage::LmHead(LmHeadStage::separate(
                 "lm_head.weight",
@@ -222,7 +248,28 @@ pub fn build_unlimited_ocr_decode_built(
     batch: usize,
     past_seq: usize,
 ) -> Result<BuiltModel> {
-    build_decode_inner(cfg, weights, None, batch, past_seq)
+    build_unlimited_ocr_decode_built_ext(cfg, weights, batch, past_seq, false)
+}
+
+/// [`build_unlimited_ocr_decode_built`] with the explicit `mask` input — see
+/// [`build_unlimited_ocr_decode_built_from_pack_ext`].
+pub fn build_unlimited_ocr_decode_built_ext(
+    cfg: &UnlimitedOcrConfig,
+    weights: &mut dyn WeightLoader,
+    batch: usize,
+    past_seq: usize,
+    use_custom_mask: bool,
+) -> Result<BuiltModel> {
+    build_decode_inner(
+        cfg,
+        weights,
+        None,
+        batch,
+        past_seq,
+        1,
+        use_custom_mask,
+        false,
+    )
 }
 
 /// Decode using a host pack — keeps Q8_0/Q4_0 in IR when applicable.
@@ -232,23 +279,111 @@ pub fn build_unlimited_ocr_decode_built_from_pack(
     batch: usize,
     past_seq: usize,
 ) -> Result<BuiltModel> {
+    build_unlimited_ocr_decode_built_from_pack_ext(cfg, pack, batch, past_seq, false)
+}
+
+/// [`build_unlimited_ocr_decode_built_from_pack`] with an explicit key mask.
+///
+/// With `use_custom_mask = true` the graph gains a `mask` input of shape
+/// `[batch, past_seq + 1]` (`1.0` = attend, `0.0` = ignore) driving
+/// `MaskKind::Custom` attention instead of `MaskKind::Causal`. `past_seq` then
+/// means *cache capacity*, not history length: the caller pads `past_k_*` /
+/// `past_v_*` up to the bucket and zeroes the mask over the padding, so one
+/// compiled graph serves every decode position inside the bucket.
+///
+/// Required by checkpoints with no sliding window (`sliding_window == 0`,
+/// e.g. `jinaai/jina-ocr-v1`), where the exact-shape `MaskKind::Causal` graph
+/// would otherwise have to be recompiled for every single generated token.
+pub fn build_unlimited_ocr_decode_built_from_pack_ext(
+    cfg: &UnlimitedOcrConfig,
+    pack: &Arc<PackedLmWeights>,
+    batch: usize,
+    past_seq: usize,
+    use_custom_mask: bool,
+) -> Result<BuiltModel> {
+    build_unlimited_ocr_decode_built_from_pack_ext2(
+        cfg,
+        pack,
+        batch,
+        past_seq,
+        use_custom_mask,
+        false,
+    )
+}
+
+/// [`build_unlimited_ocr_decode_built_from_pack_ext`] that also publishes the
+/// post-final-norm hidden state as a trailing side output.
+pub fn build_unlimited_ocr_decode_built_from_pack_ext2(
+    cfg: &UnlimitedOcrConfig,
+    pack: &Arc<PackedLmWeights>,
+    batch: usize,
+    past_seq: usize,
+    use_custom_mask: bool,
+    with_hidden: bool,
+) -> Result<BuiltModel> {
+    build_unlimited_ocr_decode_chunk_built(
+        cfg,
+        pack,
+        batch,
+        past_seq,
+        1,
+        use_custom_mask,
+        with_hidden,
+    )
+}
+
+/// Decode `seq` tokens at once against a `past_seq`-row cache.
+///
+/// `seq == 1` is ordinary decode. `seq > 1` is the speculative *verify* pass:
+/// the target scores a whole draft in one forward, which is what makes
+/// speculative decoding cheaper than running those tokens one at a time.
+/// Requires `use_custom_mask`, because a chunk needs the additive per-query
+/// bias — causality inside the chunk cannot be expressed as a key-padding mask.
+#[allow(clippy::too_many_arguments)]
+pub fn build_unlimited_ocr_decode_chunk_built(
+    cfg: &UnlimitedOcrConfig,
+    pack: &Arc<PackedLmWeights>,
+    batch: usize,
+    past_seq: usize,
+    seq: usize,
+    use_custom_mask: bool,
+    with_hidden: bool,
+) -> Result<BuiltModel> {
+    ensure!(
+        seq == 1 || use_custom_mask,
+        "multi-token decode needs the explicit mask (seq={seq})"
+    );
     let mut loader = pack.loader();
     let pack_opt = if pack.keeps_quants_in_ir() {
         Some(Arc::clone(pack))
     } else {
         None
     };
-    build_decode_inner(cfg, &mut loader, pack_opt, batch, past_seq)
+    build_decode_inner(
+        cfg,
+        &mut loader,
+        pack_opt,
+        batch,
+        past_seq,
+        seq,
+        use_custom_mask,
+        with_hidden,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_decode_inner(
     cfg: &UnlimitedOcrConfig,
     weights: &mut dyn WeightLoader,
     pack: Option<Arc<PackedLmWeights>>,
     batch: usize,
     past_seq: usize,
+    seq: usize,
+    use_custom_mask: bool,
+    with_hidden: bool,
 ) -> Result<BuiltModel> {
     cfg.validate().context("unlimited-ocr decode config")?;
+    ensure!(seq >= 1, "decode seq must be >= 1");
     validate_heads(cfg)?;
 
     let keep_packed = pack.is_some();
@@ -267,16 +402,34 @@ fn build_decode_inner(
     let kv_dim = cfg.num_key_value_heads * dh;
     let typed = TypedParamSink::new();
 
-    let hidden_shape = Shape::new(&[batch, 1, h], f);
+    let hidden_shape = Shape::new(&[batch, seq, h], f);
     let past_kv_shape = Shape::new(&[batch, past_seq, kv_dim], f);
 
     let kv_sink = SideOutputs::new();
+    let hidden_sink = with_hidden.then(|| kv_sink.clone());
 
     let mut flow = ModelFlow::new("unlimited_ocr_decode")
         .with_profile(profile)
         .input("inputs_embeds", hidden_shape.clone())
-        .input("rope_cos", Shape::new(&[1, half], f))
-        .input("rope_sin", Shape::new(&[1, half], f));
+        .input("rope_cos", Shape::new(&[seq, half], f))
+        .input("rope_sin", Shape::new(&[seq, half], f));
+
+    if use_custom_mask {
+        if seq == 1 {
+            // `[batch, past_seq + 1]` binary keep-mask over (padded past, new
+            // token). A single query needs no per-query structure.
+            flow = flow.input("mask", Shape::new(&[batch, past_seq + 1], f));
+        } else {
+            // A chunk of `seq` queries needs BOTH the padding mask and
+            // causality *within* the chunk, which a `[batch, key_len]`
+            // key-padding mask cannot express. Additive bias instead:
+            // `[batch, heads, seq, past_seq + seq]`, `0` visible / `-inf` not.
+            flow = flow.input(
+                "mask",
+                Shape::new(&[batch, cfg.num_attention_heads, seq, past_seq + seq], f),
+            );
+        }
+    }
 
     for layer_idx in 0..cfg.num_hidden_layers {
         flow = flow
@@ -285,7 +438,7 @@ fn build_decode_inner(
     }
 
     flow = flow
-        .bind_decode_inputs(cfg.num_hidden_layers, false, true)
+        .bind_decode_inputs(cfg.num_hidden_layers, use_custom_mask, true)
         .zero_beta_named("zero_beta", h)
         .zero_beta_named("zero_beta.head", dh);
 
@@ -294,10 +447,11 @@ fn build_decode_inner(
             cfg,
             layer_idx,
             batch,
-            1,
+            seq,
             eps,
             hidden_shape.clone(),
             keep_packed,
+            use_custom_mask,
             pack.clone(),
             typed.clone(),
         );
@@ -312,7 +466,8 @@ fn build_decode_inner(
     let pack_head = pack.clone();
     let vocab = cfg.vocab_size;
     let mut built = if keep_packed {
-        flow.final_norm(eps)
+        maybe_tap(flow, &hidden_sink)
+            .final_norm(eps)
             .plugin_named("unlimited_ocr.lm_head", move |emit, hidden| {
                 emit_lm_head(
                     emit,
@@ -327,7 +482,8 @@ fn build_decode_inner(
             .build(&mut WeightLoaderSource(weights))?
             .with_extra_hir_outputs(kv_sink.drain())
     } else {
-        flow.final_norm(eps)
+        maybe_tap(flow, &hidden_sink)
+            .final_norm(eps)
             .raw_stage(FlowStage::LmHead(LmHeadStage::separate(
                 "lm_head.weight",
                 cfg.vocab_size,
@@ -358,6 +514,7 @@ pub fn compute_rope_slice(cfg: &UnlimitedOcrConfig, pos: usize) -> (Vec<f32>, Ve
     (cos, sin)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn layer_spec(
     cfg: &UnlimitedOcrConfig,
     layer_idx: usize,
@@ -366,6 +523,7 @@ fn layer_spec(
     eps: f32,
     hidden_shape: Shape,
     keep_packed: bool,
+    custom_mask: bool,
     pack: Option<Arc<PackedLmWeights>>,
     typed: TypedParamSink,
 ) -> LayerSpec {
@@ -386,6 +544,7 @@ fn layer_spec(
         moe_intermediate_size: cfg.moe_intermediate_size,
         n_shared_experts: cfg.n_shared_experts.max(1),
         keep_packed,
+        custom_mask,
         pack,
         typed,
     }
@@ -476,6 +635,42 @@ fn emit_grouped_proj(
             out_shape,
         ),
     }
+}
+
+/// [`tap_hidden`] when a sink is present, otherwise the flow unchanged.
+fn maybe_tap(flow: ModelFlow, sink: &Option<SideOutputs>) -> ModelFlow {
+    match sink {
+        Some(s) => tap_hidden(flow, s),
+        None => flow,
+    }
+}
+
+/// Publish the **pre**-final-norm hidden state as a side output, passing it
+/// through unchanged.
+///
+/// Every position, not just the last: the draft head is a transformer layer
+/// with its own KV cache, and it has to run over the prompt before it can
+/// propose anything with context behind it. Prefill taps before the
+/// last-token gather for that reason, so the side output is `[batch, seq,
+/// hidden]` and callers that only want the final row slice it off.
+///
+/// Pre-norm, not post-norm, because that is what the draft head consumes:
+/// `DeepseekV2Model.forward` keeps `pre_norm_hidden_states = hidden_states`
+/// *before* `self.norm(...)` and hands that to FastMTP, which applies its own
+/// `hnorm` to it. Feeding the post-norm tensor instead is not a crash — the
+/// draft head still emits valid tokens — it just makes them bad ones, which
+/// shows up only as a low acceptance rate.
+///
+/// A stage rather than a hook inside the LM head, because the head has two
+/// lowerings — a plugin for packed quants and a raw `FlowStage::LmHead` for
+/// F32/F16 — and the tap must not depend on which precision is in play.
+fn tap_hidden(flow: ModelFlow, sink: &SideOutputs) -> ModelFlow {
+    let sink = sink.clone();
+    flow.plugin_named("unlimited_ocr.hidden_tap", move |_emit, hidden| {
+        let h = hidden.ok_or_else(|| anyhow::anyhow!("hidden tap requires hidden"))?;
+        sink.inner().lock().expect("hidden sink").push(h.hir_id());
+        Ok(Some(h))
+    })
 }
 
 fn emit_lm_head(
@@ -671,6 +866,14 @@ fn run_layer(
     let k = emit_proj(&mut gb, normed_in, &k_w, kv_out.clone());
     let v = emit_proj(&mut gb, normed_in, &v_w, kv_out);
 
+    // `MaskKind::Custom` reads the keep-mask as a 4th attention input; captured
+    // before `decode_state` is consumed below.
+    let decode_mask = if spec.custom_mask {
+        decode_state.as_ref().and_then(|d| d.mask)
+    } else {
+        None
+    };
+
     let (q_rope, k_for_cache, v_for_cache) = if let Some(decode) = decode_state {
         let past_k = decode.past_k[spec.layer_idx];
         let past_v = decode.past_v[spec.layer_idx];
@@ -744,16 +947,24 @@ fn run_layer(
     );
 
     let attn_shape = shape::attention_shape(gb.shape(q_rope));
+    let (mask_kind, attn_inputs) = match decode_mask {
+        // One query: a binary key-padding mask is enough and is the cheaper
+        // kernel. Several: the mask must also be causal *within* the chunk,
+        // which only the additive per-query bias can say.
+        Some(mask) if spec.seq == 1 => (MaskKind::Custom, vec![q_rope, k_rep, v_rep, mask]),
+        Some(mask) => (MaskKind::Bias, vec![q_rope, k_rep, v_rep, mask]),
+        None => (MaskKind::Causal, vec![q_rope, k_rep, v_rep]),
+    };
     let attn = gb.add_node(
         Op::Attention {
             num_heads: spec.num_heads,
             head_dim: spec.head_dim,
             v_head_dim: None,
-            mask_kind: MaskKind::Causal,
+            mask_kind,
             score_scale: None,
             attn_logit_softcap: None,
         },
-        vec![q_rope, k_rep, v_rep],
+        attn_inputs,
         attn_shape,
     );
     let attn_out = emit_proj(
@@ -853,7 +1064,19 @@ fn build_moe_ffn(
         vec![probs],
         Shape::new(&[rows, top_k], DType::F32),
     );
-    let top_probs_2d = g.gather_(probs, top_idx_2d, 1);
+    // Per-row `take_along_axis`, i.e. `probs[r, top_idx[r, k]]` — NOT
+    // `gather_`, which is ONNX Gather and applies every row's index list to
+    // every row: `[rows, experts]` x `[rows, k]` comes back `[rows, rows, k]`.
+    // The following `narrow` + `reshape([rows, 1])` then silently reinterpreted
+    // a `rows*k` buffer as `rows`, so each token was weighted by an arbitrary
+    // other token's routing probability. The expert *indices* were right, so
+    // every MoE layer stayed finite and plausible while drifting further from
+    // the reference at each layer.
+    let top_probs_2d = g.add_node(
+        Op::GatherElements { axis: 1 },
+        vec![probs, top_idx_2d],
+        Shape::new(&[rows, top_k], DType::F32),
+    );
 
     let mut moe_acc: Option<HirNodeId> = None;
     for ki in 0..top_k {

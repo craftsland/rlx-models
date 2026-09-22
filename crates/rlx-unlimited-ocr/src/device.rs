@@ -37,10 +37,24 @@ pub fn resolve_device(name: Option<&str>) -> Result<Device> {
     if label.eq_ignore_ascii_case("auto") {
         let device = pick_auto_device();
         if device == Device::Cpu {
+            // Names the running binary, not this crate: derivatives such as
+            // `rlx-jina-ocr` reuse this resolver, and pointing them at
+            // `--features metal` on the *wrong* package is advice that does
+            // not work.
+            let pkg = env!("CARGO_CRATE_NAME");
+            let bin = std::env::args()
+                .next()
+                .and_then(|a| {
+                    std::path::Path::new(&a)
+                        .file_name()
+                        .map(|f| f.to_string_lossy().into_owned())
+                })
+                .unwrap_or_else(|| pkg.replace('_', "-"));
             eprintln!(
-                "[rlx-unlimited-ocr] auto → Cpu (no GPU backend in this binary). \
-                 On Apple Silicon: `just features=metal unlimited-ocr -- …` or \
-                 `cargo build -p rlx-unlimited-ocr --features metal`"
+                "[{bin}] auto → Cpu (no GPU backend in this binary). \
+                 On Apple Silicon: `cargo build -p {bin} --features metal` \
+                 (or `just features=metal {}`)",
+                bin.trim_start_matches("rlx-")
             );
         }
         ensure_backend_ready(device)?;

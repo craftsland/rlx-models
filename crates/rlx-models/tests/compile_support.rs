@@ -129,3 +129,52 @@ pub fn compile_llada2(
 ) -> CompiledGraph {
     compile_with_profile(device, graph, params, &CompileProfile::llada2_diffusion())
 }
+
+/// Largest elementwise difference, relative to the reference's magnitude.
+pub fn max_rel_diff(want: &[f32], got: &[f32]) -> f32 {
+    let scale = want.iter().fold(0f32, |a, v| a.max(v.abs())).max(1e-6);
+    want.iter()
+        .zip(got)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0f32, f32::max)
+        / scale
+}
+
+/// A backend's output must match the CPU reference, not merely be finite.
+///
+/// "All values are finite" is the weakest useful property, and it is what let a
+/// rank-4 RoPE lowering that zeroed almost every element, a MoE router that read
+/// another token's probability, and a host readback that walked a strided buffer
+/// linearly all sit in a green suite — every one of them produced finite,
+/// in-range, plausible numbers. Comparing against CPU costs one extra run of a
+/// tiny graph and catches all three.
+pub fn assert_matches_cpu(backend: &str, cpu: &[f32], dev: &[f32], tol: f32) {
+    assert!(
+        cpu.iter().all(|v| v.is_finite()),
+        "CPU reference itself is not finite"
+    );
+    assert!(
+        dev.iter().all(|v| v.is_finite()),
+        "{backend} produced non-finite output"
+    );
+    assert_eq!(
+        cpu.len(),
+        dev.len(),
+        "{backend} returned {} values, CPU returned {}",
+        dev.len(),
+        cpu.len()
+    );
+    let rel = max_rel_diff(cpu, dev);
+    // Show a few values on failure: "diverges by 1.000000" is the signature of
+    // an all-zero result, which reads very differently from a real numeric
+    // drift and points at a different class of bug.
+    assert!(
+        rel.is_finite() && rel < tol,
+        "{backend} diverges from CPU by {rel:.6} (tolerance {tol})\n  \
+         cpu[..8] = {:?}\n  {backend}[..8] = {:?}\n  \
+         {backend} all-zero: {}",
+        &cpu[..cpu.len().min(8)],
+        &dev[..dev.len().min(8)],
+        dev.iter().all(|v| *v == 0.0),
+    );
+}

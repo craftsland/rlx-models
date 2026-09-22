@@ -95,14 +95,16 @@ pub fn load_qwen35_weights_from_gepard(
         trunk_layers.push(Qwen35TrunkLayer::FullAttn(load_full_attn_layer(st, il)?));
     }
 
-    Ok(Qwen35Weights {
+    // Gepard's backbone is a plain safetensors Qwen3.5 — dense embeddings, no
+    // `prism.hadamard` rotated basis, no packed LM head.
+    Ok(Qwen35Weights::from_dense_parts(
         token_embd,
         output_norm,
-        output: None,
-        token_embd_lm: None,
+        None,
+        None,
         trunk_layers,
-        mtp_layers: Vec::new(),
-    })
+        Vec::new(),
+    ))
 }
 
 /// Load config + weights from parsed safetensors.

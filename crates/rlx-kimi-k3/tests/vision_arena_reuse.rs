@@ -9,6 +9,7 @@
 use rlx_ir::hir::{HirModule, HirMut};
 use rlx_ir::{DType, Shape};
 use rlx_kimi_k3::vision::{VisionBlockWeights, VisionDims, VisionWeights, build_vision};
+use rlx_runtime::Device;
 use std::collections::HashMap;
 
 fn fill(n: usize, s: u64) -> Vec<f32> {
@@ -62,9 +63,8 @@ fn weights(d: &VisionDims) -> VisionWeights {
 }
 
 /// Build + compile + run the tower on CPU, returning the projected tokens.
-fn run_tower() -> (Vec<f32>, usize) {
+fn run_tower(device: Device) -> (Vec<f32>, usize) {
     use rlx_core::flow_util::{built_from_hir, compile_built};
-    use rlx_runtime::Device;
     let d = dims();
     let w = weights(&d);
     let (l, hid, hd) = (d.seq_len(), d.hidden, d.head_dim);
@@ -76,7 +76,7 @@ fn run_tower() -> (Vec<f32>, usize) {
     let mut p = HashMap::new();
     let out = build_vision(&mut g, &mut p, hh, cos, sin, &w, d).unwrap();
     g.set_outputs(vec![out]);
-    let mut c = compile_built(built_from_hir(hir, p).unwrap(), Device::Cpu).unwrap();
+    let mut c = compile_built(built_from_hir(hir, p).unwrap(), device).unwrap();
     let y = c
         .run(&[
             ("hidden", fill(l * hid, 1).as_slice()),
@@ -89,11 +89,18 @@ fn run_tower() -> (Vec<f32>, usize) {
 }
 
 #[test]
-fn vision_tower_finite_under_arena_reuse() {
-    let (y, expect_len) = run_tower();
-    assert_eq!(y.len(), expect_len, "wrong output length");
-    assert!(
-        y.iter().all(|v| v.is_finite()),
-        "vision output has non-finite values under arena reuse (fused-attn mis-fire regression)"
+fn vision_tower_matches_cpu_under_arena_reuse() {
+    // The regression this guards (a fused-attention mis-fire under arena reuse)
+    // showed up as non-finite values, but a mis-fire that lands on stale arena
+    // bytes is just as likely to be finite and wrong — which only a comparison
+    // against CPU catches.
+    rlx_core::backend_matrix::assert_matches_cpu_on_all(
+        "kimi-k3 vision tower (arena reuse)",
+        2e-3,
+        |device| {
+            let (y, expect_len) = run_tower(device);
+            assert_eq!(y.len(), expect_len, "wrong output length");
+            y
+        },
     );
 }

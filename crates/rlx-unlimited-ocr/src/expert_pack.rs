@@ -175,7 +175,23 @@ impl PackedLmWeights {
         cfg: &UnlimitedOcrConfig,
         requested: LmWeightPrecision,
     ) -> Result<Self> {
-        let resolved = resolve_lm_precision(requested, cfg);
+        Self::from_store_for_device(store, cfg, requested, None)
+    }
+
+    /// [`Self::from_store_with_precision`], but aware of the device the pack
+    /// will run on so a precision that backend cannot execute correctly is
+    /// downgraded instead of silently producing wrong logits. `None` keeps the
+    /// device-agnostic behaviour.
+    pub fn from_store_for_device(
+        store: &UnlimitedOcrWeightStore,
+        cfg: &UnlimitedOcrConfig,
+        requested: LmWeightPrecision,
+        device: Option<rlx_runtime::Device>,
+    ) -> Result<Self> {
+        let resolved = match device {
+            Some(d) => crate::lm_precision::resolve_lm_precision_for_device(requested, cfg, d),
+            None => resolve_lm_precision(requested, cfg),
+        };
         eprintln!(
             "[rlx-unlimited-ocr] {}",
             precision_decision_message(requested, resolved, cfg)

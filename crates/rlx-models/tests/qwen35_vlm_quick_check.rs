@@ -159,22 +159,22 @@ fn synth_lm_weights(cfg: &Qwen35Config) -> Qwen35Weights {
             Qwen35TrunkLayer::Linear(linear_layer(cfg))
         });
     }
-    Qwen35Weights {
-        token_embd: std::sync::Arc::from(ramp(n_vocab * n_embd, 0.001)),
-        output_norm: vec![1.0; n_embd],
-        output: None,
-        token_embd_lm: None,
-        trunk_layers: trunk,
-        mtp_layers: vec![],
-    }
+    // Unfolded LM head and a dense table, matching the other synthetic fixtures.
+    Qwen35Weights::from_dense_parts(
+        std::sync::Arc::from(ramp(n_vocab * n_embd, 0.001)),
+        vec![1.0; n_embd],
+        None,
+        None,
+        trunk,
+        vec![],
+    )
 }
 
 fn fake_tokenizer(text: &str) -> anyhow::Result<Vec<u32>> {
     Ok(text.bytes().map(|b| (b as u32 % 31 + 1).max(1)).collect())
 }
 
-#[test]
-fn qwen35_vlm_hidden_prefill_and_decode_quick_check() {
+fn run_case(device: Device) -> Vec<f32> {
     let mmcfg = tiny_mmproj_cfg();
     let mmweights = MmProjWeights::synthetic(&mmcfg);
     let lmcfg = tiny_lm_cfg();
@@ -183,7 +183,7 @@ fn qwen35_vlm_hidden_prefill_and_decode_quick_check() {
     let mut runner = Qwen35RunnerBuilder::default()
         .inline_weights(lmcfg.clone(), lmweights.clone())
         .inline_mmproj(mmcfg.clone(), mmweights.clone())
-        .device(Device::Cpu)
+        .device(device)
         .max_seq(64)
         .last_logits_only(true)
         .build()
@@ -194,7 +194,7 @@ fn qwen35_vlm_hidden_prefill_and_decode_quick_check() {
     let img_w = 4;
     let img_h = 4;
     let rgb: Vec<u8> = (0..(img_w * img_h * 3)).map(|i| (i % 251) as u8).collect();
-    let mut enc = Qwen35VisionEncoder::from_parts(mmcfg, mmweights, img_w, img_h, Device::Cpu)
+    let mut enc = Qwen35VisionEncoder::from_parts(mmcfg, mmweights, img_w, img_h, device)
         .expect("vision encoder");
     let vision = enc.encode_rgb(&rgb, img_w, img_h).expect("encode");
 
@@ -204,7 +204,7 @@ fn qwen35_vlm_hidden_prefill_and_decode_quick_check() {
         vision: &vision,
     };
     let prefill = mm
-        .assemble(fake_tokenizer, &lmweights.token_embd, lmcfg.hidden_size, 0)
+        .assemble(fake_tokenizer, lmweights.token_embd(), lmcfg.hidden_size, 0)
         .expect("assemble");
     assert!(prefill.mrope_sections.len() == prefill.seq.len());
 
@@ -212,9 +212,22 @@ fn qwen35_vlm_hidden_prefill_and_decode_quick_check() {
         .prefill_from_assembled(prefill)
         .expect("hidden prefill");
     assert_eq!(seed.trunk_logits.len(), lmcfg.vocab_size);
-    assert!(seed.trunk_logits.iter().all(|v| v.is_finite()));
 
     let step = runner.decode_get_logits(3).expect("decode step");
     assert_eq!(step.len(), lmcfg.vocab_size);
-    assert!(step.iter().all(|v| v.is_finite()));
+    seed.trunk_logits.into_iter().chain(step).collect()
+}
+
+/// Every backend must agree with CPU across the whole multimodal path.
+///
+/// Vision encoder *and* LM runner both move to the swept device, and the
+/// prefill and decode logits are concatenated, so a divergence anywhere in
+/// the chain is caught.
+#[test]
+fn qwen35_vlm_hidden_prefill_and_decode_matches_cpu_on_every_backend() {
+    rlx_core::backend_matrix::assert_matches_cpu_on_all(
+        "qwen3.5-VL prefill + decode",
+        2e-3,
+        run_case,
+    );
 }

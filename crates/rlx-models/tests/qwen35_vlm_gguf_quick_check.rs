@@ -153,7 +153,7 @@ fn qwen35_real_gguf_mmproj_assembled_prefill() {
     let prefill = mm
         .assemble(
             |s| Ok(s.bytes().map(|b| (b as u32 % 31 + 1).max(1)).collect()),
-            &w.token_embd,
+            &w.token_embd(),
             cfg.hidden_size,
             0,
         )

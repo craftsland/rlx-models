@@ -465,10 +465,20 @@ impl UnlimitedOcrConfig {
         }
     }
 
+    /// Checkpoint `model_type`s this crate's decoder stack can build.
+    ///
+    /// `unlimited-ocr` and `deepseek_vl_v2` (DeepSeek-OCR and its derivatives,
+    /// e.g. `jinaai/jina-ocr-v1`) ship the same SAM+CLIP DeepEncoder, the same
+    /// linear `2048 -> 1280` projector and the same DeepSeek-V2 MoE decoder
+    /// under identical tensor names; they differ only in config *values*
+    /// (`sliding_window`, `rope_theta`), which [`Self`] already carries.
+    pub const SUPPORTED_MODEL_TYPES: &'static [&'static str] = &["unlimited-ocr", "deepseek_vl_v2"];
+
     pub fn validate(&self) -> Result<()> {
         ensure!(
-            self.model_type == "unlimited-ocr",
-            "model_type must be unlimited-ocr, got {}",
+            Self::SUPPORTED_MODEL_TYPES.contains(&self.model_type.as_str()),
+            "model_type must be one of {:?}, got {}",
+            Self::SUPPORTED_MODEL_TYPES,
             self.model_type
         );
         ensure!(self.num_hidden_layers > 0, "num_hidden_layers");
@@ -494,6 +504,16 @@ impl UnlimitedOcrConfig {
 
     pub fn kv_group_size(&self) -> usize {
         self.num_attention_heads / self.num_key_value_heads
+    }
+
+    /// Width of one cached K/V row.
+    ///
+    /// The graph caches the **pre-repeat** key/value, so this is
+    /// `num_key_value_heads * head_dim` and equals [`Self::hidden_size`] only
+    /// when there is no GQA. Using `hidden_size` as the cache stride mis-sizes
+    /// every cache buffer on a grouped-query checkpoint.
+    pub fn kv_hidden(&self) -> usize {
+        self.num_key_value_heads * self.head_dim()
     }
 
     /// Whether `layer_idx` (0-based) uses the dense (non-MoE) FFN.

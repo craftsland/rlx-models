@@ -9,16 +9,7 @@ use rlx_core::flow_util::compile_built;
 use rlx_core::weight_map::WeightMap;
 use rlx_minimax::m3::config::MiniMaxM3Config;
 use rlx_minimax::m3::{build_m3_text_flow, rope_tables};
-use rlx_runtime::Device;
 use std::collections::HashMap;
-
-fn dev() -> Device {
-    std::env::var("RLX_TEST_DEVICE")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(|s| rlx_cli::parse_device(&s).expect("bad RLX_TEST_DEVICE"))
-        .unwrap_or(Device::Cpu)
-}
 
 fn fill(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -153,25 +144,32 @@ fn m3_config_derives_layer_types() {
     assert!(!cfg.is_sparse_layer(0) && cfg.is_sparse_layer(1) && cfg.is_sparse_layer(2));
 }
 
+/// Every backend must agree with CPU, not merely produce finite logits.
 #[test]
-fn m3_text_flow_compiles_and_runs() {
-    let cfg = tiny_cfg();
-    let seq = 5usize;
-    let mut wm = weights(&cfg);
-    let built = build_m3_text_flow(&cfg, &mut wm, seq, true).expect("build m3 flow");
-    let mut compiled = compile_built(built, dev()).expect("compile m3 flow");
+fn m3_text_flow_matches_cpu_on_every_backend() {
+    rlx_core::backend_matrix::assert_matches_cpu_on_all(
+        "minimax M3 text flow",
+        2e-3,
+        |device: rlx_runtime::Device| {
+            let cfg = tiny_cfg();
+            let seq = 5usize;
+            let mut wm = weights(&cfg);
+            let built = build_m3_text_flow(&cfg, &mut wm, seq, true).expect("build m3 flow");
+            let mut compiled = compile_built(built, device).expect("compile m3 flow");
 
-    let ids: Vec<f32> = (0..seq).map(|i| (i % cfg.vocab_size) as f32).collect();
-    let (cos, sin) = rope_tables(seq, cfg.n_rot(), cfg.rope_theta);
-    let out = compiled
-        .run(&[
-            ("input_ids", ids.as_slice()),
-            ("rope_cos", cos.as_slice()),
-            ("rope_sin", sin.as_slice()),
-        ])
-        .into_iter()
-        .next()
-        .expect("m3 forward returned output");
-    assert_eq!(out.len(), seq * cfg.vocab_size);
-    assert!(out.iter().all(|v| v.is_finite()), "logits must be finite");
+            let ids: Vec<f32> = (0..seq).map(|i| (i % cfg.vocab_size) as f32).collect();
+            let (cos, sin) = rope_tables(seq, cfg.n_rot(), cfg.rope_theta);
+            let out = compiled
+                .run(&[
+                    ("input_ids", ids.as_slice()),
+                    ("rope_cos", cos.as_slice()),
+                    ("rope_sin", sin.as_slice()),
+                ])
+                .into_iter()
+                .next()
+                .expect("m3 forward returned output");
+            assert_eq!(out.len(), seq * cfg.vocab_size, "logits length");
+            out
+        },
+    );
 }

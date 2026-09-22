@@ -12,14 +12,6 @@ use rlx_glm4moe::flow::build_glm_text_flow;
 use rlx_runtime::Device;
 use std::collections::HashMap;
 
-fn dev() -> Device {
-    std::env::var("RLX_TEST_DEVICE")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(|s| rlx_cli::parse_device(&s).expect("bad RLX_TEST_DEVICE"))
-        .unwrap_or(Device::Cpu)
-}
-
 fn fill(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
     (0..n)
@@ -109,8 +101,7 @@ fn weights(cfg: &Glm4MoeConfig) -> WeightMap {
     WeightMap::from_tensors(t)
 }
 
-#[test]
-fn glm_text_flow_compiles_and_runs() {
+fn run_case(device: Device) -> Vec<f32> {
     let cfg: Glm4MoeConfig = serde_json::from_str(
         r#"{"vocab_size":20,"hidden_size":16,"intermediate_size":16,"moe_intermediate_size":8,
             "num_hidden_layers":3,"num_attention_heads":4,"num_key_value_heads":2,"head_dim":4,
@@ -124,7 +115,7 @@ fn glm_text_flow_compiles_and_runs() {
     let half = cfg.rotary_dim() / 2;
     let mut wm = weights(&cfg);
     let built = build_glm_text_flow(&cfg, &mut wm, seq, true).expect("build glm flow");
-    let mut compiled = compile_built(built, dev()).expect("compile glm flow");
+    let mut compiled = compile_built(built, device).expect("compile glm flow");
 
     let ids: Vec<f32> = vec![1.0, 5.0, 3.0];
     let cos = fill(seq * half.max(1), 7);
@@ -138,6 +129,16 @@ fn glm_text_flow_compiles_and_runs() {
         .into_iter()
         .next()
         .expect("glm forward returned output");
-    assert_eq!(out.len(), seq * cfg.vocab_size);
-    assert!(out.iter().all(|v| v.is_finite()), "logits must be finite");
+    assert_eq!(out.len(), seq * cfg.vocab_size, "unexpected output length");
+    out
+}
+
+/// Every backend must agree with CPU, not merely produce finite numbers.
+///
+/// This test previously ran on one device and asserted only that the
+/// output was finite — a bar that an all-zero result, or a tensor with
+/// one head's worth of real values and the rest zero, still clears.
+#[test]
+fn glm_text_flow_compiles_and_runs_matches_cpu_on_every_backend() {
+    rlx_core::backend_matrix::assert_matches_cpu_on_all("glm4moe text flow", 2e-3, run_case);
 }

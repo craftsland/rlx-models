@@ -259,6 +259,76 @@ pub fn pestle_and_dense(out: usize, n_in: usize, rank: usize, seed: u64) -> (Pro
     )
 }
 
+/// A `prism.hadamard`-folded projection and its exact dense equivalent.
+///
+/// The publisher folds the rotation into the weight by applying the very
+/// same transform the runtime applies to the activation, once per weight
+/// *row* — see `prism_hadamard` for the derivation. So this builds a
+/// dense `W`, transforms its rows, and hands back both; a correct
+/// builder computes the same function from either.
+///
+/// `perm` optionally exercises the GDN `ssm_out` head reorder.
+pub fn folded_and_dense(
+    out: usize,
+    n_in: usize,
+    block: usize,
+    seed: u64,
+    perm: Option<crate::prism_hadamard::GdnPerm>,
+) -> (Proj, Proj) {
+    use crate::prism_hadamard::{HadamardFold, apply_activation_transform, hadamard_matrix};
+    assert_eq!(n_in % block, 0, "block must divide the input width");
+
+    let w: Vec<f32> = (0..out * n_in).map(|i| 0.3 * prand(seed, i)).collect();
+    // Deliberately not all +1: an implementation that dropped the sign
+    // flip would still pass an all-positive fixture.
+    //
+    // Seeded by WIDTH, not by `seed`: the format ships one sign vector
+    // per input width (`prism.hadamard.sign_widths`) shared by every
+    // weight of that width, and the builder registers it as one param
+    // per width. A fixture with per-weight signs would fold each weight
+    // against signs the graph never applies to it.
+    let signs: Vec<f32> = (0..n_in)
+        .map(|i| {
+            if prand(0x5E ^ n_in as u64, i) < 0.0 {
+                -1.0
+            } else {
+                1.0
+            }
+        })
+        .collect();
+
+    let fold = HadamardFold {
+        block_size: block,
+        matrix: hadamard_matrix(block).into(),
+        signs: Some(signs.into()),
+        perm,
+    };
+
+    let mut folded = w.clone();
+    apply_activation_transform(&mut folded, n_in, &fold);
+
+    (
+        Proj::Folded(Box::new(crate::weights::FoldedProj {
+            weight: MatWeight::F32(folded),
+            fold,
+        })),
+        Proj::Dense(MatWeight::F32(w)),
+    )
+}
+
+/// Pick the folded or the dense half of [`folded_and_dense`].
+fn folded_pair(
+    out: usize,
+    n_in: usize,
+    block: usize,
+    seed: u64,
+    perm: Option<crate::prism_hadamard::GdnPerm>,
+    folded: bool,
+) -> Proj {
+    let (f, d) = folded_and_dense(out, n_in, block, seed, perm);
+    if folded { f } else { d }
+}
+
 /// Pick the Pestle or the dense half of [`pestle_and_dense`].
 fn paired(out: usize, n_in: usize, rank: usize, seed: u64, pestle: bool) -> Proj {
     let (p, d) = pestle_and_dense(out, n_in, rank, seed);
@@ -331,6 +401,8 @@ pub fn synth_weights_pestle(cfg: &Qwen35Config, pestle: bool) -> Qwen35Weights {
     }
 
     Qwen35Weights {
+        output_fold: None,
+        token_embd_lazy: None,
         token_embd: std::sync::Arc::from(ramp(n_vocab * n_embd, 0.001)),
         output_norm: vec![1.0; n_embd],
         output: None,
@@ -351,6 +423,106 @@ pub fn synth_weights_pestle(cfg: &Qwen35Config, pestle: bool) -> Qwen35Weights {
 }
 
 /// Dense MoE quick check config (3 trunk layers, no MTP).
+/// [`synth_weights`] with every foldable trunk projection — and the LM
+/// head — stored in a Hadamard-rotated basis (`folded = true`) or as its
+/// exact dense equivalent (`folded = false`). The two bundles are the
+/// *same model* numerically, so their logits must match.
+///
+/// `ssm_alpha` / `ssm_beta` stay dense in both, matching the real
+/// checkpoint: they are the higher-precision recurrent-state path and
+/// are absent from `prism.hadamard.weight_names`.
+pub fn synth_weights_folded(cfg: &Qwen35Config, folded: bool) -> Qwen35Weights {
+    use crate::prism_hadamard::GdnPerm;
+
+    let n_embd = cfg.hidden_size;
+    let n_vocab = cfg.vocab_size;
+    let n_main = cfg.num_hidden_layers - cfg.nextn_predict_layers;
+    let interval = cfg.full_attention_interval.max(1);
+    let n_ff = cfg.intermediate_size;
+    let n_state = cfg.ssm_state_size;
+    let n_v_heads = cfg.ssm_time_step_rank;
+    let value_dim = n_state * n_v_heads;
+    let conv_channels = n_state * cfg.ssm_group_count * 2 + value_dim;
+    let head_dim = cfg.key_length;
+    let q_gate_cols = cfg.num_attention_heads * head_dim * 2;
+    let kv_cols = cfg.num_key_value_heads * head_dim;
+    let q_dim = cfg.num_attention_heads * head_dim;
+
+    // Divides every folded input width in `tiny_cfg` (16 / 32 / 8).
+    const BLOCK: usize = 4;
+    // `tiny_cfg`'s GDN geometry gives rep == 1, which makes the head
+    // reorder a no-op, so pin an explicit rep > 1 permutation here —
+    // otherwise the one part of the transform that is invisible when
+    // wrong would also be untested.
+    let ssm_perm = Some(GdnPerm {
+        hd: value_dim / 4,
+        nk: 2,
+        rep: 2,
+    });
+
+    let seed = |il: usize, slot: usize| ((il as u64) << 8 | slot as u64).wrapping_add(0x7A1D);
+    let ffn = |il: usize| Qwen35LayerFfn::Dense {
+        gate: folded_pair(n_ff, n_embd, BLOCK, seed(il, 5), None, folded),
+        up: folded_pair(n_ff, n_embd, BLOCK, seed(il, 6), None, folded),
+        down: folded_pair(n_embd, n_ff, BLOCK, seed(il, 7), None, folded),
+    };
+
+    let mut trunk = Vec::new();
+    for il in 0..n_main {
+        trunk.push(if ((il + 1) % interval) == 0 {
+            Qwen35TrunkLayer::FullAttn(Qwen35FullAttnLayer {
+                attn_norm: vec![1.0; n_embd],
+                attn_post_norm: vec![1.0; n_embd],
+                attn_q_gate: folded_pair(q_gate_cols, n_embd, BLOCK, seed(il, 0), None, folded),
+                attn_k: folded_pair(kv_cols, n_embd, BLOCK, seed(il, 1), None, folded),
+                attn_v: folded_pair(kv_cols, n_embd, BLOCK, seed(il, 2), None, folded),
+                attn_output: folded_pair(n_embd, q_dim, BLOCK, seed(il, 3), None, folded),
+                attn_q_norm: vec![1.0; head_dim],
+                attn_k_norm: vec![1.0; head_dim],
+                ffn: ffn(il),
+            })
+        } else {
+            Qwen35TrunkLayer::Linear(Qwen35LinearLayer {
+                attn_norm: vec![1.0; n_embd],
+                attn_post_norm: vec![1.0; n_embd],
+                attn_qkv: folded_pair(conv_channels, n_embd, BLOCK, seed(il, 0), None, folded),
+                attn_gate: folded_pair(value_dim, n_embd, BLOCK, seed(il, 1), None, folded),
+                ssm_conv1d: ramp(cfg.ssm_conv_kernel * conv_channels, 0.02),
+                ssm_dt_bias: ramp(n_v_heads, 0.05),
+                ssm_a: vec![-1.0; n_v_heads],
+                ssm_beta: proj(ramp(n_v_heads * n_embd, 0.01)),
+                ssm_alpha: proj(ramp(n_v_heads * n_embd, 0.02)),
+                ssm_norm: vec![1.0; n_state],
+                ssm_out: folded_pair(n_embd, value_dim, BLOCK, seed(il, 4), ssm_perm, folded),
+                ffn: ffn(il),
+            })
+        });
+    }
+
+    // The LM head is folded too, and reaches the graph outside
+    // `emit_linear`, so cover it explicitly.
+    let (head_folded, head_dense) = folded_and_dense(n_vocab, n_embd, BLOCK, 0xF00D, None);
+    let (output, output_fold) = if folded {
+        let Proj::Folded(f) = head_folded else {
+            unreachable!("folded_and_dense returns Folded first")
+        };
+        (Some(f.weight), Some(f.fold))
+    } else {
+        let Proj::Dense(w) = head_dense else {
+            unreachable!("folded_and_dense returns Dense second")
+        };
+        (Some(w), None)
+    };
+
+    let base = synth_weights(cfg);
+    Qwen35Weights {
+        output,
+        output_fold,
+        trunk_layers: trunk,
+        ..base
+    }
+}
+
 pub fn moe_cfg() -> Qwen35Config {
     Qwen35Config {
         vocab_size: 32,
@@ -417,6 +589,8 @@ pub fn moe_synth_weights(cfg: &Qwen35Config) -> Qwen35Weights {
     let n_embd = cfg.hidden_size;
     let n_vocab = cfg.vocab_size;
     Qwen35Weights {
+        output_fold: None,
+        token_embd_lazy: None,
         token_embd: std::sync::Arc::from(ramp(n_vocab * n_embd, 0.0001)),
         output_norm: vec![1.0; n_embd],
         output: None,
@@ -456,6 +630,8 @@ pub fn synth_weights(cfg: &Qwen35Config) -> Qwen35Weights {
     };
 
     Qwen35Weights {
+        output_fold: None,
+        token_embd_lazy: None,
         token_embd: std::sync::Arc::from(ramp(n_vocab * n_embd, 0.001)),
         output_norm: vec![1.0; n_embd],
         output: None,

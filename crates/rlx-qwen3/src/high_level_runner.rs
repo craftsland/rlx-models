@@ -531,18 +531,33 @@ impl PackedForward {
         for (name, data) in &params {
             compiled.set_param(name, data);
         }
+        // Empty bytes = GGUF zero-copy marker; owned MLX arrays are non-empty
+        // and used as-is.
+        //
+        // For the GGUF case, `pread` into one reused scratch rather than
+        // borrowing the mmap. `set_param_typed` copies through whatever slice
+        // it is given, so a borrow faults in every page of the checkpoint and
+        // leaves a second full-size copy resident — unreclaimable on macOS
+        // short of `munmap`, since `release_mapped_pages` is a Linux-only win.
+        // Streaming caps the resident cost at the largest single tensor.
+        // Measured on rlx-qwen35, the same change was worth 4.7 GB on a 5.5 GB
+        // checkpoint and 19.6 GB on a 13 GB one. Revert:
+        // RLX_QWEN3_MMAP_UPLOAD=1.
+        let stream = !rlx_ir::env::flag("RLX_QWEN3_MMAP_UPLOAD");
+        let mut scratch: Vec<u8> = Vec::new();
         for (name, (bytes, _scheme, _shape)) in &packed {
-            // Empty bytes = GGUF zero-copy marker: borrow the packed blob straight
-            // from the loader's mmap instead of a materialized buffer. Owned MLX
-            // arrays are non-empty and used as-is.
-            let slice = if bytes.is_empty() {
-                loader
+            if bytes.is_empty() {
+                if stream && loader.read_tensor_bytes_into(name, &mut scratch)? {
+                    compiled.set_param_typed(name, &scratch, rlx_ir::DType::U8);
+                    continue;
+                }
+                let slice = loader
                     .tensor_bytes_borrowed(name)
-                    .expect("packed weight bytes unavailable at attach")
+                    .expect("packed weight bytes unavailable at attach");
+                compiled.set_param_typed(name, slice, rlx_ir::DType::U8);
             } else {
-                bytes.as_slice()
-            };
-            compiled.set_param_typed(name, slice, rlx_ir::DType::U8);
+                compiled.set_param_typed(name, bytes.as_slice(), rlx_ir::DType::U8);
+            }
         }
         Ok(Self {
             compiled,

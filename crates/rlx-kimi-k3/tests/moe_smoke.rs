@@ -11,18 +11,6 @@ use rlx_kimi_k3::moe::{MoeDims, MoeWeights, build_latent_moe};
 use rlx_runtime::Device;
 use std::collections::HashMap;
 
-fn dev() -> Device {
-    match std::env::var("RLX_TEST_DEVICE").ok().as_deref() {
-        Some("metal") | Some("mtl") => Device::Metal,
-        Some("mlx") => Device::Mlx,
-        Some("gpu") | Some("wgpu") => Device::Gpu,
-        Some("coreml") | Some("ane") => Device::Ane,
-        Some("cuda") => Device::Cuda,
-        Some("vulkan") | Some("vk") => Device::Vulkan,
-        _ => Device::Cpu,
-    }
-}
-
 fn fill(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
     (0..n)
@@ -35,8 +23,7 @@ fn fill(n: usize, seed: u64) -> Vec<f32> {
         .collect()
 }
 
-#[test]
-fn latent_moe_compiles_and_runs() {
+fn run_case(device: Device) -> Vec<f32> {
     let d = MoeDims {
         hidden: 16,
         latent: 12,
@@ -75,7 +62,7 @@ fn latent_moe_compiles_and_runs() {
     g.set_outputs(vec![out]);
 
     let built = built_from_hir(hir, params).expect("build model");
-    let mut compiled = compile_built(built, dev()).expect("compile moe");
+    let mut compiled = compile_built(built, device).expect("compile moe");
 
     let hin = fill(d.batch * d.seq * hidden, 100);
     let y = compiled
@@ -84,5 +71,16 @@ fn latent_moe_compiles_and_runs() {
         .next()
         .expect("moe output");
     assert_eq!(y.len(), d.batch * d.seq * hidden);
-    assert!(y.iter().all(|v| v.is_finite()), "MoE output must be finite");
+    y
+}
+
+/// Every backend must agree with CPU, not merely produce finite numbers.
+///
+/// This ran on one device — whichever `RLX_TEST_DEVICE` named, CPU by
+/// default — and asked only for finite output. An all-zero result, or a
+/// tensor with one head's worth of real values and the rest zero, passes
+/// that; neither passes a comparison against CPU.
+#[test]
+fn latent_moe_compiles_and_runs_matches_cpu_on_every_backend() {
+    rlx_core::backend_matrix::assert_matches_cpu_on_all("kimi-k3 latent MoE", 2e-3, run_case);
 }

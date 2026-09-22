@@ -7786,6 +7786,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rlx-dsv41"
+version = "0.2.16"
+dependencies = [
+ "anyhow",
+ "rlx-cli",
+ "rlx-models-core",
+ "rlx-runtime",
+ "serde_json",
+]
+
+[[package]]
 name = "rlx-eagle3"
 version = "0.2.16"
 dependencies = [
@@ -8387,6 +8398,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "rlx-jina-ocr"
+version = "0.2.16"
+dependencies = [
+ "anyhow",
+ "hf-hub",
+ "image",
+ "rlx-cli",
+ "rlx-models-core",
+ "rlx-runtime",
+ "rlx-unlimited-ocr",
+ "serde",
+ "serde_json",
+ "tokenizers",
+]
+
+[[package]]
 name = "rlx-jlens"
 version = "0.2.16"
 dependencies = [
@@ -8404,6 +8431,22 @@ dependencies = [
  "rlx-siglip2",
  "safetensors 0.7.0",
  "thiserror 2.0.19",
+]
+
+[[package]]
+name = "rlx-kev"
+version = "0.2.16"
+dependencies = [
+ "anyhow",
+ "rlx-ir",
+ "rlx-models-core",
+ "rlx-qwen35",
+ "rlx-runtime",
+ "rlx-torch-ckpt",
+ "safetensors 0.7.0",
+ "serde",
+ "serde_json",
+ "tokenizers",
 ]
 
 [[package]]
@@ -9051,6 +9094,7 @@ dependencies = [
  "rlx-hy-mt",
  "rlx-inkling",
  "rlx-ir",
+ "rlx-jina-ocr",
  "rlx-kittentts",
  "rlx-kokoro",
  "rlx-kyutai-tts",
@@ -9159,6 +9203,7 @@ dependencies = [
  "memmap2",
  "rayon",
  "rlx-assets",
+ "rlx-autodiff",
  "rlx-cpu",
  "rlx-cuda",
  "rlx-distributed",
@@ -9324,9 +9369,8 @@ name = "rlx-nemo"
 version = "0.2.16"
 dependencies = [
  "anyhow",
- "flate2",
- "half",
  "rlx-ir",
+ "rlx-torch-ckpt",
  "serde_yaml",
 ]
 
@@ -10507,6 +10551,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rlx-torch-ckpt"
+version = "0.2.16"
+dependencies = [
+ "anyhow",
+ "flate2",
+ "half",
+]
+
+[[package]]
 name = "rlx-tpu"
 version = "0.2.16"
 dependencies = [
@@ -10707,6 +10760,23 @@ dependencies = [
  "serde",
  "serde_json",
  "tokenizers",
+]
+
+[[package]]
+name = "rlx-upscale"
+version = "0.2.16"
+dependencies = [
+ "anyhow",
+ "image",
+ "rlx-cli",
+ "rlx-flow",
+ "rlx-ir",
+ "rlx-models-core",
+ "rlx-runtime",
+ "rlx-torch-ckpt",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

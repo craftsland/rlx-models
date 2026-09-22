@@ -27,15 +27,17 @@
 //! equal prefill logits — which is what `decode_matches_prefill` asserts.
 
 use crate::dsv41::DeepseekV41Spec;
-use crate::dsv41_engram::load_and_build_v41_engram;
-use crate::dsv41_graph::{
-    NEG, V41Inputs, build_v41_index_score, build_v41_moe, compressed_causal_mask, exact_topk_mask,
-    hc_mean, hc_mixes, hc_post, hc_reduce, identity_pre_mix, main_hidden_node, rope_table,
+use crate::dsv41_block::{
+    AttnOut, Ctx, Qkv, RopeTables, build_attn_out, build_qkv, open_mask, rope_table,
 };
-use crate::standard_decoder::{
-    build_v4_o_lora, build_v4_sink_attention, emit_proj, load_dense_dequant, load_norm, load_p,
-    load_proj, load_transposed_param, load_v4_wo_a, rope_tail, synth_const, synth_zero,
+use crate::dsv41_csa::{Compressed, CompressorW, CsaShared, pool_groups, publish_topk_mask};
+use crate::dsv41_engram::build_v41_engram;
+use crate::dsv41_graph::V41Inputs;
+use crate::dsv41_hc::{
+    HcSide, hc_mean, hc_reduce, hc_sublayer_plain, identity_pre_mix, main_hidden_node,
 };
+use crate::dsv41_moe::build_v41_moe;
+use crate::standard_decoder::{load_dense_dequant, rope_tail};
 use crate::weight_loader::WeightLoader;
 use anyhow::{Result, anyhow};
 use rlx_ir::GraphExt;
@@ -84,6 +86,28 @@ pub mod names {
     }
     pub fn group_score_new(src: usize) -> String {
         format!("groupscorenew.{src}")
+    }
+    /// The compressor's carried group, **replacing** whatever was there.
+    ///
+    /// A single decode step contributes one row to a group and the cache appends
+    /// it; a multi-token chunk can complete several groups and be left holding a
+    /// different partial one entirely, so it hands back the whole group rather
+    /// than a delta. Append semantics would concatenate the old leftover onto
+    /// the new one and silently widen the group.
+    pub fn group_kv_set(src: usize) -> String {
+        format!("groupkvset.{src}")
+    }
+    pub fn group_score_set(src: usize) -> String {
+        format!("groupscoreset.{src}")
+    }
+    /// Engram n-gram row ids for layer `il`: `[1, n_hash_cols]`.
+    ///
+    /// An **input**, not a baked constant. The rows change every position while
+    /// the graph's shape does not, so baking them would make a compiled step
+    /// reusable in shape but wrong in content — a decode loop that caches
+    /// sessions would silently reuse another position's n-grams.
+    pub fn engram_rows(il: usize) -> String {
+        format!("engramrows.{il}")
     }
 }
 
@@ -149,8 +173,83 @@ impl V41DecodePlan {
         }
     }
 
-    fn for_source(&self, src: usize) -> Option<&CompressStep> {
+    pub fn for_source(&self, src: usize) -> Option<&CompressStep> {
         self.sources.iter().find(|s| s.source_layer == src)
+    }
+}
+
+/// Per-source compressed geometry for a **chunk** of `k` tokens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkCompress {
+    pub source_layer: usize,
+    pub ratio: usize,
+    /// Latents in the cache when the chunk begins (`start / ratio`).
+    pub len_before: usize,
+    /// Latents visible to the chunk's *last* query (`(start + k) / ratio`).
+    pub len_after: usize,
+    /// Rows of a partial group the host carries in (`start % ratio`).
+    pub group_filled: usize,
+    /// Rows of a partial group the chunk leaves behind.
+    pub group_left: usize,
+}
+
+impl ChunkCompress {
+    fn new(source_layer: usize, ratio: usize, start: usize, k: usize) -> Self {
+        ChunkCompress {
+            source_layer,
+            ratio,
+            len_before: start / ratio,
+            len_after: (start + k) / ratio,
+            group_filled: start % ratio,
+            group_left: (start + k) % ratio,
+        }
+    }
+
+    /// New latents this chunk completes.
+    pub fn produced(&self) -> usize {
+        self.len_after - self.len_before
+    }
+}
+
+/// The geometry of a `k`-token step starting at absolute position `start`.
+///
+/// Generalizes both existing paths: `start = 0` with an empty cache is a
+/// prefill, and `k = 1` is a decode step. Having one plan for all three is what
+/// lets a prompt be processed in chunks and a speculative draft block be
+/// verified in a single pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V41ChunkPlan {
+    pub start: usize,
+    pub k: usize,
+    /// Window rows the host supplies, covering positions
+    /// `start - cache_len .. start`.
+    pub cache_len: usize,
+    pub sources: Vec<ChunkCompress>,
+}
+
+impl V41ChunkPlan {
+    pub fn new(spec: &DeepseekV41Spec, start: usize, k: usize) -> Self {
+        let sources = (0..spec.n_layers)
+            .filter(|&il| spec.is_kv_source(il) && spec.ratio(il) > 0)
+            .map(|il| ChunkCompress::new(il, spec.ratio(il), start, k))
+            .collect();
+        V41ChunkPlan {
+            start,
+            k,
+            // the window holds at most `window_size - 1` positions from before
+            // the chunk; the chunk's own tokens take the remaining slots
+            cache_len: start.min(spec.window_size.saturating_sub(1)),
+            sources,
+        }
+    }
+
+    pub fn for_source(&self, src: usize) -> Option<&ChunkCompress> {
+        self.sources.iter().find(|s| s.source_layer == src)
+    }
+
+    /// Absolute position of query row `i`.
+    pub fn pos(&self, i: usize) -> usize {
+        self.start + i
     }
 }
 
@@ -219,10 +318,181 @@ impl V41DecodeCache {
         out
     }
 
+    /// Seed the cache from a batched prefill.
+    ///
+    /// `names`/`values` are what
+    /// [`crate::dsv41_graph::build_deepseek_v41_prefill`] returned with
+    /// `emit_cache`. Priming leaves the cache exactly where stepping the same
+    /// prompt one token at a time would have left it, so decoding continues from
+    /// position `seq` — which is what makes prompt processing one graph run
+    /// instead of `seq` of them.
+    ///
+    /// Unlike [`Self::apply`] there is no plan: a prefill emits whole tensors
+    /// rather than one row, and it has already dropped the groups it consumed.
+    pub fn prime(&mut self, names: &[String], values: &[Vec<f32>]) -> Result<()> {
+        if names.len() != values.len() {
+            return Err(anyhow!(
+                "deepseek_v41 prefill: {} cache names for {} tensors",
+                names.len(),
+                values.len()
+            ));
+        }
+        self.window.iter_mut().for_each(Vec::clear);
+        self.compress.clear();
+        self.index_k.clear();
+        self.group_kv.clear();
+        self.group_score.clear();
+        for (name, v) in names.iter().zip(values) {
+            self.fold(name, v)?;
+        }
+        Ok(())
+    }
+
+    /// Fold one named cache tensor in, whether it came from a prefill or a step.
+    fn fold(&mut self, name: &str, v: &[f32]) -> Result<()> {
+        let Some((tag, idx)) = name.rsplit_once('.') else {
+            return Ok(()); // `logits`
+        };
+        let Ok(i) = idx.parse::<usize>() else {
+            return Ok(());
+        };
+        match tag {
+            "kvnew" => {
+                let rows = self.window.get_mut(i).ok_or_else(|| {
+                    anyhow!("deepseek_v41: window KV for layer {i}, which does not exist")
+                })?;
+                rows.extend_from_slice(v);
+                // the new token occupies the last ring slot, so the buffer
+                // handed to the NEXT step holds at most window_size - 1
+                let cap = self.window_size.saturating_sub(1) * self.head_dim;
+                if rows.len() > cap {
+                    rows.drain(..rows.len() - cap);
+                }
+            }
+            "compnew" => self.compress.entry(i).or_default().extend_from_slice(v),
+            "indexknew" => self.index_k.entry(i).or_default().extend_from_slice(v),
+            "groupkvnew" => self.group_kv.entry(i).or_default().extend_from_slice(v),
+            "groupscorenew" => self.group_score.entry(i).or_default().extend_from_slice(v),
+            "groupkvset" => {
+                self.group_kv.insert(i, v.to_vec());
+            }
+            "groupscoreset" => {
+                self.group_score.insert(i, v.to_vec());
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Window rows cached for layer `il`.
+    ///
+    /// Exposed because "the tokens came out right" is a weak check on a cache: an
+    /// over-long compressed cache is silently truncated to the declared input
+    /// width, so it reads correctly for a while and only misaligns once the next
+    /// latent is appended past the stale one. Asserting the lengths catches that
+    /// at the round it happens.
+    pub fn window_len(&self, il: usize) -> usize {
+        self.window
+            .get(il)
+            .map(|r| r.len() / self.head_dim.max(1))
+            .unwrap_or(0)
+    }
+
+    /// Compressed latents cached for source layer `src`.
+    pub fn compressed_len(&self, src: usize) -> usize {
+        self.compress
+            .get(&src)
+            .map(|c| c.len() / self.head_dim.max(1))
+            .unwrap_or(0)
+    }
+
+    /// Rows of a partial compressor group carried for `src`.
+    pub fn group_len(&self, src: usize) -> usize {
+        self.group_kv
+            .get(&src)
+            .map(|c| c.len() / self.head_dim.max(1))
+            .unwrap_or(0)
+    }
+
+    /// Named input buffers for a `k`-token chunk.
+    pub fn chunk_inputs(&self, plan: &V41ChunkPlan) -> Vec<(String, &[f32])> {
+        let mut out: Vec<(String, &[f32])> = Vec::new();
+        if plan.cache_len > 0 {
+            for (il, rows) in self.window.iter().enumerate() {
+                out.push((names::window_kv(il), rows.as_slice()));
+            }
+        }
+        for s in &plan.sources {
+            let src = s.source_layer;
+            if s.len_before > 0 {
+                if let Some(c) = self.compress.get(&src) {
+                    out.push((names::compress_kv(src), c.as_slice()));
+                }
+                if self.index_head_dim > 0
+                    && let Some(k) = self.index_k.get(&src)
+                {
+                    out.push((names::index_k(src), k.as_slice()));
+                }
+            }
+            if s.group_filled > 0 {
+                if let Some(v) = self.group_kv.get(&src) {
+                    out.push((names::group_kv(src), v.as_slice()));
+                }
+                if let Some(v) = self.group_score.get(&src) {
+                    out.push((names::group_score(src), v.as_slice()));
+                }
+            }
+        }
+        out
+    }
+
+    /// Fold a chunk's outputs back in.
+    ///
+    /// The plan is needed to *clear* a partial group the chunk consumed exactly.
+    /// A chunk ending on a group boundary has no leftover rows to hand back, so
+    /// it emits nothing for that source — and "emits nothing" has to mean "the
+    /// group is now empty", not "leave the old one".
+    ///
+    /// In practice a stale group left there heals itself: the next chunk starts
+    /// on a multiple of `ratio`, so it declares no group input at all and then
+    /// overwrites the entry. This is therefore hygiene rather than a fix for
+    /// wrong output — but a cache that misdescribes its own contents is not
+    /// something to leave standing, and the length accessors below are only
+    /// meaningful if it does not.
+    pub fn apply_chunk(
+        &mut self,
+        plan: &V41ChunkPlan,
+        names: &[String],
+        values: &[Vec<f32>],
+    ) -> Result<()> {
+        if names.len() != values.len() {
+            return Err(anyhow!(
+                "deepseek_v41 chunk: {} names for {} outputs",
+                names.len(),
+                values.len()
+            ));
+        }
+        for (name, v) in names.iter().zip(values) {
+            self.fold(name, v)?;
+        }
+        for s in &plan.sources {
+            if s.group_left == 0 {
+                self.group_kv.remove(&s.source_layer);
+                self.group_score.remove(&s.source_layer);
+            }
+        }
+        Ok(())
+    }
+
     /// Fold one step's outputs back in. `names`/`values` are the name list
     /// [`build_deepseek_v41_decode`] returned and the session's outputs, in the
     /// same order.
-    pub fn apply(&mut self, plan: &V41DecodePlan, names: &[String], values: &[Vec<f32>]) -> Result<()> {
+    pub fn apply(
+        &mut self,
+        plan: &V41DecodePlan,
+        names: &[String],
+        values: &[Vec<f32>],
+    ) -> Result<()> {
         if names.len() != values.len() {
             return Err(anyhow!(
                 "deepseek_v41 decode: {} output names for {} outputs",
@@ -231,30 +501,7 @@ impl V41DecodeCache {
             ));
         }
         for (name, v) in names.iter().zip(values) {
-            let Some((tag, idx)) = name.rsplit_once('.') else {
-                continue; // `logits`
-            };
-            let i: usize = match idx.parse() {
-                Ok(i) => i,
-                Err(_) => continue,
-            };
-            match tag {
-                "kvnew" => {
-                    let rows = &mut self.window[i];
-                    rows.extend_from_slice(v);
-                    // the new token occupies the last ring slot, so the buffer
-                    // handed to the NEXT step holds at most window_size - 1
-                    let cap = self.window_size.saturating_sub(1) * self.head_dim;
-                    if rows.len() > cap {
-                        rows.drain(..rows.len() - cap);
-                    }
-                }
-                "compnew" => self.compress.entry(i).or_default().extend_from_slice(v),
-                "indexknew" => self.index_k.entry(i).or_default().extend_from_slice(v),
-                "groupkvnew" => self.group_kv.entry(i).or_default().extend_from_slice(v),
-                "groupscorenew" => self.group_score.entry(i).or_default().extend_from_slice(v),
-                _ => {}
-            }
+            self.fold(name, v)?;
         }
         // a completed group clears what it consumed
         for s in &plan.sources {
@@ -267,13 +514,12 @@ impl V41DecodeCache {
     }
 }
 
-/// State threaded through one decode step's layer loop.
-struct StepShared {
-    compress_kv: Option<NodeId>,
-    index_k: Option<NodeId>,
-    topk_mask: Option<NodeId>,
-    candidates: Option<NodeId>,
-    len_after: usize,
+/// State threaded through one decode step's layer loop — the decode counterpart
+/// of prefill's `SharedAttn`.
+#[derive(Default)]
+pub(crate) struct StepShared {
+    pub csa: CsaShared,
+    pub len_after: usize,
 }
 
 /// Build one decode step at absolute position `pos`.
@@ -290,438 +536,330 @@ pub fn build_deepseek_v41_decode(
 ) -> Result<(Graph, HashMap<String, Vec<f32>>, Vec<String>)> {
     spec.validate()?;
     let plan = V41DecodePlan::new(spec, pos);
-    let mut g = Graph::new("deepseek_v41_decode");
-    let mut params: HashMap<String, Vec<f32>> = HashMap::new();
-    let f = DType::F32;
-    let (d, hc, nh, hd) = (spec.dim, spec.hc_mult, spec.n_heads, spec.head_dim);
-    let ql = spec.q_lora_rank;
-    let rd = spec.rope_head_dim & !1;
-    let eps = spec.rms_norm_eps;
-    let rows = 1usize;
-    let cache_len = plan.cache_len;
-    let zb_d = synth_zero(&mut g, &mut params, "v41d.zb.d", d);
-    let zb_ql = synth_zero(&mut g, &mut params, "v41d.zb.ql", ql);
-    let zb_hd = synth_zero(&mut g, &mut params, "v41d.zb.hd", hd);
+    let mut ctx = Ctx::new("deepseek_v41_decode", spec, weights, packed, 1);
+    let (d, hc) = (spec.dim, spec.hc_mult);
+    let rope = StepRope::build(&mut ctx, &plan);
+    let mut step = StepOutputs::default();
 
-    let yarn = (spec.original_seq_len > 0 && spec.rope_factor > 1.0).then_some((
-        spec.original_seq_len,
-        spec.rope_factor,
-        spec.beta_fast,
-        spec.beta_slow,
-    ));
-    // q and the window KV rotate at the current position; the two bases are the
-    // same split as prefill (compressed layers use `compress_rope_theta` + YaRN).
-    let (cos_w, sin_w, sininv_w) =
-        rope_table(&mut g, &mut params, &[pos], rd, spec.rope_theta, None, "d.win");
-    let (cos_k, sin_k, sininv_k) = rope_table(
-        &mut g,
-        &mut params,
-        &[pos],
-        rd,
-        spec.compress_rope_theta,
-        yarn,
-        "d.comp",
-    );
-    // A latent completed at this step stands for the first token of its group,
-    // which is `pos + 1 - ratio`.
-    let mut latent_rope: HashMap<usize, (NodeId, NodeId)> = HashMap::new();
-    for s in &plan.sources {
-        if !s.fires || latent_rope.contains_key(&s.ratio) {
-            continue;
-        }
-        let p = pos + 1 - s.ratio;
-        let (c, sn, _) = rope_table(
-            &mut g,
-            &mut params,
-            &[p],
-            rd,
-            spec.compress_rope_theta,
-            yarn,
-            &format!("d.lat{}", s.ratio),
-        );
-        latent_rope.insert(s.ratio, (c, sn));
-    }
+    let input_ids = ctx.g.input("input_ids", Shape::new(&[1, 1], DType::I32));
+    let (embed_w, _, _) =
+        load_dense_dequant(&mut ctx.g, &mut ctx.params, ctx.weights, "embed.weight")?;
+    let h0 = ctx.g.gather_(embed_w, input_ids, 0);
+    let h0 = ctx.g.reshape_(h0, vec![1, 1, d as i64]);
+    let ones = ctx.konst("v41d.hc.ones", vec![1f32; hc], &[1, hc, 1]);
+    let mut h = ctx.g.mul(h0, ones);
+    let mut pre_mix = identity_pre_mix(&mut ctx.g, &mut ctx.params, 1, hc);
 
-    let mut outputs: Vec<NodeId> = Vec::new();
-    let mut output_names: Vec<String> = Vec::new();
-
-    let input_ids = g.input("input_ids", Shape::new(&[1, 1], DType::I32));
-    let (embed_w, _, _) = load_dense_dequant(&mut g, &mut params, weights, "embed.weight")?;
-    let h0 = g.gather_(embed_w, input_ids, 0);
-    let h0 = g.reshape_(h0, vec![1, 1, d as i64]);
-    let ones_hc = synth_const(&mut g, &mut params, "v41d.hc.ones", vec![1f32; hc], &[1, hc, 1]);
-    let mut h = g.mul(h0, ones_hc);
-    let mut pre_mix = identity_pre_mix(&mut g, &mut params, rows, hc);
-
-    let mut shared = StepShared {
-        compress_kv: None,
-        index_k: None,
-        topk_mask: None,
-        candidates: None,
-        len_after: 0,
-    };
-
+    let mut shared = StepShared::default();
     let mut main_hiddens: Vec<NodeId> = Vec::new();
     for il in 0..spec.n_layers {
         let lp = spec.layer_prefix(il);
 
         if let Some(e) = &spec.engram
-            && let Some(hash_idx) = e.layer_hash_index(il)
+            && e.layer_hash_index(il).is_some()
         {
-            {
-                let cols = e.n_hash_cols();
-                let n_eng = e.layer_ids.len();
-                if inputs.engram_rows.len() != n_eng * cols {
-                    return Err(anyhow!(
-                        "deepseek_v41 decode: engram_rows has {} entries, expected {} (1 token × {n_eng} layers × {cols} cols)",
-                        inputs.engram_rows.len(),
-                        n_eng * cols
-                    ));
-                }
-                let slice: Vec<f32> = inputs.engram_rows[hash_idx * cols..(hash_idx + 1) * cols]
-                    .iter()
-                    .map(|&v| v as f32)
-                    .collect();
-                let row_ids = synth_const(
-                    &mut g,
-                    &mut params,
-                    &format!("{lp}.engram.rows"),
-                    slice,
-                    &[1, cols],
-                );
-                h = load_and_build_v41_engram(
-                    &mut g, &mut params, weights, &lp, h, row_ids, None, rows, hc, d, e, eps,
-                )?;
+            let cols = e.n_hash_cols();
+            let n_eng = e.layer_ids.len();
+            if inputs.engram_rows.len() != n_eng * cols {
+                return Err(anyhow!(
+                    "deepseek_v41 decode: engram_rows has {} entries, expected {} \
+                     (1 token × {n_eng} layers × {cols} cols)",
+                    inputs.engram_rows.len(),
+                    n_eng * cols
+                ));
             }
+            let row_ids = ctx
+                .g
+                .input(names::engram_rows(il), Shape::new(&[1, cols], DType::F32));
+            h = build_v41_engram(&mut ctx, &lp, h, row_ids, None, e)?;
         }
 
         if inputs.emit_main_hidden && spec.dspark_target_layer_ids.contains(&il) {
-            main_hiddens.push(hc_mean(&mut g, h, rows, d));
+            main_hiddens.push(hc_mean(&mut ctx.g, h, 1, d));
         }
 
-        let ratio = spec.ratio(il);
-        let (cos, sin, sin_inv) = if ratio > 0 {
-            (cos_k, sin_k, sininv_k)
-        } else {
-            (cos_w, sin_w, sininv_w)
-        };
-
-        // ── attention sub-block ──
-        let residual = h;
-        let fn_a = load_transposed_param(&mut g, &mut params, weights, &format!("{lp}.hc_attn_fn"))?;
-        let sc_a = load_p(&mut g, &mut params, weights, &format!("{lp}.hc_attn_scale"), false)?;
-        let bs_a = load_p(&mut g, &mut params, weights, &format!("{lp}.hc_attn_base"), false)?;
-        let (attn_pre, attn_post, attn_comb) = hc_mixes(
-            &mut g,
-            &mut params,
-            h,
-            fn_a,
-            sc_a,
-            bs_a,
-            rows,
-            hc,
-            d,
-            eps,
-            spec.hc_eps,
-            spec.hc_mult_sinkhorn_iters,
-            &format!("{lp}.da"),
-        );
-        let xa = hc_reduce(&mut g, h, pre_mix, rows, hc);
-        let an = load_norm(&mut g, &mut params, weights, &format!("{lp}.attn_norm.weight"), 0.0)?;
-        let xa = g.rms_norm(xa, an, zb_d, eps);
-
-        let wq_a = load_proj(&mut g, &mut params, packed, weights, &format!("{lp}.attn.wq_a.weight"))?;
-        let qr = emit_proj(&mut g, xa, &wq_a, Shape::new(&[rows, ql], f));
-        let q_norm = load_norm(&mut g, &mut params, weights, &format!("{lp}.attn.q_norm.weight"), 0.0)?;
-        let qr = g.rms_norm(qr, q_norm, zb_ql, eps);
-        let wq_b = load_proj(&mut g, &mut params, packed, weights, &format!("{lp}.attn.wq_b.weight"))?;
-        let q = emit_proj(&mut g, qr, &wq_b, Shape::new(&[rows, nh * hd], f));
-        let q = rope_tail(&mut g, q, cos, sin, rows, nh, hd, rd);
-
-        let wkv = load_proj(&mut g, &mut params, packed, weights, &format!("{lp}.attn.wkv.weight"))?;
-        let kv = emit_proj(&mut g, xa, &wkv, Shape::new(&[rows, hd], f));
-        let kv_norm = load_norm(&mut g, &mut params, weights, &format!("{lp}.attn.kv_norm.weight"), 0.0)?;
-        let kv = g.rms_norm(kv, kv_norm, zb_hd, eps);
-        let kv_new = rope_tail(&mut g, kv, cos, sin, rows, 1, hd, rd);
-        outputs.push(kv_new);
-        output_names.push(names::window_kv_new(il));
-
-        // the window this query attends over: everything cached plus itself
-        let window = if cache_len > 0 {
-            let cached = g.input(names::window_kv(il), Shape::new(&[cache_len, hd], f));
-            g.concat_(vec![cached, kv_new], 0)
-        } else {
-            kv_new
-        };
-        let n_window = cache_len + 1;
-
-        // ── compressed KV: produced at a source, read by everyone after it ──
-        if let Some(step) = plan.for_source(il) {
-            let (latent, new_nodes) =
-                build_step_compressor(&mut g, &mut params, weights, &lp, xa, step, hd, eps)?;
-            for (node, name) in new_nodes {
-                outputs.push(node);
-                output_names.push(name);
-            }
-            // extend the caches, whether or not this step added to them
-            let cached_comp = (step.len_before > 0)
-                .then(|| g.input(names::compress_kv(il), Shape::new(&[step.len_before, hd], f)));
-            let cached_ik = (step.len_before > 0 && spec.index_head_dim > 0).then(|| {
-                g.input(
-                    names::index_k(il),
-                    Shape::new(&[step.len_before, spec.index_head_dim], f),
-                )
-            });
-
-            if let Some(lat) = latent {
-                let (cos_l, sin_l) = latent_rope[&step.ratio];
-                if spec.index_head_dim > 0 {
-                    let ihd = spec.index_head_dim;
-                    let wk = load_p(&mut g, &mut params, weights, &format!("{lp}.attn.indexer.wk.weight"), true)?;
-                    let k_norm = load_norm(
-                        &mut g,
-                        &mut params,
-                        weights,
-                        &format!("{lp}.attn.indexer.k_norm.weight"),
-                        0.0,
-                    )?;
-                    let zb_i = synth_zero(&mut g, &mut params, &format!("{lp}.dzb.ihd"), ihd);
-                    let k = g.mm(lat, wk);
-                    let k = g.rms_norm(k, k_norm, zb_i, eps);
-                    let k = rope_tail(&mut g, k, cos_l, sin_l, 1, 1, ihd, rd);
-                    outputs.push(k);
-                    output_names.push(names::index_k_new(il));
-                    shared.index_k = Some(match cached_ik {
-                        Some(c) => g.concat_(vec![c, k], 0),
-                        None => k,
-                    });
-                }
-                let comp = rope_tail(&mut g, lat, cos_l, sin_l, 1, 1, hd, rd);
-                outputs.push(comp);
-                output_names.push(names::compress_kv_new(il));
-                shared.compress_kv = Some(match cached_comp {
-                    Some(c) => g.concat_(vec![c, comp], 0),
-                    None => comp,
-                });
-            } else {
-                shared.compress_kv = cached_comp;
-                shared.index_k = cached_ik;
-            }
-            shared.len_after = step.len_after;
-        }
-
-        let ncomp = if ratio > 0 {
-            plan.for_source(spec.kv_source_for(il).unwrap_or(il))
-                .map(|s| s.len_after)
-                .unwrap_or(0)
-        } else {
-            0
-        };
-
-        let (kv_all, mask, n_keys) = if ncomp == 0 {
-            // every provided window slot is real, so no mask is needed
-            let m = synth_const(
-                &mut g,
-                &mut params,
-                &format!("{lp}.d.maskw"),
-                vec![0f32; n_window],
-                &[1, n_window],
-            );
-            (window, m, n_window)
-        } else {
-            if shared.len_after != ncomp {
-                return Err(anyhow!(
-                    "deepseek_v41 decode: layer {il} expects {ncomp} compressed positions, source has {}",
-                    shared.len_after
-                ));
-            }
-            let comp = shared.compress_kv.ok_or_else(|| {
-                anyhow!("deepseek_v41 decode: layer {il} reads compressed KV with no source")
+        let rope_l = rope.for_layer(spec.ratio(il));
+        let (nh, pre_attn) =
+            hc_sublayer_plain(&mut ctx, HcSide::Attn, &lp, h, pre_mix, |ctx, xa| {
+                build_decode_attention(ctx, il, xa, &plan, &rope_l, &mut shared, &mut step)
             })?;
-            // Every cached latent is causally visible to this query by
-            // construction, so the causal mask is all-zero and only the Indexer's
-            // budget can drop anything.
-            let causal_c = compressed_causal_mask(
-                &mut g,
-                &mut params,
-                &[ncomp],
-                ncomp,
-                &format!("{lp}.d.maskc"),
-            );
-            if spec.is_index_source(il) && spec.index_head_dim > 0 {
-                let index_k = shared.index_k.ok_or_else(|| {
-                    anyhow!("deepseek_v41 decode: layer {il} indexes with no index keys")
-                })?;
-                let wq_b_i = load_p(
-                    &mut g,
-                    &mut params,
-                    weights,
-                    &format!("{lp}.attn.indexer.wq_b.weight"),
-                    true,
-                )?;
-                let wpj = load_p(
-                    &mut g,
-                    &mut params,
-                    weights,
-                    &format!("{lp}.attn.indexer.weights_proj.weight"),
-                    true,
-                )?;
-                let mut score = build_v41_index_score(
-                    &mut g,
-                    &mut params,
-                    qr,
-                    xa,
-                    index_k,
-                    wq_b_i,
-                    wpj,
-                    cos,
-                    sin,
-                    rows,
-                    spec.index_n_heads,
-                    spec.index_head_dim,
-                    rd,
-                    ncomp,
-                    &format!("{lp}.d"),
-                );
-                score = g.add(score, causal_c);
-                if spec.is_candidate_source(il) && spec.candidate_block_size > 0 {
-                    shared.candidates = Some(crate::dsv41_graph::build_v41_candidate_mask(
-                        &mut g,
-                        &mut params,
-                        score,
-                        causal_c,
-                        rows,
-                        ncomp,
-                        &[ncomp],
-                        spec.candidate_block_size,
-                        spec.candidate_topk_blocks,
-                        &format!("{lp}.d"),
-                    ));
-                } else if spec.uses_candidates(il)
-                    && let Some(c) = shared.candidates
-                {
-                    score = g.add(score, c);
-                }
-                let base = match shared.candidates {
-                    Some(c) if spec.uses_candidates(il) => c,
-                    _ => causal_c,
-                };
-                shared.topk_mask = Some(if ncomp > spec.index_topk && spec.index_topk > 0 {
-                    exact_topk_mask(
-                        &mut g,
-                        &mut params,
-                        score,
-                        base,
-                        rows,
-                        ncomp,
-                        spec.index_topk,
-                        &format!("{lp}.d"),
-                    )
-                } else {
-                    base
-                });
-            }
-            let comp_mask = shared.topk_mask.unwrap_or(causal_c);
-            let win_mask = synth_const(
-                &mut g,
-                &mut params,
-                &format!("{lp}.d.maskw"),
-                vec![0f32; n_window],
-                &[1, n_window],
-            );
-            let kv_all = g.concat_(vec![window, comp], 0);
-            let full = g.concat_(vec![win_mask, comp_mask], 1);
-            (kv_all, full, n_window + ncomp)
-        };
-
-        let sink = load_p(&mut g, &mut params, weights, &format!("{lp}.attn.attn_sink"), false)?;
-        let q3 = g.reshape_(q, vec![rows as i64, nh as i64, hd as i64]);
-        let o = build_v4_sink_attention(
-            &mut g,
-            &mut params,
-            q3,
-            kv_all,
-            mask,
-            sink,
-            (hd as f32).powf(-0.5),
-            rows,
-            nh,
-            hd,
-            n_keys,
-            &format!("{lp}.d"),
-        );
-        let o_flat = g.reshape_(o, vec![rows as i64, (nh * hd) as i64]);
-        let o_inv = rope_tail(&mut g, o_flat, cos, sin_inv, rows, nh, hd, rd);
-        let dpg = spec.dim_per_group();
-        let wo_a = load_v4_wo_a(
-            &mut g,
-            &mut params,
-            weights,
-            &format!("{lp}.attn.wo_a.weight"),
-            spec.n_groups,
-            spec.o_lora_rank,
-            dpg,
-        )?;
-        let wo_b = load_transposed_param(&mut g, &mut params, weights, &format!("{lp}.attn.wo_b.weight"))?;
-        let attn_out = build_v4_o_lora(
-            &mut g,
-            o_inv,
-            wo_a,
-            wo_b,
-            rows,
-            spec.n_groups,
-            spec.o_lora_rank,
-            dpg,
-            d,
-        );
-        h = hc_post(&mut g, attn_out, residual, attn_post, attn_comb, rows, hc, d);
-
-        // ── FFN sub-block ──
-        let residual = h;
-        let fn_f = load_transposed_param(&mut g, &mut params, weights, &format!("{lp}.hc_ffn_fn"))?;
-        let sc_f = load_p(&mut g, &mut params, weights, &format!("{lp}.hc_ffn_scale"), false)?;
-        let bs_f = load_p(&mut g, &mut params, weights, &format!("{lp}.hc_ffn_base"), false)?;
-        let (ffn_pre, ffn_post, ffn_comb) = hc_mixes(
-            &mut g,
-            &mut params,
-            h,
-            fn_f,
-            sc_f,
-            bs_f,
-            rows,
-            hc,
-            d,
-            eps,
-            spec.hc_eps,
-            spec.hc_mult_sinkhorn_iters,
-            &format!("{lp}.df"),
-        );
-        let xf = hc_reduce(&mut g, h, attn_pre, rows, hc);
-        let fnorm = load_norm(&mut g, &mut params, weights, &format!("{lp}.ffn_norm.weight"), 0.0)?;
-        let xf = g.rms_norm(xf, fnorm, zb_d, eps);
-        let ffn_out = build_v41_moe(&mut g, &mut params, packed, weights, spec, il, xf, rows, None)?;
-        h = hc_post(&mut g, ffn_out, residual, ffn_post, ffn_comb, rows, hc, d);
-        pre_mix = ffn_pre;
+        h = nh;
+        let (nh, pre_ffn) =
+            hc_sublayer_plain(&mut ctx, HcSide::Ffn, &lp, h, pre_attn, |ctx, xf| {
+                build_v41_moe(ctx, il, xf, 1, None)
+            })?;
+        h = nh;
+        pre_mix = pre_ffn;
     }
 
-    let x = hc_reduce(&mut g, h, pre_mix, rows, hc);
-    let fnorm = load_norm(&mut g, &mut params, weights, "norm.weight", 0.0)?;
-    let x = g.rms_norm(x, fnorm, zb_d, eps);
-    let head = load_proj(&mut g, &mut params, packed, weights, "head.weight")?;
-    let logits = emit_proj(&mut g, x, &head, Shape::new(&[rows, spec.vocab_size], f));
-    let logits = g.reshape_(logits, vec![rows as i64, spec.vocab_size as i64]);
+    let x = hc_reduce(&mut ctx.g, h, pre_mix, 1, hc);
+    let gain = ctx.norm("norm.weight")?;
+    let zb = ctx.zero_bias("v41d.zb.d", d);
+    let eps = ctx.eps();
+    let x = ctx.g.rms_norm(x, gain, zb, eps);
+    let logits = ctx.project("head.weight", x, 1, spec.vocab_size)?;
+    let logits = ctx.g.reshape_(logits, vec![1, spec.vocab_size as i64]);
 
     let mut all = vec![logits];
-    let mut all_names = vec!["logits".to_string()];
+    let mut names_out = vec!["logits".to_string()];
     if inputs.emit_main_hidden {
-        all.push(main_hidden_node(&mut g, &main_hiddens, spec, rows)?);
-        all_names.push("main_hidden".to_string());
+        all.push(main_hidden_node(&mut ctx.g, &main_hiddens, spec, 1)?);
+        names_out.push("main_hidden".to_string());
     }
-    all.extend(outputs);
-    all_names.extend(output_names);
-    g.set_outputs(all);
-    let _ = NEG;
-    Ok((g, params, all_names))
+    all.extend(step.nodes);
+    names_out.extend(step.names);
+    let (g, params) = ctx.finish(all);
+    Ok((g, params, names_out))
+}
+
+/// The cache pieces one step hands back, in graph-output order.
+#[derive(Default)]
+pub(crate) struct StepOutputs {
+    pub nodes: Vec<NodeId>,
+    pub names: Vec<String>,
+}
+
+impl StepOutputs {
+    fn push(&mut self, node: NodeId, name: String) {
+        self.nodes.push(node);
+        self.names.push(name);
+    }
+}
+
+/// The RoPE tables one decode step needs: the current position for `q` and the
+/// window KV, plus — for each ratio that *completes* a group this step — the
+/// position its new latent stands for.
+pub(crate) struct StepRope {
+    win: (NodeId, NodeId, NodeId),
+    comp: (NodeId, NodeId, NodeId),
+    latent: HashMap<usize, (NodeId, NodeId)>,
+}
+
+impl StepRope {
+    pub(crate) fn build(ctx: &mut Ctx<'_>, plan: &V41DecodePlan) -> Self {
+        let spec = ctx.spec;
+        let (rd, pos) = (ctx.rd(), plan.pos);
+        let (theta, ctheta) = (spec.rope_theta, spec.compress_rope_theta);
+        let yarn = (spec.original_seq_len > 0 && spec.rope_factor > 1.0).then_some((
+            spec.original_seq_len,
+            spec.rope_factor,
+            spec.beta_fast,
+            spec.beta_slow,
+        ));
+        let win = rope_table(
+            &mut ctx.g,
+            &mut ctx.params,
+            &[pos],
+            rd,
+            theta,
+            None,
+            "d.win",
+        );
+        let comp = rope_table(
+            &mut ctx.g,
+            &mut ctx.params,
+            &[pos],
+            rd,
+            ctheta,
+            yarn,
+            "d.comp",
+        );
+
+        let firing: Vec<usize> = plan
+            .sources
+            .iter()
+            .filter(|s| s.fires)
+            .map(|s| s.ratio)
+            .collect();
+        let mut latent = HashMap::new();
+        for ratio in firing {
+            if latent.contains_key(&ratio) {
+                continue;
+            }
+            // a latent completed now stands for the first token of its group
+            let p = pos + 1 - ratio;
+            let (c, s, _) = rope_table(
+                &mut ctx.g,
+                &mut ctx.params,
+                &[p],
+                rd,
+                ctheta,
+                yarn,
+                &format!("d.lat{ratio}"),
+            );
+            latent.insert(ratio, (c, s));
+        }
+        StepRope { win, comp, latent }
+    }
+
+    pub(crate) fn for_layer(&self, ratio: usize) -> RopeTables {
+        let (cos, sin, sin_inv) = if ratio > 0 { self.comp } else { self.win };
+        let (cos_c, sin_c) = self
+            .latent
+            .get(&ratio)
+            .copied()
+            .unwrap_or((self.comp.0, self.comp.1));
+        RopeTables {
+            cos,
+            sin,
+            sin_inv,
+            cos_c,
+            sin_c,
+        }
+    }
+}
+
+/// Extend this source layer's compressed caches by (at most) one latent, and
+/// publish them for the layers that read them.
+fn extend_compressed(
+    ctx: &mut Ctx<'_>,
+    lp: &str,
+    il: usize,
+    x: NodeId,
+    step: &CompressStep,
+    rope: &RopeTables,
+    shared: &mut StepShared,
+    out: &mut StepOutputs,
+) -> Result<()> {
+    let f = DType::F32;
+    let (hd, ihd, rd, eps) = (
+        ctx.spec.head_dim,
+        ctx.spec.index_head_dim,
+        ctx.rd(),
+        ctx.eps(),
+    );
+    let (latent, carried) = build_step_compressor(ctx, lp, x, step)?;
+    for (node, name) in carried {
+        out.push(node, name);
+    }
+
+    // the caches as they stood before this step
+    let cached_comp = (step.len_before > 0).then(|| {
+        ctx.g.input(
+            names::compress_kv(il),
+            Shape::new(&[step.len_before, hd], f),
+        )
+    });
+    let cached_ik = (step.len_before > 0 && ihd > 0).then(|| {
+        ctx.g
+            .input(names::index_k(il), Shape::new(&[step.len_before, ihd], f))
+    });
+
+    match latent {
+        Some(lat) => {
+            let (cos_l, sin_l) = (rope.cos_c, rope.sin_c);
+            if ihd > 0 {
+                let wk = ctx.param(&format!("{lp}.attn.indexer.wk.weight"), true)?;
+                let gain = ctx.norm(&format!("{lp}.attn.indexer.k_norm.weight"))?;
+                let zb = ctx.zero_bias(&format!("{lp}.dzb.ihd"), ihd);
+                let k = ctx.g.mm(lat, wk);
+                let k = ctx.g.rms_norm(k, gain, zb, eps);
+                let k = rope_tail(&mut ctx.g, k, cos_l, sin_l, 1, 1, ihd, rd);
+                out.push(k, names::index_k_new(il));
+                shared.csa.index_k = Some(match cached_ik {
+                    Some(c) => ctx.g.concat_(vec![c, k], 0),
+                    None => k,
+                });
+            }
+            let comp = rope_tail(&mut ctx.g, lat, cos_l, sin_l, 1, 1, hd, rd);
+            out.push(comp, names::compress_kv_new(il));
+            shared.csa.compress_kv = Some(match cached_comp {
+                Some(c) => ctx.g.concat_(vec![c, comp], 0),
+                None => comp,
+            });
+        }
+        None => {
+            shared.csa.compress_kv = cached_comp;
+            shared.csa.index_k = cached_ik;
+        }
+    }
+    shared.len_after = step.len_after;
+    Ok(())
+}
+
+/// One decode step's attention. Unlike prefill there is no causal masking to do:
+/// every window slot the host supplied and every cached latent is visible to
+/// this query by construction, so only the Indexer's budget can drop anything.
+pub(crate) fn build_decode_attention(
+    ctx: &mut Ctx<'_>,
+    il: usize,
+    x: NodeId,
+    plan: &V41DecodePlan,
+    rope: &RopeTables,
+    shared: &mut StepShared,
+    out: &mut StepOutputs,
+) -> Result<NodeId> {
+    let lp = ctx.spec.layer_prefix(il);
+    let hd = ctx.spec.head_dim;
+    let cache_len = plan.cache_len;
+    let f = DType::F32;
+
+    let Qkv { qr, q, kv } = build_qkv(ctx, &lp, x, rope.cos, rope.sin, 1)?;
+    out.push(kv, names::window_kv_new(il));
+
+    // the window this query attends over: everything cached, plus itself
+    let window = if cache_len > 0 {
+        let cached = ctx
+            .g
+            .input(names::window_kv(il), Shape::new(&[cache_len, hd], f));
+        ctx.g.concat_(vec![cached, kv], 0)
+    } else {
+        kv
+    };
+    let n_window = cache_len + 1;
+
+    if let Some(step) = plan.for_source(il) {
+        extend_compressed(ctx, &lp, il, x, step, rope, shared, out)?;
+    }
+
+    let ncomp = if ctx.spec.ratio(il) > 0 {
+        plan.for_source(ctx.spec.kv_source_for(il).unwrap_or(il))
+            .map(|s| s.len_after)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
+    let (kv_all, mask, n_keys) = if ncomp == 0 {
+        let m = open_mask(ctx, &format!("{lp}.d.maskw"), 1, n_window);
+        (window, m, n_window)
+    } else {
+        if shared.len_after != ncomp {
+            return Err(anyhow!(
+                "deepseek_v41 decode: layer {il} expects {ncomp} compressed positions, \
+                 source has {}",
+                shared.len_after
+            ));
+        }
+        let comp = shared.csa.compress_kv.ok_or_else(|| {
+            anyhow!("deepseek_v41 decode: layer {il} reads compressed KV with no source")
+        })?;
+        // one query, and it has passed every latent in the cache
+        let comp_geom = Compressed::new(ctx, vec![ncomp], ncomp, &format!("{lp}.d.maskc"));
+        let causal_c = comp_geom.causal;
+        if ctx.spec.is_index_source(il) && ctx.spec.index_head_dim > 0 {
+            publish_topk_mask(ctx, il, x, qr, &comp_geom, rope, &mut shared.csa, ".d")?;
+        }
+        let comp_mask = shared.csa.topk_mask.unwrap_or(causal_c);
+        let win_mask = open_mask(ctx, &format!("{lp}.d.maskw"), 1, n_window);
+        let kv_all = ctx.g.concat_(vec![window, comp], 0);
+        let full = ctx.g.concat_(vec![win_mask, comp_mask], 1);
+        (kv_all, full, n_window + ncomp)
+    };
+
+    build_attn_out(
+        ctx,
+        &lp,
+        &AttnOut {
+            q,
+            kv_all,
+            mask,
+            n_keys,
+            rows: 1,
+            cos: rope.cos,
+            sin_inv: rope.sin_inv,
+        },
+    )
 }
 
 /// One decode step of the KV Compressor.
@@ -730,30 +868,23 @@ pub fn build_deepseek_v41_decode(
 /// carried state. Above that, the step either completes the group — pooling the
 /// carried `ratio - 1` entries together with this token's — or contributes to it,
 /// in which case there is no latent and the raw `wkv`/`wgate` pair is handed back.
-#[allow(clippy::too_many_arguments)]
 fn build_step_compressor(
-    g: &mut Graph,
-    params: &mut HashMap<String, Vec<f32>>,
-    weights: &mut dyn WeightLoader,
+    ctx: &mut Ctx<'_>,
     lp: &str,
     x: NodeId,
     step: &CompressStep,
-    hd: usize,
-    eps: f32,
 ) -> Result<(Option<NodeId>, Vec<(NodeId, String)>)> {
     let f = DType::F32;
-    let wkv = load_p(g, params, weights, &format!("{lp}.attn.compressor.wkv.weight"), true)?;
-    let norm_w = load_norm(g, params, weights, &format!("{lp}.attn.compressor.norm.weight"), 0.0)?;
-    let zb = synth_zero(g, params, &format!("{lp}.d.comp.zb"), hd);
-    let kv = g.mm(x, wkv); // [1, hd]
+    let hd = ctx.spec.head_dim;
+    let w = CompressorW::load(ctx, lp, ".d")?;
+    let kv = w.latent(ctx, x); // [1, hd]
 
     if step.ratio == 1 {
-        let latent = g.rms_norm(kv, norm_w, zb, eps);
-        return Ok((Some(latent), Vec::new()));
+        return Ok((Some(w.norm(ctx, kv)), Vec::new()));
     }
 
-    let wgate = load_p(g, params, weights, &format!("{lp}.attn.compressor.wgate.weight"), true)?;
-    let score = g.mm(x, wgate); // [1, hd]
+    let wgate = ctx.param(&format!("{lp}.attn.compressor.wgate.weight"), true)?;
+    let score = ctx.g.mm(x, wgate); // [1, hd]
     if !step.fires {
         // still filling: hand both halves back for the host to accumulate
         return Ok((
@@ -768,22 +899,23 @@ fn build_step_compressor(
     let filled = step.group_filled;
     debug_assert_eq!(filled, step.ratio - 1, "a firing step completes the group");
     let (kv_group, sc_group) = if filled > 0 {
-        let gk = g.input(names::group_kv(step.source_layer), Shape::new(&[filled, hd], f));
-        let gs = g.input(names::group_score(step.source_layer), Shape::new(&[filled, hd], f));
-        (g.concat_(vec![gk, kv], 0), g.concat_(vec![gs, score], 0))
+        let gk = ctx.g.input(
+            names::group_kv(step.source_layer),
+            Shape::new(&[filled, hd], f),
+        );
+        let gs = ctx.g.input(
+            names::group_score(step.source_layer),
+            Shape::new(&[filled, hd], f),
+        );
+        (
+            ctx.g.concat_(vec![gk, kv], 0),
+            ctx.g.concat_(vec![gs, score], 0),
+        )
     } else {
         (kv, score)
     };
-    let (r, dd) = (step.ratio as i64, hd as i64);
-    let kv3 = g.reshape_(kv_group, vec![1, r, dd]);
-    let sc3 = g.reshape_(sc_group, vec![1, r, dd]);
-    let sct = g.transpose_(sc3, vec![0, 2, 1]); // [1, hd, ratio]
-    let w = g.sm(sct, -1);
-    let w = g.transpose_(w, vec![0, 2, 1]);
-    let prod = g.mul(kv3, w);
-    let pooled = g.sum(prod, vec![1], false); // [1, hd]
-    let pooled = g.reshape_(pooled, vec![1, dd]);
-    Ok((Some(g.rms_norm(pooled, norm_w, zb, eps)), Vec::new()))
+    let pooled = pool_groups(ctx, kv_group, sc_group, 1, step.ratio, hd);
+    Ok((Some(w.norm(ctx, pooled)), Vec::new()))
 }
 
 #[cfg(test)]

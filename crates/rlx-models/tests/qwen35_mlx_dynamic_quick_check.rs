@@ -13,38 +13,54 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-//! MLX quick check: dynamic prefill + decode compile paths.
+//! MLX quick check: dynamic prefill + decode must match CPU.
 
 mod compile_support;
 
 #[cfg(all(target_os = "macos", feature = "mlx"))]
-#[test]
-fn qwen35_dynamic_prefill_runs_on_mlx() {
+mod parity {
     use rlx_models::Qwen35RunnerBuilder;
     use rlx_models::qwen35::synth;
     use rlx_runtime::Device;
 
-    let cfg = synth::tiny_cfg();
-    let weights = synth::synth_weights(&cfg);
-    let mut runner = Qwen35RunnerBuilder::default()
-        .inline_weights(cfg.clone(), weights)
-        .device(Device::Mlx)
-        .max_seq(8)
-        .dynamic_prefill(true)
-        .dynamic_decode(true)
-        .bucketed_decode(false)
-        .last_logits_only(true)
-        .build()
-        .expect("mlx dynamic runner");
+    /// Dynamic prefill + decode on `device`; returns both steps' logits so a
+    /// divergence in either one is caught.
+    fn run(device: Device) -> Vec<f32> {
+        let cfg = synth::tiny_cfg();
+        let weights = synth::synth_weights(&cfg);
+        let mut runner = Qwen35RunnerBuilder::default()
+            .inline_weights(cfg.clone(), weights)
+            .device(device)
+            .max_seq(8)
+            .dynamic_prefill(true)
+            .dynamic_decode(true)
+            .bucketed_decode(false)
+            .last_logits_only(true)
+            .build()
+            .expect("dynamic runner");
 
-    let logits = runner
-        .prefill_get_last_logits(&[1, 2, 3])
-        .expect("dynamic prefill on mlx");
-    assert_eq!(logits.len(), cfg.vocab_size);
-    for v in &logits {
-        assert!(v.is_finite());
+        let mut out = runner
+            .prefill_get_last_logits(&[1, 2, 3])
+            .expect("dynamic prefill");
+        assert_eq!(out.len(), cfg.vocab_size, "prefill logits width");
+        let step = runner.decode_get_logits(4).expect("dynamic decode");
+        assert_eq!(step.len(), cfg.vocab_size, "decode logits width");
+        out.extend_from_slice(&step);
+        out
     }
 
-    let step = runner.decode_get_logits(4).expect("dynamic decode on mlx");
-    assert_eq!(step.len(), cfg.vocab_size);
+    /// The mlx result must equal CPU's, not merely be finite.
+    ///
+    /// This previously ran on mlx alone and asserted finiteness — and did
+    /// not check the decode logits at all beyond their length.
+    #[test]
+    fn qwen35_dynamic_matches_cpu_on_mlx() {
+        if !rlx_runtime::is_available(Device::Mlx) {
+            eprintln!("skip: mlx not available");
+            return;
+        }
+        let cpu = run(Device::Cpu);
+        let dev = run(Device::Mlx);
+        super::compile_support::assert_matches_cpu("mlx", &cpu, &dev, 2e-3);
+    }
 }

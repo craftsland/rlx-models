@@ -28,13 +28,12 @@
 //! (`DSparkAttention`, `DSparkBlock`, `Transformer.forward_spec`).
 
 use crate::dsv41::DeepseekV41Spec;
-use crate::dsv41_graph::{
-    V41Inputs, build_v41_moe, hc_mixes, hc_post, hc_reduce, identity_pre_mix, rope_table,
-};
+use crate::dsv41_block::{AttnOut, AttnProj, Ctx, build_attn_out, open_mask, rope_table};
+use crate::dsv41_graph::V41Inputs;
+use crate::dsv41_hc::{HcSide, hc_reduce, hc_sublayer_plain, identity_pre_mix};
+use crate::dsv41_moe::build_v41_moe;
 use crate::standard_decoder::{
-    build_dspark_confidence_head, build_dspark_markov_head, build_v4_o_lora,
-    build_v4_sink_attention, emit_proj, load_dense_dequant, load_norm, load_p, load_proj,
-    load_transposed_param, load_v4_wo_a, rope_tail, synth_const, synth_zero,
+    build_dspark_confidence_head, build_dspark_markov_head, load_dense_dequant, load_p,
 };
 use crate::weight_loader::WeightLoader;
 use anyhow::{Result, anyhow};
@@ -73,29 +72,27 @@ pub fn build_v41_dspark_seed(
     packed: &mut HashMap<String, (Vec<u8>, QuantScheme, Vec<usize>)>,
 ) -> Result<(Graph, HashMap<String, Vec<f32>>, Vec<String>)> {
     if spec.n_mtp_layers == 0 {
-        return Err(anyhow!("deepseek_v41: this checkpoint has no DSpark stages"));
+        return Err(anyhow!(
+            "deepseek_v41: this checkpoint has no DSpark stages"
+        ));
     }
-    let mut g = Graph::new("deepseek_v41_dspark_seed");
-    let mut params: HashMap<String, Vec<f32>> = HashMap::new();
+    let mut ctx = Ctx::new("deepseek_v41_dspark_seed", spec, weights, packed, seq);
     let f = DType::F32;
-    let (d, hd) = (spec.dim, spec.head_dim);
-    let rd = spec.rope_head_dim & !1;
-    let eps = spec.rms_norm_eps;
+    let (d, rd) = (spec.dim, spec.rope_head_dim & !1);
     let n_targets = spec.dspark_target_layer_ids.len();
     let keep = seq.min(spec.window_size);
-    let zb_d = synth_zero(&mut g, &mut params, "v41s.zb.d", d);
-    let zb_hd = synth_zero(&mut g, &mut params, "v41s.zb.hd", hd);
 
-    let main_hidden = g.input("main_hidden", Shape::new(&[seq, d * n_targets], f));
-    let main_x = build_main_x(&mut g, &mut params, packed, weights, spec, main_hidden, seq)?;
-
-    // DSpark stages have `compress_ratio == 0`, so the plain `rope_theta` table
-    // with no YaRN is the right one — same choice the backbone makes for a
+    let main_hidden = ctx
+        .g
+        .input("main_hidden", Shape::new(&[seq, d * n_targets], f));
+    let main_x = build_main_x(&mut ctx, main_hidden, seq)?;
+    // DSpark stages have `compress_ratio == 0`, so the plain base with no YaRN is
+    // the right table — the same choice the backbone makes for a
     // sliding-window-only layer.
     let positions: Vec<usize> = (0..seq).collect();
     let (cos, sin, _) = rope_table(
-        &mut g,
-        &mut params,
+        &mut ctx.g,
+        &mut ctx.params,
         &positions,
         rd,
         spec.rope_theta,
@@ -107,55 +104,30 @@ pub fn build_v41_dspark_seed(
     let mut names_out = Vec::new();
     for stage in 0..spec.n_mtp_layers {
         let lp = spec.layer_prefix(spec.n_layers + stage);
-        let wkv = load_proj(
-            &mut g,
-            &mut params,
-            packed,
-            weights,
-            &format!("{lp}.attn.wkv.weight"),
-        )?;
-        let kv = emit_proj(&mut g, main_x, &wkv, Shape::new(&[seq, hd], f));
-        let kv_norm = load_norm(
-            &mut g,
-            &mut params,
-            weights,
-            &format!("{lp}.attn.kv_norm.weight"),
-            0.0,
-        )?;
-        let kv = g.rms_norm(kv, kv_norm, zb_hd, eps);
-        let kv = rope_tail(&mut g, kv, cos, sin, seq, 1, hd, rd);
+        let w = AttnProj::load(&mut ctx, &lp)?;
+        let kv = w.kv(&mut ctx, main_x, cos, sin, seq);
         // the ring only retains the last `window_size` positions
         let kept = if keep < seq {
-            g.narrow_(kv, 0, seq - keep, keep)
+            ctx.g.narrow_(kv, 0, seq - keep, keep)
         } else {
             kv
         };
         outs.push(kept);
         names_out.push(names::window_kv(stage));
     }
-    let _ = zb_d;
-    g.set_outputs(outs);
+    let (g, params) = ctx.finish(outs);
     Ok((g, params, names_out))
 }
 
 /// `main_norm(main_proj(main_hidden))` — stage 0 owns the projection that turns
 /// the concatenated target-layer states into the DSpark stream's conditioning.
-fn build_main_x(
-    g: &mut Graph,
-    params: &mut HashMap<String, Vec<f32>>,
-    packed: &mut HashMap<String, (Vec<u8>, QuantScheme, Vec<usize>)>,
-    weights: &mut dyn WeightLoader,
-    spec: &DeepseekV41Spec,
-    main_hidden: NodeId,
-    rows: usize,
-) -> Result<NodeId> {
-    let f = DType::F32;
-    let lp = spec.layer_prefix(spec.n_layers); // stage 0
-    let proj = load_proj(g, params, packed, weights, &format!("{lp}.main_proj.weight"))?;
-    let x = emit_proj(g, main_hidden, &proj, Shape::new(&[rows, spec.dim], f));
-    let norm = load_norm(g, params, weights, &format!("{lp}.main_norm.weight"), 0.0)?;
-    let zb = synth_zero(g, params, "v41s.mainx.zb", spec.dim);
-    Ok(g.rms_norm(x, norm, zb, spec.rms_norm_eps))
+fn build_main_x(ctx: &mut Ctx<'_>, main_hidden: NodeId, rows: usize) -> Result<NodeId> {
+    let (d, eps) = (ctx.spec.dim, ctx.eps());
+    let lp = ctx.spec.layer_prefix(ctx.spec.n_layers); // stage 0 owns the projection
+    let x = ctx.project(&format!("{lp}.main_proj.weight"), main_hidden, rows, d)?;
+    let gain = ctx.norm(&format!("{lp}.main_norm.weight"))?;
+    let zb = ctx.zero_bias("v41s.mainx.zb", d);
+    Ok(ctx.g.rms_norm(x, gain, zb, eps))
 }
 
 /// One DSpark draft step at main-model position `pos`.
@@ -180,52 +152,32 @@ pub fn build_v41_dspark_step(
     packed: &mut HashMap<String, (Vec<u8>, QuantScheme, Vec<usize>)>,
 ) -> Result<(Graph, HashMap<String, Vec<f32>>, Vec<String>)> {
     if spec.n_mtp_layers == 0 || spec.dspark_block_size == 0 {
-        return Err(anyhow!("deepseek_v41: this checkpoint has no DSpark stages"));
+        return Err(anyhow!(
+            "deepseek_v41: this checkpoint has no DSpark stages"
+        ));
     }
-    let mut g = Graph::new("deepseek_v41_dspark_step");
-    let mut params: HashMap<String, Vec<f32>> = HashMap::new();
-    let f = DType::F32;
-    let (d, hc, nh, hd) = (spec.dim, spec.hc_mult, spec.n_heads, spec.head_dim);
-    let ql = spec.q_lora_rank;
-    let rd = spec.rope_head_dim & !1;
-    let eps = spec.rms_norm_eps;
     let block = spec.dspark_block_size;
+    let mut ctx = Ctx::new("deepseek_v41_dspark_step", spec, weights, packed, block);
+    let (d, hc) = (spec.dim, spec.hc_mult);
     let n_targets = spec.dspark_target_layer_ids.len();
-    let zb_d = synth_zero(&mut g, &mut params, "v41k.zb.d", d);
-    let zb_ql = synth_zero(&mut g, &mut params, "v41k.zb.ql", ql);
-    let zb_hd = synth_zero(&mut g, &mut params, "v41k.zb.hd", hd);
+    let f = DType::F32;
 
-    let main_hidden = g.input("main_hidden", Shape::new(&[1, d * n_targets], f));
-    let main_x = build_main_x(&mut g, &mut params, packed, weights, spec, main_hidden, 1)?;
+    let main_hidden = ctx
+        .g
+        .input("main_hidden", Shape::new(&[1, d * n_targets], f));
+    let main_x = build_main_x(&mut ctx, main_hidden, 1)?;
+    let rope = DraftRope::build(&mut ctx, pos, block);
 
-    // The main token sits at `pos`; the draft block starts one past it.
-    let (cos_m, sin_m, _) = rope_table(
-        &mut g,
-        &mut params,
-        &[pos],
-        rd,
-        spec.rope_theta,
-        None,
-        "k.main",
-    );
-    let draft_positions: Vec<usize> = (0..block).map(|i| pos + 1 + i).collect();
-    let (cos_b, sin_b, sininv_b) = rope_table(
-        &mut g,
-        &mut params,
-        &draft_positions,
-        rd,
-        spec.rope_theta,
-        None,
-        "k.blk",
-    );
-
-    let draft_ids = g.input("draft_ids", Shape::new(&[1, block], DType::I32));
-    let (embed_w, _, _) = load_dense_dequant(&mut g, &mut params, weights, "embed.weight")?;
-    let e0 = g.gather_(embed_w, draft_ids, 0);
-    let e0 = g.reshape_(e0, vec![block as i64, 1, d as i64]);
-    let ones_hc = synth_const(&mut g, &mut params, "v41k.hc.ones", vec![1f32; hc], &[1, hc, 1]);
-    let mut h = g.mul(e0, ones_hc);
-    let mut pre_mix = identity_pre_mix(&mut g, &mut params, block, hc);
+    let draft_ids = ctx
+        .g
+        .input("draft_ids", Shape::new(&[1, block], DType::I32));
+    let (embed_w, _, _) =
+        load_dense_dequant(&mut ctx.g, &mut ctx.params, ctx.weights, "embed.weight")?;
+    let e0 = ctx.g.gather_(embed_w, draft_ids, 0);
+    let e0 = ctx.g.reshape_(e0, vec![block as i64, 1, d as i64]);
+    let ones = ctx.konst("v41k.hc.ones", vec![1f32; hc], &[1, hc, 1]);
+    let mut h = ctx.g.mul(e0, ones);
+    let mut pre_mix = identity_pre_mix(&mut ctx.g, &mut ctx.params, block, hc);
 
     let mut kv_outs: Vec<(NodeId, String)> = Vec::new();
 
@@ -239,140 +191,34 @@ pub fn build_v41_dspark_step(
             ));
         }
 
-        // ── attention sub-block ──
-        let residual = h;
-        let fn_a = load_transposed_param(&mut g, &mut params, weights, &format!("{lp}.hc_attn_fn"))?;
-        let sc_a = load_p(&mut g, &mut params, weights, &format!("{lp}.hc_attn_scale"), false)?;
-        let bs_a = load_p(&mut g, &mut params, weights, &format!("{lp}.hc_attn_base"), false)?;
-        let (attn_pre, attn_post, attn_comb) = hc_mixes(
-            &mut g,
-            &mut params,
-            h,
-            fn_a,
-            sc_a,
-            bs_a,
-            block,
-            hc,
-            d,
-            eps,
-            spec.hc_eps,
-            spec.hc_mult_sinkhorn_iters,
-            &format!("{lp}.ka"),
-        );
-        let xa = hc_reduce(&mut g, h, pre_mix, block, hc);
-        let an = load_norm(&mut g, &mut params, weights, &format!("{lp}.attn_norm.weight"), 0.0)?;
-        let xa = g.rms_norm(xa, an, zb_d, eps);
-
-        let wq_a = load_proj(&mut g, &mut params, packed, weights, &format!("{lp}.attn.wq_a.weight"))?;
-        let qr = emit_proj(&mut g, xa, &wq_a, Shape::new(&[block, ql], f));
-        let q_norm = load_norm(&mut g, &mut params, weights, &format!("{lp}.attn.q_norm.weight"), 0.0)?;
-        let qr = g.rms_norm(qr, q_norm, zb_ql, eps);
-        let wq_b = load_proj(&mut g, &mut params, packed, weights, &format!("{lp}.attn.wq_b.weight"))?;
-        let q = emit_proj(&mut g, qr, &wq_b, Shape::new(&[block, nh * hd], f));
-        let q = rope_tail(&mut g, q, cos_b, sin_b, block, nh, hd, rd);
-
-        // one `wkv` serves both the main-model latent and the draft keys
-        let wkv = load_proj(&mut g, &mut params, packed, weights, &format!("{lp}.attn.wkv.weight"))?;
-        let kv_norm = load_norm(&mut g, &mut params, weights, &format!("{lp}.attn.kv_norm.weight"), 0.0)?;
-
-        let main_kv = emit_proj(&mut g, main_x, &wkv, Shape::new(&[1, hd], f));
-        let main_kv = g.rms_norm(main_kv, kv_norm, zb_hd, eps);
-        let main_kv = rope_tail(&mut g, main_kv, cos_m, sin_m, 1, 1, hd, rd);
-        kv_outs.push((main_kv, names::window_kv_new(stage)));
-
-        let draft_kv = emit_proj(&mut g, xa, &wkv, Shape::new(&[block, hd], f));
-        let draft_kv = g.rms_norm(draft_kv, kv_norm, zb_hd, eps);
-        let draft_kv = rope_tail(&mut g, draft_kv, cos_b, sin_b, block, 1, hd, rd);
-
-        let window = if cache_len > 0 {
-            let cached = g.input(names::window_kv(stage), Shape::new(&[cache_len, hd], f));
-            g.concat_(vec![cached, main_kv], 0)
-        } else {
-            main_kv
-        };
-        let n_window = cache_len + 1;
-        let kv_all = g.concat_(vec![window, draft_kv], 0);
-        let n_keys = n_window + block;
-        // Every key is visible to every draft query: the window slots are all
-        // real, and the block is deliberately non-causal within itself.
-        let mask = synth_const(
-            &mut g,
-            &mut params,
-            &format!("{lp}.k.mask"),
-            vec![0f32; block * n_keys],
-            &[block, n_keys],
-        );
-
-        let sink = load_p(&mut g, &mut params, weights, &format!("{lp}.attn.attn_sink"), false)?;
-        let q3 = g.reshape_(q, vec![block as i64, nh as i64, hd as i64]);
-        let o = build_v4_sink_attention(
-            &mut g,
-            &mut params,
-            q3,
-            kv_all,
-            mask,
-            sink,
-            (hd as f32).powf(-0.5),
-            block,
-            nh,
-            hd,
-            n_keys,
-            &format!("{lp}.k"),
-        );
-        let o_flat = g.reshape_(o, vec![block as i64, (nh * hd) as i64]);
-        let o_inv = rope_tail(&mut g, o_flat, cos_b, sininv_b, block, nh, hd, rd);
-        let dpg = spec.dim_per_group();
-        let wo_a = load_v4_wo_a(
-            &mut g,
-            &mut params,
-            weights,
-            &format!("{lp}.attn.wo_a.weight"),
-            spec.n_groups,
-            spec.o_lora_rank,
-            dpg,
-        )?;
-        let wo_b = load_transposed_param(&mut g, &mut params, weights, &format!("{lp}.attn.wo_b.weight"))?;
-        let attn_out = build_v4_o_lora(
-            &mut g, o_inv, wo_a, wo_b, block, spec.n_groups, spec.o_lora_rank, dpg, d,
-        );
-        h = hc_post(&mut g, attn_out, residual, attn_post, attn_comb, block, hc, d);
-
-        // ── FFN sub-block (the stage's own, smaller expert bank) ──
-        let residual = h;
-        let fn_f = load_transposed_param(&mut g, &mut params, weights, &format!("{lp}.hc_ffn_fn"))?;
-        let sc_f = load_p(&mut g, &mut params, weights, &format!("{lp}.hc_ffn_scale"), false)?;
-        let bs_f = load_p(&mut g, &mut params, weights, &format!("{lp}.hc_ffn_base"), false)?;
-        let (ffn_pre, ffn_post, ffn_comb) = hc_mixes(
-            &mut g,
-            &mut params,
-            h,
-            fn_f,
-            sc_f,
-            bs_f,
-            block,
-            hc,
-            d,
-            eps,
-            spec.hc_eps,
-            spec.hc_mult_sinkhorn_iters,
-            &format!("{lp}.kf"),
-        );
-        let xf = hc_reduce(&mut g, h, attn_pre, block, hc);
-        let fnorm = load_norm(&mut g, &mut params, weights, &format!("{lp}.ffn_norm.weight"), 0.0)?;
-        let xf = g.rms_norm(xf, fnorm, zb_d, eps);
-        let ffn_out = build_v41_moe(&mut g, &mut params, packed, weights, spec, il, xf, block, None)?;
-        h = hc_post(&mut g, ffn_out, residual, ffn_post, ffn_comb, block, hc, d);
-        pre_mix = ffn_pre;
+        let (nh_out, pre_attn) =
+            hc_sublayer_plain(&mut ctx, HcSide::Attn, &lp, h, pre_mix, |ctx, xa| {
+                let (out, main_kv) =
+                    build_dspark_attention(ctx, stage, xa, main_x, cache_len, block, &rope)?;
+                kv_outs.push((main_kv, names::window_kv_new(stage)));
+                Ok(out)
+            })?;
+        h = nh_out;
+        // the FFN routes over the stage's own, smaller expert bank
+        let (nh_out, pre_ffn) =
+            hc_sublayer_plain(&mut ctx, HcSide::Ffn, &lp, h, pre_attn, |ctx, xf| {
+                build_v41_moe(ctx, il, xf, block, None)
+            })?;
+        h = nh_out;
+        pre_mix = pre_ffn;
     }
 
     // ── head: collapse, norm, project through the backbone's LM head ──
     let last = spec.layer_prefix(spec.n_layers + spec.n_mtp_layers - 1);
-    let x = hc_reduce(&mut g, h, pre_mix, block, hc);
-    let norm = load_norm(&mut g, &mut params, weights, &format!("{last}.norm.weight"), 0.0)?;
-    let xn = g.rms_norm(x, norm, zb_d, eps);
-    let head = load_proj(&mut g, &mut params, packed, weights, "head.weight")?;
-    let logits = emit_proj(&mut g, xn, &head, Shape::new(&[block, spec.vocab_size], f));
-    let logits = g.reshape_(logits, vec![block as i64, spec.vocab_size as i64]);
+    let x = hc_reduce(&mut ctx.g, h, pre_mix, block, hc);
+    let gain = ctx.norm(&format!("{last}.norm.weight"))?;
+    let zb = ctx.zero_bias("v41k.zb.d", d);
+    let eps = ctx.eps();
+    let xn = ctx.g.rms_norm(x, gain, zb, eps);
+    let logits = ctx.project("head.weight", xn, block, spec.vocab_size)?;
+    let logits = ctx
+        .g
+        .reshape_(logits, vec![block as i64, spec.vocab_size as i64]);
 
     let mut outs = vec![logits, x];
     let mut names_out = vec!["logits".to_string(), "hidden".to_string()];
@@ -380,8 +226,104 @@ pub fn build_v41_dspark_step(
         outs.push(n);
         names_out.push(name);
     }
-    g.set_outputs(outs);
+    let (g, params) = ctx.finish(outs);
     Ok((g, params, names_out))
+}
+
+/// The RoPE tables a draft step needs: the main token's position, and the block
+/// of draft positions that follows it.
+struct DraftRope {
+    main: (NodeId, NodeId, NodeId),
+    blk: (NodeId, NodeId, NodeId),
+}
+
+impl DraftRope {
+    fn build(ctx: &mut Ctx<'_>, pos: usize, block: usize) -> Self {
+        let (rd, theta) = (ctx.rd(), ctx.spec.rope_theta);
+        // DSpark stages have `compress_ratio == 0`, so the plain base with no
+        // YaRN is the right table — the same choice the backbone makes for a
+        // sliding-window-only layer.
+        let main = rope_table(
+            &mut ctx.g,
+            &mut ctx.params,
+            &[pos],
+            rd,
+            theta,
+            None,
+            "k.main",
+        );
+        let draft: Vec<usize> = (0..block).map(|i| pos + 1 + i).collect();
+        let blk = rope_table(
+            &mut ctx.g,
+            &mut ctx.params,
+            &draft,
+            rd,
+            theta,
+            None,
+            "k.blk",
+        );
+        DraftRope { main, blk }
+    }
+}
+
+/// One DSpark stage's attention.
+///
+/// Two things set it apart from the backbone's. Its window cache is filled from
+/// the **main** model's stream rather than its own tokens, so `wkv` is applied
+/// twice — once to `main_x` at the main position, once to the draft block. And
+/// the block is **not causal within itself**: every draft position attends to
+/// every draft key, which is why the mask is open.
+///
+/// Returns the sublayer output and the main-model latent to append to the ring.
+fn build_dspark_attention(
+    ctx: &mut Ctx<'_>,
+    stage: usize,
+    x: NodeId,
+    main_x: NodeId,
+    cache_len: usize,
+    block: usize,
+    rope: &DraftRope,
+) -> Result<(NodeId, NodeId)> {
+    let lp = ctx.spec.layer_prefix(ctx.spec.n_layers + stage);
+    let lp = lp.as_str();
+    let hd = ctx.spec.head_dim;
+    let f = DType::F32;
+    let (cos_b, sin_b, sininv_b) = rope.blk;
+    let (cos_m, sin_m, _) = rope.main;
+
+    let w = AttnProj::load(ctx, lp)?;
+    let (_, q) = w.query(ctx, x, cos_b, sin_b, block);
+    // one `wkv`, two streams: the main model's token and this draft block
+    let main_kv = w.kv(ctx, main_x, cos_m, sin_m, 1);
+    let draft_kv = w.kv(ctx, x, cos_b, sin_b, block);
+
+    let window = if cache_len > 0 {
+        let cached = ctx
+            .g
+            .input(names::window_kv(stage), Shape::new(&[cache_len, hd], f));
+        ctx.g.concat_(vec![cached, main_kv], 0)
+    } else {
+        main_kv
+    };
+    let n_window = cache_len + 1;
+    let kv_all = ctx.g.concat_(vec![window, draft_kv], 0);
+    let n_keys = n_window + block;
+    let mask = open_mask(ctx, &format!("{lp}.k.mask"), block, n_keys);
+
+    let out = build_attn_out(
+        ctx,
+        lp,
+        &AttnOut {
+            q,
+            kv_all,
+            mask,
+            n_keys,
+            rows: block,
+            cos: cos_b,
+            sin_inv: sininv_b,
+        },
+    )?;
+    Ok((out, main_kv))
 }
 
 /// The Markov bias and confidence heads, as one graph over the whole draft block.

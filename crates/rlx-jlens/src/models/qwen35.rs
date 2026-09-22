@@ -209,7 +209,7 @@ impl LensModel for Qwen35LensModel {
                 t
             }
             _ => {
-                let embd = &self.weights.token_embd;
+                let embd = &self.weights.token_embd();
                 if embd.len() < vocab * d {
                     return Err(LensError::Other(anyhow::anyhow!(
                         "tied LM head needs {}·{d} embedding entries, found {}",

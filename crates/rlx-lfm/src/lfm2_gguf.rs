@@ -119,6 +119,13 @@ impl WeightLoader for GgufNameShim {
     fn tensor_bytes_borrowed(&self, key: &str) -> Option<&[u8]> {
         self.inner.tensor_bytes_borrowed(&hf_to_gguf_name(key))
     }
+    /// Forwarded (through the same name remap) so the packed upload can
+    /// `pread` instead of borrowing the mmap. Without this the trait default
+    /// returns `false` and the streaming path silently falls back.
+    fn read_tensor_bytes_into(&self, key: &str, buf: &mut Vec<u8>) -> Result<bool> {
+        self.inner
+            .read_tensor_bytes_into(&hf_to_gguf_name(key), buf)
+    }
     fn remaining_keys(&self) -> Vec<String> {
         self.inner.remaining_keys()
     }
@@ -326,16 +333,29 @@ impl Lfm2GgufRunner {
         for (n, d) in params {
             compiled.set_param(n, d);
         }
+        // Empty bytes = GGUF zero-copy marker; otherwise the bytes are owned.
+        //
+        // For the GGUF case `pread` into one reused scratch rather than
+        // borrowing the mmap: `set_param_typed` copies through the slice, so a
+        // borrow faults in every page of the checkpoint and leaves a second
+        // full-size copy resident (unreclaimable on macOS short of `munmap`).
+        // Falls back to the borrow when the loader has no streaming backing.
+        // Revert: RLX_LFM_MMAP_UPLOAD=1.
+        let stream = !rlx_ir::env::flag("RLX_LFM_MMAP_UPLOAD");
+        let mut scratch: Vec<u8> = Vec::new();
         for (n, (bytes, _scheme, _shape)) in packed {
-            // Empty bytes = GGUF zero-copy marker: borrow the packed blob from
-            // the loader's mmap (remapped to the GGUF name by the shim).
-            let slice = if bytes.is_empty() {
-                shim.tensor_bytes_borrowed(n)
-                    .ok_or_else(|| anyhow!("lfm2: packed weight {n} bytes unavailable at attach"))?
+            if bytes.is_empty() {
+                if stream && shim.read_tensor_bytes_into(n, &mut scratch)? {
+                    compiled.set_param_typed(n, &scratch, rlx_ir::DType::U8);
+                    continue;
+                }
+                let slice = shim.tensor_bytes_borrowed(n).ok_or_else(|| {
+                    anyhow!("lfm2: packed weight {n} bytes unavailable at attach")
+                })?;
+                compiled.set_param_typed(n, slice, rlx_ir::DType::U8);
             } else {
-                bytes.as_slice()
-            };
-            compiled.set_param_typed(n, slice, rlx_ir::DType::U8);
+                compiled.set_param_typed(n, bytes.as_slice(), rlx_ir::DType::U8);
+            }
         }
         Ok(())
     }
@@ -424,16 +444,57 @@ impl Lfm2GgufRunner {
             .map_err(|e| anyhow!("lfm2: open weights {}: {e}", self.weights.display()))?;
         let mut shim = GgufNameShim::new(inner);
         let exec_device = self.pick_exec_device(&shim);
-        // CPU decode: default the wide-matmul int8 fast path ON (measured ~2×
-        // decode TPS on LFM2.5-Q4_K_M). The dispatch only affects m==1 Q4_K GEMVs
-        // whose output width ≥ this threshold (LM head + large FFN); smaller
-        // matmuls stay on Accelerate/AMX. It quantizes the activation to Q8, so
-        // it is NOT bit-identical to the pure-F32 path (can flip rare near-tie
-        // greedy tokens). Only set when the user hasn't chosen a value — override
-        // with `RLX_Q4K_FUSED_MIN_N=<n>` (set huge, e.g. that many 9s, to disable).
-        if exec_device == Device::Cpu && rlx_ir::env::is_unset("RLX_Q4K_FUSED_MIN_N") {
-            rlx_ir::env::set("RLX_Q4K_FUSED_MIN_N", "2048");
-        }
+        // NOTE: this used to force `RLX_Q4K_FUSED_MIN_N=2048` on CPU, citing a
+        // ~2× decode win. Removed: the fused kernel quantizes the activation to
+        // Q8_K, so once the threshold pulls in the FFN matmuls the error
+        // compounds through every remaining layer — which is what broke
+        // `decode_parity_live` (incremental decode vs the f32 prefill
+        // reference). Upstream rlx defaults the path off for exactly this
+        // reason; forcing it on here silently overrode that policy process-wide
+        // via an `env::set` from inside a builder.
+        //
+        // Agreement with the f32 prefill reference, 8 random-id prompts × 8
+        // tokens (deterministic):
+        //
+        // | `RLX_Q4K_FUSED_MIN_N` | 350M | 2.6B |
+        // |---|---|---|
+        // | unset (off)     | 100%  | 100%  |
+        // | 65536 (LM head) | 100%  | 100%  |
+        // | 4096            | 75.9% | 90.6% |
+        // | 2048 (was)      | 72.2% | 92.2% |
+        //
+        // Speed, arms alternated *inside one process* and min-of-5 (sequential
+        // per-config runs were useless here — two arms executing identical code
+        // differed by 28% on machine drift alone):
+        //
+        // | arm | 350M | 2.6B |
+        // |---|---|---|
+        // | off             | 33.7 tok/s | 8.4 tok/s |
+        // | 65536 (LM head) | +1.4%      | −0.4%     |
+        // | 2048 (was)      | −14.1%     | +11.1%    |
+        //
+        // It also decides peak RSS, because the exact path dequantizes Q4_K to
+        // an f32 cache while the fused kernel reads the packed bytes in place —
+        // on 2.6B, 14.45 GB exact vs 5.17 GB fused (−9.3 GB, an 8.7× vs 3.1×
+        // amplification of the 1.67 GB checkpoint), stable to ±0.02 GB over
+        // three interleaved rounds.
+        //
+        // So the old default was strictly worse on 350M (slower *and* lossy),
+        // while on 2.6B it bought ~11% decode and ~8.8 GB for non-bit-exact
+        // output — a real tradeoff, but nothing like the 2× claimed, and not
+        // one to make silently on a crate whose own parity test asserts
+        // exactness. Callers who want it — especially memory-constrained ones,
+        // where the RSS saving dwarfs the throughput delta — opt in per-process:
+        //
+        //     RLX_Q4K_FUSED_MIN_N=2048
+        //
+        // The LM-head-only width (`n == vocab_size`) is parity-exact in these
+        // samples but measures as a wash on speed, so it is not worth
+        // recommending either.
+        //
+        // Cache-thrash protection is unaffected: that lives in rlx-cpu's
+        // `prefer_cached_blas`, which routes to the fused kernel on its own when
+        // the f32 dequant cache would thrash, independent of this threshold.
         let mut packed: HashMap<String, (Vec<u8>, QuantScheme, Vec<usize>)> = HashMap::new();
         let (graph, params, names) = build_lfm2_decode(&self.spec, &mut shim, max_kv, &mut packed)?;
         let opts = packed_compile_opts(exec_device);

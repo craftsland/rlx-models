@@ -169,8 +169,7 @@ decoder:
     AsrConfig::from_nemo(&NemoConfig::from_yaml_bytes(yaml).unwrap()).unwrap()
 }
 
-#[test]
-fn encoder_builds_compiles_and_runs() {
+fn run_case(device: Device) -> Vec<f32> {
     let cfg = tiny_cfg();
     let mel_frames = 64usize; // -> ~16 encoder frames with striding×4
     let mut w = SynthWeights::new(&cfg);
@@ -180,7 +179,7 @@ fn encoder_builds_compiles_and_runs() {
 
     let built = built_from_hir(hir, params).expect("built model");
     let saved = built.params().clone();
-    let mut cg = compile_built(built, Device::Cpu).expect("compile encoder");
+    let mut cg = compile_built(built, device).expect("compile encoder");
     for (n, d) in &saved {
         cg.set_param(n, d);
     }
@@ -195,5 +194,15 @@ fn encoder_builds_compiles_and_runs() {
         .expect("encoder output");
 
     assert_eq!(out.len(), t * cfg.d_model, "output is [t, d_model]");
-    assert!(out.iter().all(|x| x.is_finite()), "all outputs finite");
+    out
+}
+
+/// Every backend must agree with CPU, not merely produce finite numbers.
+///
+/// This test previously ran on CPU alone and asserted only that the output
+/// was finite — a bar that an all-zero result, or a tensor with one head's
+/// worth of real values and the rest zero, still clears.
+#[test]
+fn encoder_builds_compiles_and_runs_matches_cpu_on_every_backend() {
+    rlx_core::backend_matrix::assert_matches_cpu_on_all("conformer-CTC encoder", 2e-3, run_case);
 }

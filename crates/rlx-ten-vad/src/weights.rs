@@ -28,7 +28,9 @@ use std::sync::OnceLock;
 
 use crate::{CONTEXT_FRAMES, FEATURE_LEN, HIDDEN, MEL_BANDS};
 
-const SAFETENSORS: &[u8] = include_bytes!("../weights/ten_vad.safetensors");
+// Sourced from `rlx-ten-vad-core`, which owns the blob so that crate can be
+// published standalone (`include_bytes!` cannot cross a package boundary).
+const SAFETENSORS: &[u8] = rlx_ten_vad_core::weights::SAFETENSORS;
 
 /// Conv channels after the first pointwise projection.
 pub const CONV_CH: usize = 16;

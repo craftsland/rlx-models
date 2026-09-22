@@ -76,6 +76,7 @@ rlx-conformer-ctc = { workspace = true, optional = true }
 rlx-funasr = { workspace = true, optional = true }
 rlx-nemotron-asr = { workspace = true, optional = true }
 rlx-locateanything = { workspace = true, optional = true }
+rlx-jina-ocr = { workspace = true, optional = true }
 rlx-unlimited-ocr = { workspace = true, optional = true }
 rlx-voxtral-tts = { workspace = true, optional = true }
 rlx-ocr = { workspace = true, optional = true }
@@ -243,6 +244,7 @@ sam-ir = ["dep:rlx-sam-ir"]
 vjepa2 = ["dep:rlx-vjepa2"]
 florence2 = ["dep:rlx-florence2"]
 locateanything = ["dep:rlx-locateanything"]
+jina-ocr = ["dep:rlx-jina-ocr"]
 unlimited-ocr = ["dep:rlx-unlimited-ocr"]
 diarize = ["dep:rlx-diarize", "dep:rlx-wespeaker", "rlx-diarize/wespeaker"]
 whisper = ["dep:rlx-whisper"]
@@ -388,6 +390,7 @@ vision-models = [
     "florence2",
     "vjepa2",
     "locateanything",
+    "jina-ocr",
     "unlimited-ocr",
     "flux2",
     "diamond",
@@ -416,6 +419,7 @@ hf-download = [
     "rlx-tinyllama?/hf-download",
     "rlx-hy-mt?/hf-download",
     "rlx-locateanything?/hf-download",
+    "rlx-jina-ocr?/hf-download",
     "rlx-unlimited-ocr?/hf-download",
     "rlx-qwen3-tts?/hf-download",
     "rlx-kittentts?/hf-download",
@@ -459,6 +463,7 @@ metal = [
     "rlx-llama32?/metal",
     "rlx-lfm?/metal",
     "rlx-locateanything?/metal",
+    "rlx-jina-ocr?/metal",
     "rlx-unlimited-ocr?/metal",
     "rlx-minicpm5?/metal",
     "rlx-nanbeige?/metal",
@@ -544,6 +549,7 @@ mlx = [
     "rlx-llama32?/mlx",
     "rlx-lfm?/mlx",
     "rlx-locateanything?/mlx",
+    "rlx-jina-ocr?/mlx",
     "rlx-unlimited-ocr?/mlx",
     "rlx-minicpm5?/mlx",
     "rlx-nanbeige?/mlx",
@@ -659,6 +665,7 @@ gpu = [
     "rlx-llama32?/gpu",
     "rlx-lfm?/gpu",
     "rlx-locateanything?/gpu",
+    "rlx-jina-ocr?/gpu",
     "rlx-unlimited-ocr?/gpu",
     "rlx-minicpm5?/gpu",
     "rlx-nanbeige?/gpu",
@@ -748,6 +755,7 @@ vulkan = [
     "rlx-llama32?/vulkan",
     "rlx-lfm?/vulkan",
     "rlx-locateanything?/vulkan",
+    "rlx-jina-ocr?/vulkan",
     "rlx-unlimited-ocr?/vulkan",
     "rlx-minicpm5?/vulkan",
     "rlx-nanbeige?/vulkan",
@@ -819,6 +827,7 @@ cuda = [
     "rlx-llama32?/cuda",
     "rlx-lfm?/cuda",
     "rlx-locateanything?/cuda",
+    "rlx-jina-ocr?/cuda",
     "rlx-unlimited-ocr?/cuda",
     "rlx-minicpm5?/cuda",
     "rlx-nanbeige?/cuda",
@@ -903,6 +912,7 @@ rocm = [
     "rlx-llama32?/rocm",
     "rlx-lfm?/rocm",
     "rlx-locateanything?/rocm",
+    "rlx-jina-ocr?/rocm",
     "rlx-unlimited-ocr?/rocm",
     "rlx-minicpm5?/rocm",
     "rlx-nanbeige?/rocm",

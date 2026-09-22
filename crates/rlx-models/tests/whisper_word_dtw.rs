@@ -27,7 +27,9 @@ struct RefWord {
     end: f32,
 }
 
-const FIXTURE: &str = include_str!("../../rlx-whisper/fixtures/jfk_words_dtw.json");
+// Lives in this crate's own tests/fixtures: `include_str!` cannot cross a
+// package boundary, and only this test uses it (nothing in rlx-whisper did).
+const FIXTURE: &str = include_str!("fixtures/jfk_words_dtw.json");
 const COLLAR_SEC: f32 = 0.2;
 
 fn within_collar(actual: f32, expected: f32) -> bool {

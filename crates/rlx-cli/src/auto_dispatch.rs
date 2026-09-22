@@ -244,6 +244,15 @@ mod families {
                remaining = a runner + packed DequantMatMul re-plumb (rlx-flow path is F32-only) — \
                real 671B–1T checkpoint not runnable on this box yet",
     };
+    /// V4.1 is further along than the rest of the family: it has a runner, so
+    /// what is left is scale rather than architecture.
+    pub static DEEPSEEK_V41: UnimplementedArch = UnimplementedArch {
+        family: "DeepSeek-V4.1-Flash",
+        milestone: "M5",
+        note: "runnable: `rlx-dsv41 --model <DIR> --prompt <TEXT> [--paged]` generates end to \
+               end (streaming weights, host routing, paged experts), parity-checked vs the \
+               reference — but the released 552B/510GB checkpoint has not been run",
+    };
     pub static COHERE: UnimplementedArch = UnimplementedArch {
         family: "Command-R / Cohere",
         milestone: "M4",
@@ -317,7 +326,7 @@ static KNOWN_UNIMPLEMENTED: phf::Map<&'static str, &'static UnimplementedArch> =
     // HF model_type keys (mlx-community): builder exists in rlx-deepseek, runner pending.
     "deepseek_v3" => &families::DEEPSEEK,
     "deepseek_v4" => &families::DEEPSEEK,
-    "deepseek_v41" => &families::DEEPSEEK,
+    "deepseek_v41" => &families::DEEPSEEK_V41,
     "kimi_k2" => &families::DEEPSEEK,
     "kimi_k25" => &families::DEEPSEEK,
     // cohere/command-r/cohere2 stay unimplemented: parallel-residual coded but

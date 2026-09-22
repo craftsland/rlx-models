@@ -41,7 +41,7 @@ fn qwen35_loaded_lm_vocab_matches_embedding_table() {
     eprintln!(
         "cfg.vocab_size={} token_embd.len={} lm_vocab_size={} hidden={}",
         cfg.vocab_size,
-        w.token_embd.len(),
+        w.token_embd().len(),
         w.lm_vocab_size(&cfg),
         cfg.hidden_size
     );

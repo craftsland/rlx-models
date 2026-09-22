@@ -60,8 +60,7 @@ fn dino_loss_trains_student_toward_teacher() {
     );
 }
 
-#[test]
-fn dino_head_forward_shape() {
+fn run_case(device: Device) -> Vec<f32> {
     let (n, in_dim, out_k) = (3usize, 16usize, 20usize);
     let cfg = DinoHeadConfig::small(in_dim, out_k);
     let mut g = Graph::new("head");
@@ -71,14 +70,24 @@ fn dino_head_forward_shape() {
     g.set_outputs(vec![y]);
 
     let init = rlx_vit_elastic::dino::init_head_params(&cfg, "head", 7);
-    let mut compiled = Session::new(Device::Cpu).compile_with(g, &CompileOptions::new());
+    let mut compiled = Session::new(device).compile_with(g, &CompileOptions::new());
     for p in &params {
         compiled.set_param(&p.name, &init[&p.name]);
     }
     let xd: Vec<f32> = (0..n * in_dim).map(|i| (i as f32 * 0.01).sin()).collect();
     let out = compiled.run(&[("x", xd.as_slice())]);
     assert_eq!(out[0].len(), n * out_k);
-    assert!(out[0].iter().all(|v| v.is_finite()));
+    out.concat()
+}
+
+/// Every backend must agree with CPU, not merely produce finite numbers.
+///
+/// This test previously ran on CPU alone and asserted only that the output
+/// was finite — a bar that an all-zero result, or a tensor with one head's
+/// worth of real values and the rest zero, still clears.
+#[test]
+fn dino_head_forward_shape_matches_cpu_on_every_backend() {
+    rlx_core::backend_matrix::assert_matches_cpu_on_all("vit-elastic DINO head", 2e-3, run_case);
 }
 
 #[test]

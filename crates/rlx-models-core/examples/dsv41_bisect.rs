@@ -9,75 +9,28 @@
 
 use rlx_models_core::dsv41::DeepseekV41Spec;
 use rlx_models_core::dsv41_graph::{V41Inputs, build_deepseek_v41_prefill};
-use rlx_models_core::weight_loader::WeightLoader;
+use rlx_models_core::parity::Deviation;
+use rlx_models_core::weight_loader::SyntheticLoader;
 use rlx_runtime::{Device, Session};
+
+/// `RLX_DSV41_DEVICE=metal|mlx|gpu|cpu` — which backend to bisect.
+fn device() -> Device {
+    match std::env::var("RLX_DSV41_DEVICE")
+        .unwrap_or_default()
+        .as_str()
+    {
+        #[cfg(feature = "metal")]
+        "metal" => Device::Metal,
+        #[cfg(feature = "mlx")]
+        "mlx" => Device::Mlx,
+        #[cfg(feature = "gpu")]
+        "gpu" => Device::Gpu,
+        "" | "cpu" => Device::Cpu,
+        other => panic!("device `{other}` is not enabled in this build"),
+    }
+}
 use serde_json::Value;
 use std::collections::BTreeMap;
-
-fn fnv1a(name: &str) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in name.as_bytes() {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
-}
-
-fn param_values(name: &str, shape: &[usize]) -> Vec<f32> {
-    let n: usize = shape.iter().product::<usize>().max(1);
-    let scale = if shape.len() >= 2 {
-        (1.0f64 / *shape.last().unwrap() as f64).sqrt()
-    } else {
-        0.2
-    };
-    let mut s = fnv1a(name);
-    (0..n)
-        .map(|_| {
-            s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut z = s;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^= z >> 31;
-            let f = (z >> 11) as f64 / (1u64 << 53) as f64;
-            ((f - 0.5) * 2.0 * scale) as f32
-        })
-        .collect()
-}
-
-struct RefLoader {
-    shapes: BTreeMap<String, Vec<usize>>,
-}
-
-impl WeightLoader for RefLoader {
-    fn take(&mut self, key: &str) -> anyhow::Result<(Vec<f32>, Vec<usize>)> {
-        let shape = self
-            .shapes
-            .get(key)
-            .ok_or_else(|| anyhow::anyhow!("no tensor `{key}`"))?
-            .clone();
-        Ok((param_values(key, &shape), shape))
-    }
-    fn take_transposed(&mut self, key: &str) -> anyhow::Result<(Vec<f32>, Vec<usize>)> {
-        let (d, s) = self.take(key)?;
-        if s.len() != 2 {
-            return Ok((d, s));
-        }
-        let (r, c) = (s[0], s[1]);
-        let mut o = vec![0f32; d.len()];
-        for i in 0..r {
-            for j in 0..c {
-                o[j * r + i] = d[i * c + j];
-            }
-        }
-        Ok((o, vec![c, r]))
-    }
-    fn len(&self) -> usize {
-        self.shapes.len()
-    }
-    fn remaining_keys(&self) -> Vec<String> {
-        self.shapes.keys().cloned().collect()
-    }
-}
 
 fn main() -> anyhow::Result<()> {
     let path = std::env::var("RLX_DSV41_REF").unwrap_or_else(|_| {
@@ -87,6 +40,7 @@ fn main() -> anyhow::Result<()> {
         )
     });
     let fx: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    eprintln!("bisecting on {:?}", device());
     let spec = DeepseekV41Spec::from_config(&fx["config"])?;
     let shapes: BTreeMap<String, Vec<usize>> = fx["shapes"]
         .as_object()
@@ -117,54 +71,82 @@ fn main() -> anyhow::Result<()> {
     let inputs = V41Inputs {
         engram_rows,
         image_positions: Vec::new(),
-        emit_main_hidden: false,
+        ..Default::default()
     };
 
-    let run = || -> anyhow::Result<Vec<f32>> {
-        let mut loader = RefLoader {
-            shapes: shapes.clone(),
-        };
+    let run_on = |dev: Device| -> anyhow::Result<Vec<f32>> {
+        let mut loader = SyntheticLoader::new(shapes.clone());
         let mut packed = std::collections::HashMap::new();
-        let (g, params) =
+        let (g, params, _) =
             build_deepseek_v41_prefill(&spec, &mut loader, ids.len(), &inputs, &mut packed)?;
-        let opts = rlx_models_core::flow_bridge::compile_options_for_packed_gguf_prefill_with_profile(
-            &rlx_flow::CompileProfile::qwen3_prefill(),
-            Device::Cpu,
-        );
-        let mut c = Session::new(Device::Cpu).compile_with(g, &opts);
+        let opts =
+            rlx_models_core::flow_bridge::compile_options_for_packed_gguf_prefill_with_profile(
+                &rlx_flow::CompileProfile::qwen3_prefill(),
+                dev,
+            );
+        let mut c = Session::new(dev).compile_with(g, &opts);
         for (n, d) in &params {
             c.set_param(n, d);
         }
         Ok(c.run(&[("input_ids", ids.as_slice())])[0].clone())
     };
 
-    if let Ok(k) = std::env::var("RLX_DSV41_DUMPPARAM") {
-        let sh = shapes.get(&k).unwrap_or_else(|| panic!("no shape for {k}"));
-        let v = param_values(&k, sh);
-        let mut st = fnv1a(&k);
-        let mut zs = Vec::new();
-        for _ in 0..4 {
-            st = st.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut z = st;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^= z >> 31;
-            zs.push(z);
+    let run = || -> anyhow::Result<Vec<f32>> {
+        let mut loader = SyntheticLoader::new(shapes.clone());
+        let mut packed = std::collections::HashMap::new();
+        let (g, params, _) =
+            build_deepseek_v41_prefill(&spec, &mut loader, ids.len(), &inputs, &mut packed)?;
+        let dev = device();
+        let opts =
+            rlx_models_core::flow_bridge::compile_options_for_packed_gguf_prefill_with_profile(
+                &rlx_flow::CompileProfile::qwen3_prefill(),
+                dev,
+            );
+        let mut c = Session::new(dev).compile_with(g, &opts);
+        for (n, d) in &params {
+            c.set_param(n, d);
         }
-        println!("seed {} z {:?}", fnv1a(&k), zs);
-        println!("{k} shape {sh:?} first8 {:?}", &v[..8.min(v.len())]);
-        return Ok(());
-    }
+        Ok(c.run(&[("input_ids", ids.as_slice())])[0].clone())
+    };
 
     let empty = serde_json::Map::new();
     let inter = fx["inter"].as_object().unwrap_or(&empty);
+    let all_stages = [
+        "engram", "xa", "comp", "compkv", "topk", "sa", "oinv", "attn", "ffn", "block",
+    ];
     let mut plan: Vec<(String, usize)> = Vec::new();
     for il in 0..spec.n_layers {
-        for stage in ["engram", "comp", "compkv", "topk", "attn", "ffn", "block"] {
+        for stage in all_stages {
             if inter.contains_key(&format!("{}.{il}", stage_key(stage))) {
                 plan.push((stage.to_string(), il));
             }
         }
+    }
+
+    // Device-vs-device: CPU is the known-good side, so a backend bug can be
+    // bisected without any reference dump — and at every tap, not just the ones
+    // the Python harness happened to hook.
+    if device() != Device::Cpu {
+        println!("── {:?} vs Cpu ──", device());
+        for il in 0..spec.n_layers {
+            for stage in all_stages {
+                unsafe {
+                    std::env::set_var("RLX_DSV41_DBG", stage);
+                    std::env::set_var("RLX_DSV41_DBGLAYER", il.to_string());
+                }
+                let (Ok(cpu), Ok(dev)) = (run_on(Device::Cpu), run_on(device())) else {
+                    continue; // this tap does not exist on this layer
+                };
+                report(&format!("{stage}.{il}"), &dev, &cpu);
+            }
+        }
+        unsafe {
+            std::env::remove_var("RLX_DSV41_DBG");
+            std::env::remove_var("RLX_DSV41_DBGLAYER");
+        }
+        let (cpu, dev) = (run_on(Device::Cpu)?, run_on(device())?);
+        report("logits", &dev, &cpu);
+        return Ok(());
     }
 
     for (stage, il) in plan {
@@ -196,9 +178,8 @@ fn main() -> anyhow::Result<()> {
                     want_set.sort_unstable();
                     // a mask entry only matters if it does not annihilate the
                     // softmax term; -1 is already e^-1 of weight, -30 is nothing
-                    let mut got_set: Vec<usize> = (0..ncomp)
-                        .filter(|&c| got[q * ncomp + c] > -30.0)
-                        .collect();
+                    let mut got_set: Vec<usize> =
+                        (0..ncomp).filter(|&c| got[q * ncomp + c] > -30.0).collect();
                     got_set.sort_unstable();
                     if want_set != got_set {
                         bad += 1;
@@ -258,19 +239,9 @@ fn report(label: &str, got: &[f32], want: &[f32]) {
         println!("{label:<16} LEN {} vs {}", got.len(), want.len());
         return;
     }
-    let scale = want.iter().fold(0f32, |a, b| a.max(b.abs())).max(1e-9);
-    let (mut max_abs, mut at) = (0f32, 0usize);
-    for (i, (g, w)) in got.iter().zip(want).enumerate() {
-        let d = (g - w).abs();
-        if d > max_abs {
-            max_abs = d;
-            at = i;
-        }
-    }
-    let rel = max_abs / scale;
-    let verdict = if rel < 1e-4 { "ok  " } else { "FAIL" };
+    let d = Deviation::between(got, want);
     println!(
-        "{verdict} {label:<16} rel {rel:.3e}  max|Δ| {max_abs:.3e} at {at}  (got {:+.6}, want {:+.6})",
-        got[at], want[at]
+        "{} {label:<16} {d}",
+        if d.is_within(1e-4) { "ok  " } else { "FAIL" }
     );
 }

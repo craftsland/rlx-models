@@ -30,14 +30,9 @@ fn model_dir() -> Option<PathBuf> {
     candidates.find(|p| p.join("consolidated.safetensors").is_file())
 }
 
-#[test]
-fn cpu_decode_graph_compiles_and_runs_one_step() {
-    let Some(dir) = model_dir() else {
-        eprintln!("skip: set RLX_VOXTRAL_TTS_DIR");
-        return;
-    };
-    let cfg = VoxtralTtsConfig::from_model_dir(&dir).expect("config");
-    let store = VoxtralTtsWeightStore::open(&dir).expect("store");
+fn run_case(device: Device, dir: &std::path::Path) -> Vec<f32> {
+    let cfg = VoxtralTtsConfig::from_model_dir(dir).expect("config");
+    let store = VoxtralTtsWeightStore::open(dir).expect("store");
     let hidden = cfg.text_config.hidden_size;
     let past_len = 4usize;
     let kv_dim = cfg.text_config.num_key_value_heads * cfg.text_config.head_dim;
@@ -49,7 +44,7 @@ fn cpu_decode_graph_compiles_and_runs_one_step() {
     let built = build_tts_backbone_decode_built(&cfg.text_config, &mut wm, 1, past_len)
         .expect("decode built");
     let params = built.params().clone();
-    let mut compiled = compile_built(built, Device::Cpu).expect("cpu compile");
+    let mut compiled = compile_built(built, device).expect("cpu compile");
     for (name, data) in &params {
         compiled.set_param(name, data);
     }
@@ -74,10 +69,22 @@ fn cpu_decode_graph_compiles_and_runs_one_step() {
     let outputs = compiled.run(&input_refs);
     assert_eq!(outputs.len(), 1 + 2 * n_layers);
     assert_eq!(outputs[0].len(), hidden);
-    assert!(outputs[0].iter().all(|v| v.is_finite()));
-    eprintln!(
-        "cpu decode graph ran: hidden len {} kv tensors {}",
-        outputs[0].len(),
-        outputs.len() - 1
+    outputs[0].clone()
+}
+
+/// Every backend must agree with CPU, not merely produce finite numbers.
+///
+/// This ran on CPU alone and checked that the hidden output was finite.
+#[test]
+fn cpu_decode_graph_compiles_and_runs_one_step_matches_cpu_on_every_backend() {
+    // Needs the real checkpoint; skip loudly rather than pass vacuously.
+    let Some(dir) = model_dir() else {
+        eprintln!("skip: set RLX_VOXTRAL_TTS_DIR");
+        return;
+    };
+    rlx_core::backend_matrix::assert_matches_cpu_on_all(
+        "voxtral-tts LM decode step",
+        2e-3,
+        |device| run_case(device, &dir),
     );
 }

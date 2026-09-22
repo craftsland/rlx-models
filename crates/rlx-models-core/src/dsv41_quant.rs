@@ -148,7 +148,11 @@ pub fn dequantize(codes: &[u8], scales: &[u8], p: &QuantPlan) -> Result<Vec<f32>
         ScaleLayout::RowGroups { block } => (block, true),
     };
     let sc_cols = p.cols.div_ceil(block);
-    let sc_rows = if row_wise { p.rows } else { p.rows.div_ceil(block) };
+    let sc_rows = if row_wise {
+        p.rows
+    } else {
+        p.rows.div_ceil(block)
+    };
     if scales.len() != sc_rows * sc_cols {
         return Err(anyhow!(
             "deepseek_v41 quant: {} scale bytes, expected {}",
@@ -177,6 +181,135 @@ pub fn dequantize(codes: &[u8], scales: &[u8], p: &QuantPlan) -> Result<Vec<f32>
         }
     }
     Ok(out)
+}
+
+/// Encode `values` into `(codes, scales)` for the layout `p` describes — the
+/// inverse of [`dequantize`].
+///
+/// The released checkpoint is quantized, so a runner that has only ever been
+/// driven on dense weights has never exercised the path a real load takes. This
+/// exists to build such a checkpoint, and it is written to round-trip exactly:
+/// each group's scale is the power of two that puts its largest magnitude at the
+/// top of the code range, and every code is then the nearest representable
+/// value. `dequantize(quantize(x))` is not `x` — it is lossy by construction —
+/// but it is *stable*, so a test can compare a quantized checkpoint against the
+/// dense one holding exactly the values it decodes to.
+pub fn quantize(values: &[f32], p: &QuantPlan) -> Result<(Vec<u8>, Vec<u8>)> {
+    if values.len() != p.rows * p.cols {
+        return Err(anyhow!(
+            "deepseek_v41 quant: {} values for a {}×{} tensor",
+            values.len(),
+            p.rows,
+            p.cols
+        ));
+    }
+    let (block, row_wise) = match p.layout {
+        ScaleLayout::Tile { block } => (block, false),
+        ScaleLayout::RowGroups { block } => (block, true),
+    };
+    let sc_cols = p.cols.div_ceil(block);
+    let sc_rows = if row_wise {
+        p.rows
+    } else {
+        p.rows.div_ceil(block)
+    };
+    // largest magnitude each code format can represent
+    let code_max = match p.format {
+        CodeFormat::Fp8E4m3 => 448.0f32,
+        CodeFormat::Fp4E2m1 => 6.0f32,
+    };
+
+    // one E8M0 exponent per group, chosen from that group's peak
+    let mut scales = vec![127u8; sc_rows * sc_cols];
+    for sr in 0..sc_rows {
+        for sc in 0..sc_cols {
+            let rows = if row_wise {
+                sr..sr + 1
+            } else {
+                sr * block..((sr + 1) * block).min(p.rows)
+            };
+            let cols = sc * block..((sc + 1) * block).min(p.cols);
+            let peak = rows
+                .flat_map(|r| cols.clone().map(move |c| (r, c)))
+                .map(|(r, c)| values[r * p.cols + c].abs())
+                .fold(0f32, f32::max);
+            scales[sr * sc_cols + sc] = if peak > 0.0 {
+                // exponent e with 2^e >= peak / code_max
+                let e = (peak / code_max).log2().ceil() as i32 + 127;
+                e.clamp(1, 254) as u8
+            } else {
+                127
+            };
+        }
+    }
+
+    let stride = match p.format {
+        CodeFormat::Fp8E4m3 => p.cols,
+        CodeFormat::Fp4E2m1 => p.cols.div_ceil(2),
+    };
+    let mut codes = vec![0u8; p.rows * stride];
+    for r in 0..p.rows {
+        let sr = if row_wise { r } else { r / block };
+        for c in 0..p.cols {
+            let s = e8m0_to_f32(scales[sr * sc_cols + c / block]);
+            let x = values[r * p.cols + c] / s;
+            match p.format {
+                CodeFormat::Fp8E4m3 => codes[r * stride + c] = f32_to_e4m3fn(x),
+                CodeFormat::Fp4E2m1 => {
+                    let nib = nearest_e2m1(x);
+                    let byte = &mut codes[r * stride + c / 2];
+                    if c % 2 == 0 {
+                        *byte = (*byte & 0xF0) | nib;
+                    } else {
+                        *byte = (*byte & 0x0F) | (nib << 4);
+                    }
+                }
+            }
+        }
+    }
+    Ok((codes, scales))
+}
+
+/// The `e2m1` nibble whose value is nearest `x`.
+fn nearest_e2m1(x: f32) -> u8 {
+    let mut best = 0u8;
+    let mut best_d = f32::INFINITY;
+    for (i, &v) in E2M1_TABLE.iter().enumerate() {
+        let d = (v - x).abs();
+        if d < best_d {
+            best_d = d;
+            best = i as u8;
+        }
+    }
+    best
+}
+
+/// `f32` → `e4m3fn`, round-to-nearest-even, saturating at ±448.
+fn f32_to_e4m3fn(x: f32) -> u8 {
+    if x.is_nan() {
+        return 0x7F;
+    }
+    let sign = if x.is_sign_negative() { 0x80u8 } else { 0 };
+    let a = x.abs();
+    if a == 0.0 {
+        return sign;
+    }
+    // search is exact and the table is 128 entries — clearer than bit surgery,
+    // and this runs once per weight at checkpoint-build time, never in a model
+    let mut best = 0u8;
+    let mut best_d = f32::INFINITY;
+    for m in 0..128u8 {
+        let v = e4m3fn_to_f32(m);
+        if !v.is_finite() {
+            continue;
+        }
+        let d = (v - a).abs();
+        if d < best_d {
+            best_d = d;
+            best = m;
+        }
+    }
+    sign | best
 }
 
 /// A [`WeightLoader`](crate::weight_loader::WeightLoader) over a released
@@ -313,7 +446,6 @@ impl crate::weight_loader::WeightLoader for DsV41Loader {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,19 +472,91 @@ mod tests {
     fn layouts_match_the_released_checkpoint() {
         // (name, packed_fp4, weight shape, scale shape, expected layout)
         let cases: &[(&str, bool, [usize; 2], [usize; 2], ScaleLayout)] = &[
-            ("attn.wq_a", false, [1280, 5120], [40, 160], ScaleLayout::Tile { block: 32 }),
-            ("attn.wq_b", false, [32768, 1280], [1024, 40], ScaleLayout::Tile { block: 32 }),
-            ("attn.wkv", false, [512, 5120], [16, 160], ScaleLayout::Tile { block: 32 }),
-            ("attn.wo_a", false, [8192, 4096], [256, 128], ScaleLayout::Tile { block: 32 }),
-            ("attn.wo_b", false, [5120, 8192], [160, 256], ScaleLayout::Tile { block: 32 }),
-            ("shared_experts.w1", false, [2304, 5120], [72, 160], ScaleLayout::Tile { block: 32 }),
-            ("shared_experts.w2", false, [5120, 2304], [160, 72], ScaleLayout::Tile { block: 32 }),
-            ("indexer.wq_b", false, [4096, 1280], [128, 40], ScaleLayout::Tile { block: 32 }),
-            ("engram.wkv", false, [25600, 6144], [800, 192], ScaleLayout::Tile { block: 32 }),
-            ("mtp.main_proj", false, [5120, 15360], [160, 480], ScaleLayout::Tile { block: 32 }),
+            (
+                "attn.wq_a",
+                false,
+                [1280, 5120],
+                [40, 160],
+                ScaleLayout::Tile { block: 32 },
+            ),
+            (
+                "attn.wq_b",
+                false,
+                [32768, 1280],
+                [1024, 40],
+                ScaleLayout::Tile { block: 32 },
+            ),
+            (
+                "attn.wkv",
+                false,
+                [512, 5120],
+                [16, 160],
+                ScaleLayout::Tile { block: 32 },
+            ),
+            (
+                "attn.wo_a",
+                false,
+                [8192, 4096],
+                [256, 128],
+                ScaleLayout::Tile { block: 32 },
+            ),
+            (
+                "attn.wo_b",
+                false,
+                [5120, 8192],
+                [160, 256],
+                ScaleLayout::Tile { block: 32 },
+            ),
+            (
+                "shared_experts.w1",
+                false,
+                [2304, 5120],
+                [72, 160],
+                ScaleLayout::Tile { block: 32 },
+            ),
+            (
+                "shared_experts.w2",
+                false,
+                [5120, 2304],
+                [160, 72],
+                ScaleLayout::Tile { block: 32 },
+            ),
+            (
+                "indexer.wq_b",
+                false,
+                [4096, 1280],
+                [128, 40],
+                ScaleLayout::Tile { block: 32 },
+            ),
+            (
+                "engram.wkv",
+                false,
+                [25600, 6144],
+                [800, 192],
+                ScaleLayout::Tile { block: 32 },
+            ),
+            (
+                "mtp.main_proj",
+                false,
+                [5120, 15360],
+                [160, 480],
+                ScaleLayout::Tile { block: 32 },
+            ),
             // FP4 experts: stored columns are halved
-            ("experts.w1", true, [2304, 2560], [2304, 160], ScaleLayout::RowGroups { block: 32 }),
-            ("experts.w2", true, [5120, 1152], [5120, 72], ScaleLayout::RowGroups { block: 32 }),
+            (
+                "experts.w1",
+                true,
+                [2304, 2560],
+                [2304, 160],
+                ScaleLayout::RowGroups { block: 32 },
+            ),
+            (
+                "experts.w2",
+                true,
+                [5120, 1152],
+                [5120, 72],
+                ScaleLayout::RowGroups { block: 32 },
+            ),
             // the Engram table: FP8 codes, row-wise scales
             (
                 "engram.embed",
@@ -381,9 +585,13 @@ mod tests {
 
     #[test]
     fn plan_rejects_a_scale_that_fits_neither_layout() {
-        let err = plan(&[1000, 256], false, &[17, 8], 32).unwrap_err().to_string();
+        let err = plan(&[1000, 256], false, &[17, 8], 32)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("17 row groups"), "{err}");
-        let err = plan(&[1024, 256], false, &[32, 9], 32).unwrap_err().to_string();
+        let err = plan(&[1024, 256], false, &[32, 9], 32)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("9 column groups"), "{err}");
     }
 
@@ -449,5 +657,139 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("15 code bytes"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod encode_tests {
+    use super::*;
+
+    fn plan_of(rows: usize, cols: usize, format: CodeFormat, layout: ScaleLayout) -> QuantPlan {
+        QuantPlan {
+            rows,
+            cols,
+            format,
+            layout,
+        }
+    }
+
+    fn round_trip(values: &[f32], p: &QuantPlan) -> Vec<f32> {
+        let (codes, scales) = quantize(values, p).expect("encode");
+        dequantize(&codes, &scales, p).expect("decode")
+    }
+
+    /// The encoder has to produce bytes the *decoder* reads back correctly —
+    /// same nibble order, same scale grouping, same row stride. A layout
+    /// disagreement here is not a crash, it is a checkpoint that loads into
+    /// garbage.
+    #[test]
+    fn fp4_row_groups_round_trip_within_the_grid() {
+        let (rows, cols, block) = (4usize, 8usize, 4usize);
+        let v: Vec<f32> = (0..rows * cols)
+            .map(|i| (i as f32 * 0.37).sin() * 3.0)
+            .collect();
+        let p = plan_of(
+            rows,
+            cols,
+            CodeFormat::Fp4E2m1,
+            ScaleLayout::RowGroups { block },
+        );
+        let back = round_trip(&v, &p);
+        assert_eq!(back.len(), v.len());
+        // fp4 has 8 magnitudes; within a group scaled to its peak, the error is
+        // bounded by half the coarsest step
+        for (i, (a, b)) in back.iter().zip(&v).enumerate() {
+            let peak = v[(i / cols) * cols + (i % cols) / block * block..]
+                .iter()
+                .take(block)
+                .fold(0f32, |m, x| m.max(x.abs()));
+            assert!(
+                (a - b).abs() <= peak * 0.5 + 1e-6,
+                "element {i}: {a} vs {b} (group peak {peak})"
+            );
+        }
+    }
+
+    /// Odd column counts exercise the half-used trailing byte.
+    #[test]
+    fn fp4_handles_an_odd_column_count() {
+        let (rows, cols) = (3usize, 5usize);
+        let v: Vec<f32> = (0..rows * cols).map(|i| i as f32 - 7.0).collect();
+        let p = plan_of(
+            rows,
+            cols,
+            CodeFormat::Fp4E2m1,
+            ScaleLayout::RowGroups { block: 2 },
+        );
+        let (codes, _) = quantize(&v, &p).unwrap();
+        assert_eq!(codes.len(), rows * cols.div_ceil(2));
+        assert_eq!(round_trip(&v, &p).len(), v.len());
+    }
+
+    /// FP8 tiles share one scale across `block × block`, so the encoder must
+    /// pick it from the whole tile rather than a row.
+    #[test]
+    fn fp8_tiles_round_trip() {
+        let (rows, cols, block) = (6usize, 6usize, 4usize);
+        let v: Vec<f32> = (0..rows * cols).map(|i| (i as f32 * 0.11).cos()).collect();
+        let p = plan_of(rows, cols, CodeFormat::Fp8E4m3, ScaleLayout::Tile { block });
+        let back = round_trip(&v, &p);
+        // e4m3 keeps ~2 decimal digits, and the tile scale is shared
+        for (i, (a, b)) in back.iter().zip(&v).enumerate() {
+            assert!(
+                (a - b).abs() <= 0.05 * b.abs().max(1.0),
+                "element {i}: {a} vs {b}"
+            );
+        }
+        let (_, scales) = quantize(&v, &p).unwrap();
+        assert_eq!(scales.len(), rows.div_ceil(block) * cols.div_ceil(block));
+    }
+
+    /// An all-zero group must not produce a degenerate scale, and must decode
+    /// back to zeros rather than NaN.
+    #[test]
+    fn an_all_zero_group_stays_zero() {
+        let p = plan_of(
+            2,
+            4,
+            CodeFormat::Fp4E2m1,
+            ScaleLayout::RowGroups { block: 4 },
+        );
+        let back = round_trip(&[0.0; 8], &p);
+        assert!(back.iter().all(|v| *v == 0.0), "{back:?}");
+    }
+
+    /// Values beyond the code range saturate rather than wrapping to a small
+    /// magnitude — the failure mode that turns one big weight into noise.
+    #[test]
+    fn large_values_saturate_rather_than_wrap() {
+        let p = plan_of(
+            1,
+            4,
+            CodeFormat::Fp8E4m3,
+            ScaleLayout::RowGroups { block: 4 },
+        );
+        let v = [1e5f32, -1e5, 1.0, 0.0];
+        let back = round_trip(&v, &p);
+        assert!(back[0] > 1e4, "big positive collapsed to {}", back[0]);
+        assert!(back[1] < -1e4, "big negative collapsed to {}", back[1]);
+        assert!(back[0].is_finite() && back[1].is_finite());
+    }
+
+    /// Sign is carried by the code, not the scale, so negatives must survive.
+    #[test]
+    fn signs_survive_both_formats() {
+        for format in [CodeFormat::Fp8E4m3, CodeFormat::Fp4E2m1] {
+            let p = plan_of(1, 4, format, ScaleLayout::RowGroups { block: 4 });
+            let v = [1.0f32, -1.0, 2.0, -2.0];
+            let back = round_trip(&v, &p);
+            for (i, (a, b)) in back.iter().zip(&v).enumerate() {
+                assert_eq!(
+                    a.is_sign_negative(),
+                    b.is_sign_negative(),
+                    "{format:?} element {i}: {a} vs {b}"
+                );
+            }
+        }
     }
 }

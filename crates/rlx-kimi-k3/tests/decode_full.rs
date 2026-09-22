@@ -233,6 +233,15 @@ fn full_layer_decode_matches_prefill() {
     let c1 = cfg(1);
     let kd = kda_dims(1);
     let hq = mla_dims(1).num_heads * mla_dims(1).qk();
+    // The V cache is narrower than the K cache on the vdim path (the default):
+    // `num_heads * v_head_dim`, not `num_heads * qk()`. Declaring both at `hq`
+    // made the decode graph unbuildable — `concat` refused to join a
+    // `[1, s_past, 12]` cache to an `[1, 1, 8]` new row.
+    let hv = if rlx_kimi_k3::mla::mla_vdim() {
+        mla_dims(1).num_heads * mla_dims(1).v_head_dim
+    } else {
+        hq
+    };
     // cross-token state: layer 0 KDA (conv q/k/v + scan), layer 1 MLA (k,v cache)
     let cs = (kd.conv_kernel - 1) * kd.proj();
     let (mut csq, mut csk, mut csv) = (vec![0f32; cs], vec![0f32; cs], vec![0f32; cs]);
@@ -263,7 +272,7 @@ fn full_layer_decode_matches_prefill() {
             Shape::new(&[1, kd.num_heads, kd.head_dim, kd.head_dim], DType::F32),
         );
         let g_mk = g.input("mk", Shape::new(&[1, s_past, hq], DType::F32));
-        let g_mv = g.input("mv", Shape::new(&[1, s_past, hq], DType::F32));
+        let g_mv = g.input("mv", Shape::new(&[1, s_past, hv], DType::F32));
         let mut params = HashMap::new();
 
         let mut h = h_in;

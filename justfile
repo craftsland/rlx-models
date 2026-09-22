@@ -69,8 +69,24 @@ fmt-check:
 lint:
     ./scripts/rust-lint-gate.sh --workspace
 
-# fmt-check + clippy (-D warnings).
-lint-all: fmt-check lint
+# Verify MODELS.md against cargo metadata (missing crates, stale backend
+# cells, counts that no longer add up). Metadata only — no build.
+check-catalog:
+    python3 scripts/check-models-catalog.py
+
+# Publish-blocking checks no cargo command catches (cross-package includes,
+# gitignored compile-time inputs, versionless path deps, crate size, tiers).
+check-publishable:
+    python3 scripts/check-publishable.py
+
+# fmt-check + clippy (-D warnings) + docs/publish preflight.
+lint-all: fmt-check lint check-catalog check-publishable
+
+# Everything lint-all does, plus the two gates that only matter immediately
+# before publishing: upstream pins resolve on crates.io, and the tree is clean.
+# Expect this to fail during normal development — that is the point.
+release-preflight: lint-all
+    python3 scripts/check-publishable.py --release
 
 # Point this clone at committed hooks under `.githooks/` (local git config only).
 install-hooks:
@@ -445,6 +461,57 @@ fetch-qwen38-27b:
 # optional 0.9 GiB CLIP mmproj. Blocks 0..=62 are Q2_0 factor pairs, block
 # 63 is dense BF16, embed/lm_head are G8_0. Then:
 # just qwen35 -- --weights DEST/pestle-27b-ternary.gguf --device metal
+# Build the reference runtime for Ternary Bonsai 2 parity checks.
+#
+# Stock llama.cpp cannot read these files — PTQ1_0/PQ2_0 and the
+# `prism.hadamard` rotated basis only exist on the fork, whose DEFAULT branch
+# is `prism`, not `master`. Lands on the external store because a session
+# scratchpad does not survive, and every parity claim in PARITY.md is stated
+# against this binary.
+#
+# `llama-cli` in this fork sits in interactive mode and ignores `-no-cnv`
+# oddly; use `llama-completion`. `llama-eval-callback` dumps every graph node
+# with values and is what found the `token_embd` inverse bug — build it too.
+ref-prism-llama:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dest="/Volumes/FOUR/ref/prism-llama"
+    mkdir -p "$(dirname "$dest")"
+    if [ ! -d "$dest/.git" ]; then
+      git clone --depth 1 --branch prism https://github.com/PrismML-Eng/llama.cpp "$dest"
+    fi
+    cmake -S "$dest" -B "$dest/build" -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF
+    cmake --build "$dest/build" -j8 --target llama-completion llama-eval-callback
+    ls -la "$dest/build/bin/llama-completion" "$dest/build/bin/llama-eval-callback"
+    @echo "greedy:  $dest/build/bin/llama-completion -m <gguf> -ngl 99 -c 512 --temp 0 -n 30 -no-cnv -p 'The capital of France is'"
+    @echo "tensors: $dest/build/bin/llama-eval-callback -m <gguf> -ngl 0 -c 64 -n 1 -p '...'"
+
+# prism-ml/Ternary-Bonsai-2-27B-gguf — the ternary Qwen3.8-27B. 5.95 GB for
+# the PTQ1_0 pack (the smaller of the two); `just fetch-bonsai2-27b pq2` takes
+# the 7.21 GB PQ2_0 pack instead. Weights land on the external store and are
+# symlinked back, per the >=1 GB policy.
+fetch-bonsai2-27b pack="ptq1":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "{{pack}}" in
+      ptq1) f="Ternary-Bonsai-2-27B-PTQ1_0.gguf" ;;
+      pq2)  f="Ternary-Bonsai-2-27B-PQ2_0.gguf" ;;
+      *) echo "unknown pack '{{pack}}' (want ptq1 | pq2)" >&2; exit 1 ;;
+    esac
+    store="/Volumes/FOUR/weights/lm/ternary-bonsai-2-27b-gguf"
+    link="{{real_weights_dir}}/ternary-bonsai-2-27b-gguf"
+    mkdir -p "$store"
+    base="https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/resolve/main"
+    for name in "$f" README.md LICENSE; do
+      if [ ! -s "$store/$name" ]; then
+        echo ">> downloading $name -> $store/$name"
+        curl -L -C - --retry 5 -o "$store/$name" "$base/$name"
+      fi
+    done
+    [ -e "$link" ] || ln -s "$store" "$link"
+    ls -lh "$store"
+    @echo "run: RLX_QWEN35_BONSAI2_GGUF={{real_weights_dir}}/ternary-bonsai-2-27b-gguf/$f cargo test -p rlx-qwen35 --test bonsai2_real_weights -- --nocapture"
+
 # --packed --fast --prompt "..." [--mmproj DEST/mmproj-pestle-27b-ternary.gguf]
 fetch-pestle-27b:
     #!/usr/bin/env bash
@@ -1253,6 +1320,23 @@ voxtral *ARGS:
 
 locateanything *ARGS:
     just run-bin rlx-locateanything rlx-locateanything {{ARGS}}
+
+jina-ocr *ARGS:
+    just run-bin rlx-jina-ocr rlx-jina-ocr {{ARGS}}
+
+jina-ocr-metal *ARGS:
+    just features=metal run-bin rlx-jina-ocr rlx-jina-ocr {{ARGS}}
+
+fetch-jina-ocr:
+    cargo run -p rlx-jina-ocr --features hf-download --release -- --download
+
+# Architecture checks run offline against the published safetensors headers;
+# the rest need the 6.7 GB checkpoint (RLX_JINA_OCR_DIR or `just fetch-jina-ocr`).
+test-jina-ocr *ARGS:
+    cargo test -p rlx-jina-ocr {{profile}} {{feature_args}} {{ARGS}}
+
+test-jina-ocr-parity *ARGS:
+    cargo test -p rlx-jina-ocr --test hf_parity --release -- --include-ignored --test-threads 1 {{ARGS}}
 
 unlimited-ocr *ARGS:
     just run-bin rlx-unlimited-ocr rlx-unlimited-ocr {{ARGS}}

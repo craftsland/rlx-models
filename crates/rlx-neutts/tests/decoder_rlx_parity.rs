@@ -23,7 +23,14 @@
 use rlx_neutts::NeuCodecDecoder;
 
 #[test]
-fn decoder_rlx_matches_eager() {
+fn decoder_rlx_backend_decodes_usable_audio() {
+    // Renamed from `decoder_rlx_matches_eager`, which is what it claimed to do
+    // and never did: it compared no values against the eager path, only the
+    // backend *name*. A real comparison is not reachable from an integration
+    // test (`decode_forward` is `pub(crate)`) and would be tautological anyway
+    // — `decoder::rlx::decode` currently delegates straight to it. When the rlx
+    // path grows its own implementation, the parity test belongs beside it as a
+    // lib test with access to both.
     if !cfg!(feature = "rlx") {
         return;
     }
@@ -43,12 +50,35 @@ fn decoder_rlx_matches_eager() {
     let codes: Vec<i32> = vec![0, 42, 128, 512, 1023];
 
     let audio = dec.decode(&codes).expect("decode");
-    assert!(!audio.is_empty());
-    assert!(audio.iter().all(|s| s.is_finite()));
     assert!(
         dec.backend_name().contains("rlx") || dec.backend_name().contains("eager"),
         "unexpected backend: {}",
         dec.backend_name()
     );
-    assert_eq!(audio.len(), codes.len() * dec.hop_length());
+    assert!(!audio.is_empty(), "no audio produced");
+    assert!(audio.iter().all(|s| s.is_finite()), "non-finite sample");
+    assert_eq!(
+        audio.len(),
+        codes.len() * dec.hop_length(),
+        "one hop of samples per code"
+    );
+    // Silence is finite and the right length, so the checks above pass on a
+    // decoder that emits nothing at all.
+    assert!(
+        audio.iter().any(|s| s.abs() > 1e-9),
+        "decoded audio is identically zero"
+    );
+    let first = audio[0];
+    assert!(
+        audio.iter().any(|s| (s - first).abs() > 1e-9),
+        "decoded audio is the constant {first}"
+    );
+    // Different codes must give different audio, or the codebook lookup is
+    // being ignored.
+    let other: Vec<i32> = codes.iter().map(|c| (c + 7) % 1024).collect();
+    let audio2 = dec.decode(&other).expect("decode second");
+    assert!(
+        audio.iter().zip(&audio2).any(|(a, b)| (a - b).abs() > 1e-9),
+        "two different code sequences decoded identically"
+    );
 }

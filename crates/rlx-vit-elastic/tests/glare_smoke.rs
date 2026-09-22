@@ -78,6 +78,15 @@ fn glare_trains_adapter_and_reduces_loss() {
     feature = "vulkan"
 ))]
 fn glare_native_on(dev: Device) {
+    // The `#[cfg(feature = ...)]` on each caller says the backend was *compiled
+    // in*, not that this machine has one. Building with `--features
+    // all-backends` on a Mac therefore ran the CUDA case and failed on a box
+    // with no CUDA device. Announce the skip rather than pass silently, so a
+    // run that covered four backends does not look like one that covered five.
+    if !rlx_runtime::is_available(dev) {
+        eprintln!("skip glare_native_on({dev:?}): backend not available");
+        return;
+    }
     let cfg = VitConfig::synthetic();
     let loaded = prepare_from_weightmap(synthetic_checkpoint(&cfg, 21), &cfg).unwrap();
     let mut gc = GlareConfig::small(cfg.hidden_size);

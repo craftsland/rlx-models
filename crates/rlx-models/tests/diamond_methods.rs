@@ -30,13 +30,26 @@ fn diamond_method_parse() {
 }
 
 #[test]
-fn renoise_shape() {
-    let x = vec![1.0f32; 4];
-    let eps = vec![0.1; 4];
+fn renoise_matches_its_closed_form() {
+    let x = vec![1.0f32, -2.0, 0.5, 3.0];
+    let eps = vec![0.1f32, 0.2, -0.3, 0.4];
     let (scale, std) = renoise_params(0.6, 0.3);
     let y = renoise(&x, scale, std, &eps);
-    assert_eq!(y.len(), 4);
-    assert!(y[0].is_finite());
+
+    // `y[0].is_finite()` checked one element of four and said nothing about the
+    // value. Re-noising is `scale * x + std * eps` elementwise, so check that.
+    assert_eq!(y.len(), x.len(), "length");
+    for (i, ((yi, xi), ei)) in y.iter().zip(&x).zip(&eps).enumerate() {
+        let want = scale * xi + std * ei;
+        assert!(
+            (yi - want).abs() < 1e-6,
+            "y[{i}] = {yi}, expected scale*x + std*eps = {want}"
+        );
+    }
+    // Both terms must actually be in play, or the closed form above is being
+    // satisfied by a degenerate `scale`/`std`.
+    assert!(scale.abs() > 1e-6, "scale collapsed to {scale}");
+    assert!(std.abs() > 1e-6, "std collapsed to {std}");
 }
 
 #[test]

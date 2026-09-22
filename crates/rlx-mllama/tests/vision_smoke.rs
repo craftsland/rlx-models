@@ -13,7 +13,6 @@ use rlx_core::flow_util::compile_built;
 use rlx_core::weight_map::WeightMap;
 use rlx_mllama::config::MllamaVisionConfig;
 use rlx_mllama::vision::build_vision_flow;
-use rlx_runtime::Device;
 use std::collections::HashMap;
 
 /// Deterministic small pseudo-random fill (no external rng dep).
@@ -28,14 +27,6 @@ fn fill(n: usize, seed: u64) -> Vec<f32> {
             (u - 0.5) * 0.05
         })
         .collect()
-}
-
-fn dev() -> Device {
-    std::env::var("RLX_TEST_DEVICE")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(|s| rlx_cli::parse_device(&s).expect("bad RLX_TEST_DEVICE"))
-        .unwrap_or(Device::Cpu)
 }
 
 fn tiny_config() -> MllamaVisionConfig {
@@ -125,8 +116,7 @@ fn synth_weights(cfg: &MllamaVisionConfig, text_hidden: usize) -> WeightMap {
     WeightMap::from_tensors(t)
 }
 
-#[test]
-fn vision_encoder_compiles_and_runs() {
+fn run_case(device: rlx_runtime::Device) -> Vec<f32> {
     let cfg = tiny_config();
     let text_hidden = 16usize;
     let num_tiles = 2usize;
@@ -136,7 +126,7 @@ fn vision_encoder_compiles_and_runs() {
     let mut wm = synth_weights(&cfg, text_hidden);
     let built =
         build_vision_flow(&cfg, &mut wm, text_hidden, num_tiles).expect("build vision flow");
-    let mut compiled = compile_built(built, dev()).expect("compile vision flow");
+    let mut compiled = compile_built(built, device).expect("compile vision flow");
 
     let hidden = fill(seq * cfg.hidden_size, 42);
     let post_tile = fill(seq * cfg.hidden_size, 43);
@@ -154,8 +144,15 @@ fn vision_encoder_compiles_and_runs() {
         seq * text_hidden,
         "cross_states shape [1,{seq},{text_hidden}]"
     );
-    assert!(
-        out.iter().all(|v| v.is_finite()),
-        "cross_states must be finite"
-    );
+    out
+}
+
+/// Every backend must agree with CPU, not merely produce finite numbers.
+///
+/// This test previously ran on one device and asserted only that the output was
+/// finite — a bar that an all-zero result, or a tensor with one tile's worth of
+/// real values and the rest zero, still clears.
+#[test]
+fn vision_encoder_compiles_and_runs_matches_cpu_on_every_backend() {
+    rlx_core::backend_matrix::assert_matches_cpu_on_all("mllama vision", 2e-3, run_case);
 }

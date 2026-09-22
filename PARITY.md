@@ -1,3 +1,11 @@
+Greedy decode initially tracked the reference for only ~6 tokens before
+flipping a near-tie and looping. That was **not** this port: three
+`rlx-qwen35` bugs (prompt padding advancing the GDN scan, the short-conv
+window exported from the padding, and a `predict_logits` that returned
+position 0) — all now fixed, and pinned by
+`crates/rlx-qwen35/tests/decode_equivalence.rs`. Plain `Qwen3.8-27B-Q3_K_S`
+was affected identically and is fixed with it.
+
 # rlx-models parity / speed / memory ledger
 
 Tracks the three acceptance criteria for native-rlx inference vs the ONNX/torch
@@ -30,6 +38,256 @@ byte+count verified before the original is removed — see `scripts/relocate_wei
 | parlertts | ✅ exact | ? | ? | FOUR | T5 + 9-codebook delay |
 | melotts | ✅ exact | ✅ (tiny-tts) | ? | internal | VITS2 |
 | parakeet-tdt | ⏳ wired, gated on .nemo | — | — | — | needs checkpoint on FOUR |
+
+## Ternary Bonsai 2 27B (real-weight, vs the PrismML llama.cpp fork)
+
+`prism-ml/Ternary-Bonsai-2-27B-gguf` PTQ1_0 (5.95 GB), M4 Pro / Metal, greedy.
+Reference is `llama-completion` from the `prism` branch of
+[PrismML-Eng/llama.cpp](https://github.com/PrismML-Eng/llama.cpp) — stock
+llama.cpp cannot read these files (PTQ1_0/PQ2_0 and `prism.hadamard` are
+fork-only, and `prism` is its DEFAULT branch, not `master`). Build it with
+`just ref-prism-llama`; it lands in `/Volumes/FOUR/ref/prism-llama` rather than
+a scratch dir, because every claim below is stated against that binary and a
+session scratchpad does not survive. The recipe also builds
+`llama-eval-callback`, which dumps every graph node with values and is what
+located the `token_embd` inverse bug.
+
+| Check | Result |
+|---|---|
+| Greedy continuation of `"The capital of France is"`, 40 tokens | ✅ **character-for-character** vs the reference: `"Paris.\nThe capital of Germany is Berlin.\nThe capital of Italy is Rome.\nThe capital of Spain is Madrid.\nThe capital of Portugal is Lisbon.\nThe capital of the United"` |
+| Prefill argmax, same prompt | ✅ token-exact: `11751 13 198 760 6511 314 9564` |
+| PTQ1_0 payload on real bytes | ✅ exactly `{−d, 0, +d}`; `blk.3.attn_k` splits −1/0/+1 at 33.7 / 32.8 / 33.5 % |
+| `token_embd` inverse basis | ✅ per-row kurtosis 1.51 → 8.08 (1.5 is exactly a balanced ternary's kurtosis, so the stored rows really are rotated latents) |
+| All 401 folded weights transformed | ✅ 273×5120 + 64×17408 + 64×6144 per graph, 48 with the GDN head permutation |
+
+Reproduce:
+
+```sh
+just fetch-bonsai2-27b
+RLX_QWEN35_BONSAI2_GGUF=weights/lm/ternary-bonsai-2-27b-gguf/Ternary-Bonsai-2-27B-PTQ1_0.gguf \
+  cargo test --release -p rlx-qwen35 --test bonsai2_real_weights -- --nocapture
+./target/release/rlx-qwen35 --weights <gguf> --device metal --packed \
+  --prompt-ids "760,6511,314,9338,369" --max-tokens 7
+```
+
+**Speed: ⚠️ ~16× faster than at the start, ~2× behind the reference.**
+Steady-state decode (median `total_ms` over decode steps ≥ 2,
+`RLX_QWEN35_DECODE_TRACE=1`, Metal / M4 Pro), best observed:
+
+| | tok/s | ms/token |
+|---|---:|---:|
+| before any fused kernel | 0.61 | 1638 |
+| fused GEMV, integer digit extraction | 4.34 | 230 |
+| fused GEMV, float-pipe | 8.1 | 124 |
+| **+ MPS for the rotation's square GEMM** | **9.7** | **103** |
+| reference (`llama-completion`) | 18.6 | 53.7 |
+
+⚠️ **Only the ratio is trustworthy on this box.** Absolute ms/token moves by
+2× with whatever else is running, and it has moved under me three times —
+the reference alone has read 69, 78 and 54 ms depending on the hour. Measured
+*interleaved*, the rlx : reference ratio is stable at **~2.0** (2.01, 2.02,
+2.07, 2.12 under heavy load; 1.83 under light). Quote ratios, take min-of-N for
+absolutes, alternate the arms of any A/B, and check
+`ps -Ao pcpu,comm | sort -rn | head` first.
+
+Three things got it here:
+
+1. A fused `PTQ1_0` decode GEMV at all — `dequant_matmul_gguf` was **89.8%** of
+   decode on the thunk profile, re-expanding every weight to f32 per token.
+2. `ptq1_0_mv_f32_sg_fp`, ported from the fork's own Metal kernel: base-3 digit
+   extraction rewritten into the float pipe (this ISA cannot co-issue integer
+   and float work) with each thread owning whole *bytes*, so a block's bytes
+   are read once rather than five times.
+3. A narrow rlx-metal cost-model rule sending small-`m`, 8-unaligned, **square**
+   (`k == n`) GEMMs to MPS. The rotation reshapes to `[-1, 1024]`, giving
+   `m = 5/6/17` against `k = n = 1024` ~190× a token; those land on
+   `SimdPadded`, which pads `m` up to a simdgroup and wastes the tile.
+   Bonsai-2 111.3 → 103.2 ms, won every round. `k == n` is the discriminator
+   and is not arbitrary — a square operator is a basis change, never a
+   transformer projection. Verified with `RLX_METAL_SMALL_M_MPS_TRACE=1` that
+   the rule fires on **no** shape in Qwen3.8-27B or Bonsai-1, so it cannot
+   regress them; an earlier version without `k == n` did catch rectangular
+   shapes and cost Qwen3.8 1.6%. Opt out: `RLX_METAL_NO_SMALL_M_MPS=1`.
+
+**Where the remaining ~2× lives.** On an *unloaded* profile decode is
+`dequant_matmul_gguf` **65%**, `sgemm` 13%, attention 9%, everything else under
+3% — i.e. the weight-streaming GEMV dominates and there is no overhead pile to
+attack. rlx streams the 5.9 GB at roughly 90 GB/s effective against the
+reference's ~150; closing the gap means a better GEMV, not more fusion.
+
+⚠️ **`RLX_METAL_THUNK_PROFILE=1` lies under load.** It runs each thunk
+serialized with a full sync, so every small dispatch pays that sync and the
+op mix looks completely different: the same graph profiled on a busy box
+reported `concat` at 17% / 116 ms where a clean run puts it at 1.5% / 1.04 ms.
+Two hours went into "concat is expensive" on the strength of a contended
+profile. Check the load first, and sanity-check the summed GPU span against
+wall-clock before trusting the shares.
+
+Decode issues ~2340 GPU dispatches per token and the CPU sits at 5-55% of one
+core during it, so it is GPU-bound, not encode-bound.
+
+**Tuning the GEMV needs an idle machine, and this one has not been one.**
+`ptq1_0_gemv_bandwidth` in `rlx-metal` (a `#[ignore]`d benchmark) times the
+kernel alone at the 27B's real projection shapes, subtracts the fixed
+per-`run()` overhead, and sweeps `RLX_METAL_PTQ1_0_NSG` with the arms
+**alternated inside one process** — the only form that survives a busy box.
+Run it with:
+
+```sh
+cargo test -p rlx-metal --release --test metal_gguf_dequant_matmul_prefill_parity \
+    ptq1_0_gemv_bandwidth -- --ignored --nocapture
+```
+
+Measured so far, all under 2-3 concurrent CPU-saturating jobs: kernel-only
+bandwidth 42-71 GB/s depending on load, with **no separable difference between
+NSG 2, 4 and 8**. Sequential (non-interleaved) readings had suggested NSG=4 was
+1.7x better and NSG=8 2.7x worse; both were load artifacts. The default stays
+at 2, matching the sibling Q1_0/Q2_0 kernels, because an unjustified default is
+worse than a boring one. Every value the flag accepts is correctness-checked by
+`ptq1_0_decode_gemv_matches_cpu`.
+
+Remaining work: a better PTQ1_0 GEMV (65% of decode; the reference implies
+~150 GB/s is reachable against our ~90 on a quiet box), a fused FWHT (the
+rotation is ~13% against ~3.7 GFLOP of real math), and a prefill `m > 1` GEMM.
+
+**Peak memory: ✅ 32.2 → 23.1 GB (−28%).** Adding the fused GEMV only updated
+the *run-time* dispatch (`use_fused_ptq1_0_mv` in `encode/mod.rs`); the
+*compile-time* arena sizing (`dequant_gguf_scratch_bytes`) had arms for Q1_0,
+Q2_0 and G8_0 but not PTQ1_0, so the arena still reserved an f32 dequant slab
+the fused kernel never touches — Ternary Bonsai 2's `[248320, 5120]` head alone
+is ~5 GiB of it. The two must stay in lockstep: disagree one way and the arena
+reserves a slab nothing writes, the other way and the encoder needs one that
+was never allocated.
+
+**The same mmap-borrow upload exists in other crates.** `rlx-qwen3` had it in
+two places and both are now `pread`-based: `high_level_runner.rs` (borrow →
+`set_param_typed`, identical to the qwen35 case) and `generator.rs` (which
+`to_vec()`s from the borrow, so it paid the fault-in *and* the copy — now one
+copy). Verified output-identical on Qwen3-0.6B-Q4_K_M; the saving there is only
+50 MB because the checkpoint is 400 MB, but it scales with checkpoint size, as
+the 4.7 / 19.6 GB qwen35 numbers below show. Revert with
+`RLX_QWEN3_MMAP_UPLOAD=1`.
+
+`rlx-dflash`, `rlx-gemma` and `rlx-lfm` have the same pattern and are **not**
+fixed — no local weights for them, and an unverifiable change to a hot load
+path is not worth making blind. The fix is mechanical: `pread` into one reused
+scratch via `read_tensor_bytes_into`, falling back to the borrow when the
+loader has no streaming backing. `rlx-models-core/standard_decoder.rs` borrows
+only to read `.len()`, which faults nothing, so it needs no change.
+
+**Peak RSS: ✅ a second win, and it is not Bonsai-specific.** `rlx-qwen35`
+uploaded packed weights by *borrowing* from the mmap. The arena copy reads
+through that borrow, so it faults in every page of the checkpoint and leaves a
+second full-size copy resident — and on macOS that is unreclaimable short of
+`munmap` (`release_mapped_pages`, which rlx-llama32 calls, is a no-op there).
+Switched to `pread` into one reused scratch, so resident cost is the largest
+single tensor rather than the whole file:
+
+| | RSS mmap | RSS stream | saved |
+|---|---:|---:|---:|
+| Ternary Bonsai 2 (5.5 GB weights) | 28.6 GB | **23.9 GB** | 4.7 GB |
+| Qwen3.8-27B-Q3_K_S (13 GB weights) | 41.7 GB | **22.1 GB** | **19.6 GB** |
+
+Reproducible to 0.1 GB. Costs ~400 ms of one-time upload and ~0.5 GB of
+footprint (the scratch). Every qwen35 model benefits, not just this one.
+Revert with `RLX_QWEN35_MMAP_UPLOAD=1`.
+
+**Peak memory: ✅ a third win — leave `token_embd` packed.** The table is
+`[248320, 5120]`: 278 MB packed, **4.74 GiB as F32**, and decode reads exactly
+one row per token. It is now gathered on demand from the packed bytes, with
+the `prism.hadamard` inverse applied per row instead of to all 248320 at load.
+**RSS/footprint 24.0 → 18.9 GB**, and weight load drops from 4.69 s to 11 ms
+because the 4.7 GiB dequant never happens (TTFT unchanged — that time moves
+into compile).
+
+Gated on the packed table being readable (`token_embd_lm`) and the host-gather
+path being on, so neither the lookup nor the LM head needs the F32 copy. That
+covers **tied** heads too: both the host head (`lm_head.rs`) and the graph head
+(`builder.rs`) reach for `token_embd_lm` first and only fall back to the F32
+table when it is absent, which the gate rules out. Opt out with
+`RLX_QWEN35_NO_LAZY_EMBED=1`.
+
+It therefore helps every packed qwen35 model, not just this one:
+
+| model | weights | RSS dense | RSS lazy | saved |
+|---|---|---:|---:|---:|
+| Ternary Bonsai 2 (untied) | 5.5 GB | 24.05 GB | **18.78 GB** | 5.3 GB |
+| Bonsai 1 Q1_0 (tied) | 3.8 GB | 16.51 GB | **11.61 GB** | 4.9 GB |
+| Qwen3.8-27B-Q3_K_S (tied) | 13 GB | 32.24 GB | **20.19 GB** | **12.1 GB** |
+
+Qwen3.8 saves more than the 4.74 GiB table itself, and its GPU-side footprint
+is unchanged (50.6 GB either way) — the F32 table was costing host RSS in more
+than one place.
+
+The field is now `pub(crate)` behind `Qwen35Weights::token_embd()`, which
+**panics** under a lazy table rather than returning the empty slice. That
+matters more than the encapsulation: every caller indexes the table directly,
+so an empty one reads as zeros — a model that loads, runs, and emits plausible
+tokens from nothing. Privatising it turned ~45 call sites across five crates
+into compile errors the compiler enumerated, and each was then a deliberate
+choice: metadata queries to `embd_elems()`, real gathers to `embed_row_into`,
+and the paths the gate excludes (tied head, resident embed) left to panic on
+purpose.
+
+**Running total on Ternary Bonsai 2: 32.2 → 18.9 GB footprint (−41%), ~36 →
+18.9 GB RSS (−47%).**
+
+**Next, and fully diagnosed but NOT fixed: prefill and decode each hold a
+private copy of the packed weights — 5.6 GB on the 27B.** Evidence: peak
+footprint is 18.6 GB at `max_seq=13`, where a specialised decode bucket is
+compiled and warmed alongside the prefill graph, and 13.0 GB at
+`max_seq=512`, where no separate decode graph is built (decode then runs
+through the prefill graph, at 1.83 tok/s instead of 8.97 — slower, but with
+one copy of the weights). The 5.6 GB delta is exactly the packed weight size.
+
+The machinery looks like it should fix it — `CompiledGraph::share_params_from`
+→ `MetalExecutable::share_weights_from` retains one refcounted MTLBuffer for
+both, and decode buckets already use it via `try_share_params_from_donor`. It
+does not, and the reason is further down than it appears. Traced end to end by
+instrumenting every refusal path in turn:
+
+1. `DeferredExecutable` (what `BuiltModel` produces) does not override
+   `share_params_from` / `executable_as_any`, so the trait defaults refuse
+   before any Metal code runs. **Fixed by delegating to the live
+   specialization.**
+2. `share_weights_from` requires `param_ids.len()` equality — 1065 for prefill
+   against 1015 for decode. Stricter than the invariant needs: its own loop
+   already tolerates arena-only params, so only the weight *slots* must agree.
+   **Fixed by dropping the count check.**
+3. Weight-buffer offsets follow node-iteration order, so two graphs over the
+   same tensors disagree anyway. **Fixed by ordering the layout by param name.**
+4. And then it still refuses, because **`metal_encoder_binds_weight_buffer`
+   matches only `GgufQ1_0`** — PTQ1_0 weights are never externalized into the
+   shareable buffer at all; they live inline in each graph's arena, so there is
+   no weight slot to share and `share_weights_from` is structurally
+   inapplicable. Adding `GgufPtq1_0` to that predicate (the fused GEMV already
+   reads through `resolve_off`, exactly as Q1_0's does) still did not flip it,
+   so there is at least a fifth condition.
+
+All four were implemented, verified individually as necessary-but-not-
+sufficient, and **reverted** — unproven enabling changes that loosen a safety
+check and relocate every Metal model's weight layout are not worth carrying for
+a win that never landed. Worth ~30% of peak memory to someone who picks it up;
+start at (4), since (1)–(3) are known-good and quick to redo.
+
+Note the two metrics measure different things and both matter: `peak memory
+footprint` tracks the GPU/anonymous allocations (what the arena-scratch fix
+moved) and is stable to a tenth of a GB; `maximum resident set size` includes
+file-backed pages (what the upload fix moved) and swings several GB run to run
+unless you control for the page cache.
+
+One graph simplification landed alongside: `repeat_heads` built the GDN's GQA
+expansion as `in_heads * factor` single-head narrows concatenated, when the
+tiling it produces is just `[x, x, x]` — the inner run of slices reconstructs
+`x` exactly. Now `factor` pieces instead of 48, which removes ~4600 narrow
+nodes from graph construction and 96 dispatches per token. Provably identical
+and it is simply better code; wall-clock effect was within noise.
+
+**Measured negatives, so they are not retried.** Rows-per-simdgroup 8 → 16 on
+the integer kernel (slower; `x` is already cached). Factoring the rotation as
+`H_1024 = H_32 ⊗ H_32` — exactly equal, 4 KB instead of 4 MB — slower, because
+the matrix stays cached and doubling the dispatch count costs more than the
+traffic saved. `RLX_QWEN35_GPU_KV=1` (in-place KV append): no measurable gain.
 
 ## Standing action items (where rlx does NOT yet meet all 3)
 

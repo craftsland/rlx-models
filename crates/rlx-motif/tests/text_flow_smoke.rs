@@ -19,14 +19,6 @@ use rlx_motif::{
 use rlx_runtime::Device;
 use std::collections::HashMap;
 
-fn dev() -> Device {
-    std::env::var("RLX_TEST_DEVICE")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(|s| rlx_cli::parse_device(&s).expect("bad RLX_TEST_DEVICE"))
-        .unwrap_or(Device::Cpu)
-}
-
 fn fill(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
     (0..n)
@@ -187,12 +179,12 @@ fn weights(cfg: &MotifConfig) -> WeightMap {
     WeightMap::from_tensors(t)
 }
 
-fn run(cfg: &MotifConfig, seq: usize) -> Vec<f32> {
+fn run(cfg: &MotifConfig, seq: usize, device: Device) -> Vec<f32> {
     let mut wm = weights(cfg);
     assert_eq!(drop_mtp_layers(&mut wm), 1, "MTP block should be dropped");
     prepare_checkpoint(cfg, &mut wm).expect("prepare checkpoint");
     let built = build_motif_text_flow(cfg, &mut wm, seq, true).expect("build motif flow");
-    let mut compiled = compile_built(built, dev()).expect("compile motif flow");
+    let mut compiled = compile_built(built, device).expect("compile motif flow");
 
     let (cos, sin) = cfg.rope_tables(seq);
     let (swa_cos, swa_sin) = cfg.swa_rope_tables(seq);
@@ -225,7 +217,7 @@ fn motif_text_flow_compiles_and_runs() {
     assert!(!cfg.is_moe_layer(1) && cfg.is_moe_layer(2));
 
     let seq = 5usize;
-    let out = run(&cfg, seq);
+    let out = run(&cfg, seq, Device::Cpu);
     assert_eq!(out.len(), seq * cfg.vocab_size);
     assert!(out.iter().all(|v| v.is_finite()), "logits must be finite");
     assert!(
@@ -243,8 +235,8 @@ fn motif_text_flow_compiles_and_runs() {
 fn motif_prefill_is_causal() {
     let cfg = tiny_config();
     let v = cfg.vocab_size;
-    let short = run(&cfg, 4);
-    let long = run(&cfg, 6);
+    let short = run(&cfg, 4, Device::Cpu);
+    let long = run(&cfg, 6, Device::Cpu);
     for pos in 0..4 {
         for c in 0..v {
             let (a, b) = (short[pos * v + c], long[pos * v + c]);
@@ -262,7 +254,7 @@ fn motif_prefill_is_causal() {
 fn motif_without_mhc_runs() {
     let mut cfg = tiny_config();
     cfg.mhc_enabled = false;
-    let out = run(&cfg, 4);
+    let out = run(&cfg, 4, Device::Cpu);
     assert_eq!(out.len(), 4 * cfg.vocab_size);
     assert!(out.iter().all(|v| v.is_finite()));
     assert!(out.iter().any(|v| v.abs() > 1e-9));
@@ -274,8 +266,11 @@ fn motif_without_sliding_window_runs() {
     let mut cfg = tiny_config();
     cfg.use_sliding_window = false;
     assert!(!cfg.has_sliding_layers());
-    let out = run(&cfg, 4);
-    assert!(out.iter().all(|v| v.is_finite()));
+    rlx_core::backend_matrix::assert_matches_cpu_on_all(
+        "motif without sliding window",
+        2e-3,
+        |device| run(&cfg, 4, device),
+    );
 }
 
 /// A dense-only configuration (no experts) must still build: the FFN is then the
@@ -286,6 +281,21 @@ fn motif_dense_only_runs() {
     cfg.num_experts = 0;
     cfg.interleave_moe_layer_step = 0;
     assert!((0..cfg.num_hidden_layers).all(|i| !cfg.is_moe_layer(i)));
-    let out = run(&cfg, 4);
-    assert!(out.iter().all(|v| v.is_finite()));
+    rlx_core::backend_matrix::assert_matches_cpu_on_all("motif dense only", 2e-3, |device| {
+        run(&cfg, 4, device)
+    });
+}
+
+/// Every backend must agree with CPU, not merely produce finite numbers.
+///
+/// The per-test assertions above run on CPU alone and check finiteness (and, at
+/// best, that the logits are not all zero). Neither notices a backend that
+/// routes a token to the wrong expert or fills only the first head — both stay
+/// finite, in range and plausible.
+#[test]
+fn motif_text_flow_matches_cpu_on_every_backend() {
+    let cfg = tiny_config();
+    rlx_core::backend_matrix::assert_matches_cpu_on_all("motif text flow", 2e-3, |device| {
+        run(&cfg, 5, device)
+    });
 }

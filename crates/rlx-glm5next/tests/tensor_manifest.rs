@@ -310,6 +310,27 @@ fn the_emitters_consume_exactly_the_predicted_tensors() {
         let (h, proj) = (c.hidden_size, c.kda_proj());
         let qk = c.num_attention_heads * c.qk_nope_head_dim;
         match () {
+            // Indexer tensors come first. Their names end with the same
+            // suffixes as the block's own projections — `blk.N.indexer.attn_k
+            // .weight` also ends with `attn_k.weight` — so with the generic
+            // arms first, the indexer's weights were sized as the attention
+            // block's. The graph was malformed and this test still passed,
+            // because the reshapes downstream silently fabricated or dropped
+            // elements to fit.
+            _ if name.ends_with("indexer.attn_q_b.weight") => {
+                vec![c.index_n_heads * c.index_head_dim, c.q_lora_rank]
+            }
+            _ if name.ends_with("indexer.attn_k.weight") => vec![c.index_head_dim, h],
+            _ if name.ends_with("indexer.k_norm.weight")
+                || name.ends_with("indexer.k_norm.bias") =>
+            {
+                vec![c.index_head_dim]
+            }
+            _ if name.ends_with("indexer.proj.weight") => vec![c.index_n_heads, h],
+            _ if name.ends_with("indexer_compressor_gate.weight") => vec![c.index_head_dim, h],
+            _ if name.ends_with("indexer_compressor_ape.weight") => {
+                vec![c.index_kpool, c.index_head_dim]
+            }
             _ if name.ends_with("hc_attn_fn.weight") || name.ends_with("hc_ffn_fn.weight") => {
                 vec![c.hc_mix(), c.hc_mult * h]
             }
@@ -317,7 +338,14 @@ fn the_emitters_consume_exactly_the_predicted_tensors() {
             _ if name.ends_with("_scale.weight") => vec![3],
             _ if name.ends_with("attn_norm.weight") || name.ends_with("ffn_norm.weight") => vec![h],
             _ if name.ends_with("output_norm.weight") => vec![h],
-            _ if name.ends_with("token_embd.weight") || name.ends_with("output.weight") => {
+            // `==`, not `ends_with`: the LM head is the bare `output.weight`,
+            // but `blk.N.attn_output.weight` also ends with it, and this arm
+            // comes first — so every block's attention output projection was
+            // being sized as the vocabulary projection, `[16, 32]` instead of
+            // `[32, 32]`. The graph was malformed and the test still passed,
+            // because the reshape that followed silently fabricated the missing
+            // elements.
+            _ if name == "token_embd.weight" || name == "output.weight" => {
                 vec![c.vocab_size, h]
             }
             _ if name.ends_with("attn_q.weight")
@@ -371,17 +399,6 @@ fn the_emitters_consume_exactly_the_predicted_tensors() {
             }
             _ if name.ends_with("attn_v_b.weight") => {
                 vec![c.num_attention_heads, c.v_head_dim, c.kv_lora_rank]
-            }
-            _ if name.ends_with("indexer.attn_k.weight") => vec![c.index_head_dim, h],
-            _ if name.ends_with("indexer.k_norm.weight")
-                || name.ends_with("indexer.k_norm.bias") =>
-            {
-                vec![c.index_head_dim]
-            }
-            _ if name.ends_with("indexer.proj.weight") => vec![c.index_n_heads, h],
-            _ if name.ends_with("indexer_compressor_gate.weight") => vec![c.index_head_dim, h],
-            _ if name.ends_with("indexer_compressor_ape.weight") => {
-                vec![c.index_kpool, c.index_head_dim]
             }
             _ if name.ends_with("ffn_gate_inp.weight") => vec![c.n_routed_experts, h],
             _ if name.ends_with("exp_probs_b.bias") => vec![c.n_routed_experts],

@@ -23,6 +23,7 @@
 
 use crate::config::UnlimitedOcrConfig;
 use anyhow::{Result, bail};
+use rlx_runtime::Device;
 use std::fmt;
 
 /// How to store packed LM weights on the host.
@@ -204,6 +205,44 @@ pub fn resolve_lm_precision(
     cfg: &UnlimitedOcrConfig,
 ) -> ResolvedLmPrecision {
     resolve_lm_precision_with_ram(requested, cfg, available_ram_bytes())
+}
+
+/// Backends that cannot run a packed-GGUF MoE correctly.
+///
+/// Currently none. MLX used to be excluded: its host-lowered grouped dequant
+/// read the routing indices through `to_f32()`, which mis-read a strided slice
+/// and sent every token to the wrong expert. That was an unevaluated-flags bug
+/// in the rlx-mlx shim (`materialize_row_contiguous`), now fixed, and
+/// `tests/quant_parity_backends.rs` covers MLX again.
+///
+/// Kept as a named hook rather than deleted: a backend that computes the wrong
+/// answer must be downgraded, not left to the user's `--lm-precision`, and this
+/// is where that decision goes.
+pub fn device_supports_packed_quant(device: Device) -> bool {
+    let _ = device;
+    true
+}
+
+/// [`resolve_lm_precision`], then downgraded to F16 when the device cannot run
+/// packed quants correctly.
+pub fn resolve_lm_precision_for_device(
+    requested: LmWeightPrecision,
+    cfg: &UnlimitedOcrConfig,
+    device: Device,
+) -> ResolvedLmPrecision {
+    let resolved = resolve_lm_precision(requested, cfg);
+    let packed = matches!(
+        resolved,
+        ResolvedLmPrecision::Q8_0 | ResolvedLmPrecision::Q4_0
+    );
+    if packed && !device_supports_packed_quant(device) {
+        eprintln!(
+            "[rlx-unlimited-ocr] {resolved} is not correct on {device:?} \
+             (packed-GGUF MoE selects the wrong experts there); using f16 instead"
+        );
+        return ResolvedLmPrecision::F16;
+    }
+    resolved
 }
 
 /// Same as [`resolve_lm_precision`] with an explicit available-RAM budget (tests).

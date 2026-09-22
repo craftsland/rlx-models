@@ -34,6 +34,7 @@ rlx-cpu = { path = "../rlx/crates/backends/rlx-cpu" }
 rlx-gguf = { path = "../rlx/crates/io/rlx-gguf" }
 rlx-pkg = { path = "../rlx/crates/io/rlx-pkg" }
 rlx-nemo = { path = "../rlx/crates/io/rlx-nemo" }
+rlx-torch-ckpt = { path = "../rlx/crates/io/rlx-torch-ckpt" }
 rlx-text = { path = "../rlx/crates/io/rlx-text" }
 rlx-onnx-import = { path = "../rlx/crates/io/rlx-onnx-import" }
 rlx-tensor = { path = "../rlx/crates/core/rlx-tensor" }

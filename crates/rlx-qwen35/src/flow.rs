@@ -479,10 +479,10 @@ impl<'a> Qwen35Flow<'a> {
         // packed K-quant references to the same sink so a single
         // drain at the end covers the whole graph.
         let packed_out = packed_sink.clone();
-        let n_vocab = if weights.token_embd.is_empty() {
+        let n_vocab = if weights.embd_elems() == 0 {
             cfg.vocab_size
         } else {
-            weights.token_embd.len() / h
+            weights.embd_elems() / h
         };
 
         flow = flow.plugin_named("qwen35.tail", {
@@ -850,7 +850,7 @@ pub fn build_qwen35_decode_model_flow(
     // (Bonsai-27B 4.7 GiB) into the decode arena — which, being >4 GiB,
     // otherwise mis-addresses the u32 gather offset.
     let host_embed =
-        opts.force_host_embed || host_embed_enabled_for_bytes(weights_c.token_embd.len() * 4);
+        opts.force_host_embed || host_embed_enabled_for_bytes(weights_c.embd_elems() * 4);
     if host_embed {
         flow = flow.input("inputs_embeds", hidden.clone());
     }
@@ -875,7 +875,7 @@ pub fn build_qwen35_decode_model_flow(
             &mut gb,
             emit.params,
             "token_embd.weight",
-            weights_embed.token_embd.to_vec(),
+            weights_embed.token_embd().to_vec(),
             Shape::new(&[n_vocab, n_embd], f),
         );
         let h = gb.gather_(embed_w, ids, 0);
@@ -1173,7 +1173,7 @@ pub fn build_qwen35_prefill_cache_model_flow(
     // (Bonsai-27B: [248320,5120] = 4.7 GiB). input_ids stays declared — it's
     // still used for positions/masking downstream.
     let host_embed =
-        host_embed_enabled_for_bytes(weights_c.token_embd.len() * 4) && !prefill_from_hidden;
+        host_embed_enabled_for_bytes(weights_c.embd_elems() * 4) && !prefill_from_hidden;
     if host_embed {
         flow = flow.input("inputs_embeds", hidden_shape_val.clone());
     }
@@ -1218,7 +1218,7 @@ pub fn build_qwen35_prefill_cache_model_flow(
             // Hidden states are host-built and fed as `prefill_hidden`. Do **not**
             // register `token_embd.weight` into the compiled graph — that table is
             // unused on this path and costs hundreds of MiB–1 GiB on CUDA.
-            if weights_embed.token_embd.is_empty() {
+            if weights_embed.embd_elems() == 0 {
                 return Err(anyhow::anyhow!(
                     "qwen35: prefill_from_hidden requires token_embd"
                 ));
@@ -1236,7 +1236,7 @@ pub fn build_qwen35_prefill_cache_model_flow(
                 &mut gb,
                 emit.params,
                 "token_embd.weight",
-                weights_embed.token_embd.to_vec(),
+                weights_embed.token_embd().to_vec(),
                 Shape::new(&[n_vocab, n_embd], f),
             );
             gb.gather_(embed_w, ids, 0)
@@ -1559,7 +1559,7 @@ pub fn build_qwen35_trunk_export_model_flow(
     // otherwise keep the whole embedding table resident on the device just to
     // gather the prompt's rows. Host-embed (auto ≥1 GiB / env override) gathers
     // those rows host-side and feeds them as `inputs_embeds`.
-    let mut flow = if host_embed_enabled_for_bytes(weights_c.token_embd.len() * 4) {
+    let mut flow = if host_embed_enabled_for_bytes(weights_c.token_embd().len() * 4) {
         flow_base.embed_host("token_embd.weight", n_embd)
     } else {
         flow_base.embed("token_embd.weight")
@@ -2046,7 +2046,7 @@ impl rlx_flow::WeightSource for InlineQwen35Weights<'_> {
         if key == "token_embd.weight" {
             let h = self.cfg.hidden_size;
             let v = self.weights.lm_vocab_size(self.cfg);
-            return Ok((self.weights.token_embd.to_vec(), vec![v, h]));
+            return Ok((self.weights.token_embd().to_vec(), vec![v, h]));
         }
         if transpose {
             bail!("inline qwen35 weights: transpose not supported for `{key}`");
@@ -2189,6 +2189,8 @@ mod tests {
         };
 
         Qwen35Weights {
+            output_fold: None,
+            token_embd_lazy: None,
             token_embd: std::sync::Arc::from(ramp(n_vocab * n_embd, 0.001)),
             output_norm: vec![1.0f32; n_embd],
             output: None,
@@ -2202,6 +2204,8 @@ mod tests {
     fn one_gdn_layer_flow_builds() {
         let cfg = tiny_cfg();
         let empty = Qwen35Weights {
+            output_fold: None,
+            token_embd_lazy: None,
             token_embd: std::sync::Arc::from([]),
             output_norm: vec![],
             output: None,

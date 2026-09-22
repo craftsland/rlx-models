@@ -1547,10 +1547,19 @@ impl Qwen3Generator {
                 continue;
             }
             // Only K-quant tensors have packed metadata; F16/F32 return None → skip.
-            if let Some((scheme, _shape)) = loader.packed_meta(&key)
-                && let Some(bytes) = loader.tensor_bytes_borrowed(&key)
-            {
-                map.insert(key, (bytes.to_vec(), scheme));
+            //
+            // The map owns its bytes either way, so prefer `pread` over
+            // borrowing the mmap: reading through a borrow additionally faults
+            // in every page of the checkpoint and leaves that resident on top
+            // of the copy (and on macOS it is unreclaimable short of
+            // `munmap`). Identical bytes, one copy instead of two.
+            if let Some((scheme, _shape)) = loader.packed_meta(&key) {
+                let mut buf = Vec::new();
+                if loader.read_tensor_bytes_into(&key, &mut buf)? {
+                    map.insert(key, (buf, scheme));
+                } else if let Some(bytes) = loader.tensor_bytes_borrowed(&key) {
+                    map.insert(key, (bytes.to_vec(), scheme));
+                }
             }
         }
         let n = map.len();

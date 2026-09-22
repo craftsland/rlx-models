@@ -21,10 +21,10 @@ use rlx_glm5next::mla::{MlaDims, emit_mla_attention};
 use rlx_glm5next::{Glm5NextConfig, build_glm5next_text_flow};
 use rlx_ir::{DType, Shape};
 
-fn run(c: &Glm5NextConfig, seq: usize) -> Vec<f32> {
+fn run(c: &Glm5NextConfig, seq: usize, device: rlx_runtime::Device) -> Vec<f32> {
     let mut w = weights(c);
     let built = build_glm5next_text_flow(c, &mut w, seq, true).expect("build flow");
-    let mut compiled = compile_built(built, dev()).expect("compile");
+    let mut compiled = compile_built(built, device).expect("compile");
     let ids: Vec<f32> = (0..seq).map(|i| (i % VOCAB) as f32).collect();
     let mut outs = compiled.run(&[("input_ids", ids.as_slice())]);
     assert_eq!(outs.len(), 1, "the flow declares exactly one output");
@@ -37,7 +37,7 @@ fn run(c: &Glm5NextConfig, seq: usize) -> Vec<f32> {
 fn prefill_is_finite_with_dense_dsa() {
     let c = cfg(2048);
     let seq = 12;
-    let logits = run(&c, seq);
+    let logits = run(&c, seq, rlx_runtime::Device::Cpu);
     assert_eq!(logits.len(), seq * VOCAB);
     assert!(
         logits.iter().all(|v| v.is_finite()),
@@ -51,28 +51,34 @@ fn prefill_is_finite_with_dense_dsa() {
 
 /// `index_topk` below `seq`: the indexer actually scores, selects and scatters
 /// a sparse mask, so the whole k-pool path is exercised.
+/// Compared against CPU on every backend, not merely checked for finiteness.
 #[test]
-fn prefill_is_finite_with_sparse_dsa() {
-    let c = cfg(8); // budget = 8/4 = 2 pools out of 3
+fn prefill_is_finite_with_sparse_dsa_matches_cpu_on_every_backend() {
+    let c = cfg(8);
     let seq = 12;
-    let logits = run(&c, seq);
-    assert_eq!(logits.len(), seq * VOCAB);
-    assert!(
-        logits.iter().all(|v| v.is_finite()),
-        "a sparse DSA mask must not produce NaN — every query keeps at least \
-         its own tail visible"
+    rlx_core::backend_matrix::assert_matches_cpu_on_all(
+        "glm5next sparse DSA prefill",
+        2e-3,
+        |device| {
+            let logits = run(&c, seq, device);
+            assert_eq!(logits.len(), seq * VOCAB, "logits length");
+            logits
+        },
     );
 }
 
 /// A sequence that is not a multiple of `index_kpool` leaves an incomplete tail
 /// pool, which is the branch `index_kpool_always_select_tail` exists for.
+/// Compared against CPU on every backend, not merely checked for finiteness.
 #[test]
-fn prefill_handles_a_ragged_tail() {
+fn prefill_handles_a_ragged_tail_matches_cpu_on_every_backend() {
     let c = cfg(8);
-    let seq = 11; // 2 complete pools + 3 tail tokens
-    let logits = run(&c, seq);
-    assert_eq!(logits.len(), seq * VOCAB);
-    assert!(logits.iter().all(|v| v.is_finite()));
+    let seq = 11;
+    rlx_core::backend_matrix::assert_matches_cpu_on_all("glm5next ragged tail", 2e-3, |device| {
+        let logits = run(&c, seq, device);
+        assert_eq!(logits.len(), seq * VOCAB, "logits length");
+        logits
+    });
 }
 
 /// The dense-DSA short-circuit must be a pure optimization: running the

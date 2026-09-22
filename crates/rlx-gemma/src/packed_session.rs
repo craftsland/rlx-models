@@ -59,7 +59,15 @@ fn upload_packed_borrowed(
     loader: &GgufLoader,
     skip: impl Fn(&str) -> bool,
 ) {
+    // `PackedSrc::Borrow` names a tensor still living in the loader's mmap.
+    // `pread` it into scratch rather than borrowing: `set_param_typed` copies
+    // through the slice it is given, so a borrow faults in every page of the
+    // checkpoint and leaves a second full-size copy resident (unreclaimable on
+    // macOS short of `munmap`). Falls back to the borrow when the tensor has no
+    // streaming backing. Revert: RLX_GEMMA_MMAP_UPLOAD=1.
+    let stream = !rlx_ir::env::flag("RLX_GEMMA_MMAP_UPLOAD");
     let mut scratch: Vec<u8> = Vec::new();
+    let mut comp: Vec<u8> = Vec::new();
     for (name, (src, _scheme, _shape)) in packed.iter() {
         if src.is_f32() || skip(name) {
             continue;
@@ -70,6 +78,14 @@ fn upload_packed_borrowed(
             }
             PackedSrc::Borrow { keys, nbytes } => {
                 if keys.len() == 1 {
+                    if stream
+                        && loader
+                            .read_tensor_bytes_into(&keys[0], &mut scratch)
+                            .expect("packed stream: read failed")
+                    {
+                        compiled.set_param_typed(name, &scratch, rlx_ir::DType::U8);
+                        continue;
+                    }
                     let b = loader
                         .tensor_bytes_borrowed(&keys[0])
                         .expect("packed borrow: missing tensor");
@@ -78,6 +94,14 @@ fn upload_packed_borrowed(
                     scratch.clear();
                     scratch.reserve(*nbytes);
                     for k in keys {
+                        if stream
+                            && loader
+                                .read_tensor_bytes_into(k, &mut comp)
+                                .expect("packed stream: read failed")
+                        {
+                            scratch.extend_from_slice(&comp);
+                            continue;
+                        }
                         scratch.extend_from_slice(
                             loader
                                 .tensor_bytes_borrowed(k)

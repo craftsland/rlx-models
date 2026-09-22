@@ -119,7 +119,7 @@ impl FireRedRunnerBuilder {
             cfg.backbone.num_hidden_layers, cfg.backbone.hidden_size
         );
         let (qcfg, qweights) = load_qwen35_backbone(&model_dir, &cfg)?;
-        let token_embd = Arc::clone(&qweights.token_embd);
+        let token_embd = qweights.token_embd_arc();
         let runner = Qwen35RunnerBuilder::default()
             .inline_weights(qcfg, qweights)
             .device(device)

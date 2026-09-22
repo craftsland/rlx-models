@@ -33,6 +33,10 @@ pub struct SampleOpts {
     pub no_repeat_ngram_size: usize,
     /// Trailing-token lookback window for the n-gram guard.
     pub ngram_window: usize,
+    /// Token ids the n-gram guard never bans. Structural markup legitimately
+    /// repeats inside a long table; `jinaai/jina-ocr-v1` whitelists its `<td>`
+    /// / `</td>` ids for exactly that reason.
+    pub ngram_whitelist: Vec<u32>,
     pub max_new_tokens: usize,
 }
 
@@ -43,6 +47,7 @@ impl Default for SampleOpts {
             repetition_penalty: 1.0,
             no_repeat_ngram_size: 35,
             ngram_window: 128,
+            ngram_whitelist: Vec::new(),
             max_new_tokens: 32_768,
         }
     }
@@ -57,8 +62,18 @@ impl SampleOpts {
         }
     }
 
+    /// Replace the n-gram guard's whitelist (see [`Self::ngram_whitelist`]).
+    pub fn ngram_whitelist(mut self, ids: impl IntoIterator<Item = u32>) -> Self {
+        self.ngram_whitelist = ids.into_iter().collect();
+        self
+    }
+
     fn ngram_processor(&self) -> SlidingWindowNoRepeatNgramProcessor {
-        SlidingWindowNoRepeatNgramProcessor::new(self.no_repeat_ngram_size, self.ngram_window)
+        SlidingWindowNoRepeatNgramProcessor::with_whitelist(
+            self.no_repeat_ngram_size,
+            self.ngram_window,
+            self.ngram_whitelist.iter().copied(),
+        )
     }
 }
 

@@ -29,9 +29,18 @@ const BLOB_LEN: usize = 305_080;
 #[repr(align(4))]
 struct Align4<T>(T);
 
-static BLOB: Align4<[u8; BLOB_LEN]> = Align4(*include_bytes!(
-    "../../rlx-ten-vad/weights/ten_vad.safetensors"
-));
+/// The raw safetensors blob.
+///
+/// It lives in *this* crate rather than in `rlx-ten-vad` even though that is
+/// the user-facing crate: `include_bytes!` cannot reach outside a package, and
+/// `cargo package` ships only files under the crate root, so a
+/// `../../rlx-ten-vad/...` include produced a published crate that could not
+/// compile. Dependency direction is rlx-ten-vad -> rlx-ten-vad-core, so the
+/// blob has to sit at the bottom; `rlx-ten-vad` re-uses this constant instead
+/// of embedding a second 305 KB copy.
+pub const SAFETENSORS: &[u8] = include_bytes!("../weights/ten_vad.safetensors");
+
+static BLOB: Align4<[u8; BLOB_LEN]> = Align4(*include_bytes!("../weights/ten_vad.safetensors"));
 
 /// The blob as `f32`s.
 ///
@@ -142,7 +151,7 @@ mod tests {
     /// The baked layout must still describe the file it was generated from.
     #[test]
     fn layout_matches_blob() {
-        let bytes = include_bytes!("../../rlx-ten-vad/weights/ten_vad.safetensors");
+        let bytes = include_bytes!("../weights/ten_vad.safetensors");
         assert_eq!(bytes.len(), BLOB_LEN, "blob length changed");
         let hdr_len = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
         let hdr = core::str::from_utf8(&bytes[8..8 + hdr_len]).expect("header utf8");

@@ -145,7 +145,7 @@ fn pestle_27b_loads_with_the_expected_mixed_layout() {
     // A G8_0 table decoded with a single block-wide scale (or with the
     // scales read as f16 instead of bf16) collapses toward zero.
     let rms = (weights
-        .token_embd
+        .token_embd()
         .iter()
         .take(1 << 20)
         .map(|v| (*v as f64) * (*v as f64))

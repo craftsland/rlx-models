@@ -159,8 +159,49 @@ stage against a dump, which is how the port was brought up — point
 `RLX_DSV41_DBG=<stage> RLX_DSV41_DBGLAYER=<n>` cuts the graph short at one of
 them (`engram`, `comp`, `compkv`, `topk`, `attn`, `ffn`, `block`).
 
-Real weights are out of reach here — the only checkpoint is 510 GB of fp8/fp4 —
-so coverage is `WiredDeferred`.
+### Real weights without the 510 GB
+
+Two tests reach the actual checkpoint without downloading it.
+
+`tensor_manifest_matches_the_real_checkpoint` needs no download at all: a 15 KB
+inventory distilled from the 48 shard headers pins all **96,085** tensors —
+name, dtype, shape, and that every quantized one's scale resolves to one of the
+three layouts — against [`DeepseekV41Spec::expected_tensors`]. It checks both
+directions, so a subsystem the port forgot surfaces as an unexplained tensor.
+
+Three more need ~300 MB of range-fetched tensors (a safetensors header gives each
+tensor's byte range, so nothing else is downloaded):
+
+* `real_layer_attention_matches_reference` runs the port's own `DsV41Loader` and
+  attention over real fp8 bytes at 160 tokens — past `sliding_window`, so the
+  window evicts — for layer 0 (sliding-window only) **and** layer 2 (a KV *and*
+  index source, so the compressor, the index keys and the YaRN-scaled compressed
+  RoPE all run). Agreement is 7.5e-7 relative.
+* `dequant_matches_reference_on_real_bytes` decodes one real tensor per scale
+  layout **exactly**: FP8 tiles, FP4 nibble pairs, and — the trap — 64 rows of
+  the 384-million-row Engram table, which is FP8 but row-wise scaled.
+* `engram_token_map_matches_the_real_tokenizer` collapses the real 129,280-token
+  vocab and must land on exactly **99092**, the constant every Engram hash
+  multiplier is derived from.
+
+See `scripts/dsv41_ref/README.md`; set `RLX_DSV41_WEIGHTS` to run them, otherwise
+each checks its committed digest and skips.
+
+### Backends
+
+`prefill_matches_reference_on_all_backends` runs the whole stack on every device
+the build can reach — `cargo test -p rlx-models-core --features metal,mlx`.
+Bringing it up on Metal and MLX found one bug in each (both upstream in `../rlx`,
+both affecting V4 as well; see the changelog), which is the argument for running
+it: a CPU-only port is a port that has not been tested.
+
+`examples/dsv41_bisect` also takes `RLX_DSV41_DEVICE=metal|mlx|gpu` and then
+compares that backend against CPU at every tap, so a backend divergence can be
+bisected without any reference dump. `examples/dsv41_rope_probe` and
+`examples/dsv41_topk_probe` isolate the two ops that broke, against a host
+reference.
+
+Full end-to-end generation stays `WiredDeferred` — that needs the whole 510 GB.
 
 ## Distributed inference (multi-node)
 

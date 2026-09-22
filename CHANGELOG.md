@@ -2,6 +2,1323 @@
 
 ## Unreleased
 
+### `rlx-upscale` — single-image super-resolution (15 architectures)
+
+New crate covering both tiers of the current super-resolution landscape, native
+Rust end to end:
+
+- **Tier 1, efficient CNNs**: **`ESRGAN`/RRDBNet**, `Compact` (SRVGGNet),
+  `SPAN`, **`SPANV2`** (team
+  XiaomiMM's NTIRE 2026 Efficient SR challenge winner), `PLKSR` (all three
+  channel mixers), `RealPLKSR` (GroupNorm and channel-first LayerNorm variants,
+  `PixelShuffle` and `DySample` heads).
+  Plus **`SAFMN`** (receptive field from pooling rather than attention or large
+  kernels) and **`RealCUGAN`** (`upcunet_v3` — two *valid-padded* U-Nets in
+  series; the anime upscaler, and the only network here whose convolutions
+  shrink the feature map).
+- **Tier 2, window-attention transformers**: `SwinIR`, **`Swin2SR`**, `HAT`,
+  `DRCT`, `DAT`, `MambaIRv2`, plus **`OmniSR`** (MaxViT-shaped: block
+  attention, *grid* attention and channel attention interleaved).
+
+`Swin2SR` is SwinIR rebuilt on Swin **V2** blocks — cosine attention, a learned
+per-head temperature, an MLP-generated position bias and res-post-norm — so it
+is a flag on the existing module rather than a second copy of it. Both frozen
+pieces (the temperature's `clamp(…).exp()` and the whole
+`16·sigmoid(cpb_mlp(table))` bias) fold to host constants, leaving a graph the
+same shape as V1's. Its `PatchEmbed` also carries a real 1×1 convolution that
+SwinIR's does not, which is invisible until a checkpoint reports unread tensors.
+
+Legacy `torch.save` containers (pre-1.6, five concatenated pickles and no ZIP)
+now load, which unlocks the ESRGAN-era back-catalogue — `4x-UltraSharp` among
+them. Writing a synthetic container for the test exposed a defect in the pickle
+VM: `read_long` shifted past the register width for integers wider than 8 bytes,
+and torch's own file magic is ten bytes, so **every** legacy file hit it — a
+panic in debug, silent corruption of the low bytes in release.
+
+Checkpoints that carry both `params` and `params_ema` (BasicSR's default) now
+resolve to the EMA copy instead of failing every wrapper's unanimity test, and
+`thop` profiler buffers are stripped — 545 of OmniSR's 728 tensors are
+`total_ops`/`total_params`, which would otherwise defeat the guard that reports
+tensors a build never read.
+
+Three variants are **refused with their reason** rather than guessed at, because
+each shares key names with something supported and would have produced a
+plausible, wrong image: the NTIRE-2023 SAFMN (global response norm, no trunk
+skip, biasless convolutions and pooling by `2^(i+1)` — even its tile multiple
+differs), Swin2SR's `pixelshuffle_aux` (takes a second bicubic input), and
+OmniSR with `pe=False` (the window size is then stated nowhere in the weights).
+
+**MambaIRv2 is deterministic here and the reference is not.** Upstream routes
+tokens through `F.gumbel_softmax(..., hard=True)` with **no `self.training`
+guard anywhere in the file**, so the released model draws fresh Gumbel noise on
+every forward — the token ordering, the selective scan and therefore the image
+differ run to run — and `torch.sort(..., stable=False)` over `num_tokens`
+distinct values adds tie-breaking on top. This port takes the `argmax` of the
+routing logits with a stable sort: a nondeterministic upscaler is not useful,
+and matching PyTorch's RNG stream *and* its unstable sort is unachievable
+regardless. Two exact simplifications follow — the trailing `LogSoftmax` cannot
+change an argmax, and the prototype table is a product of two frozen parameters,
+so it folds to a host constant and the prompt becomes one `Gather`. The scan
+maps onto `Op::SelectiveScan` with the reference's `D·x` skip added outside.
+
+Each is a transliteration of its reference module, verified against the upstream
+source rather than from memory. Supporting machinery:
+
+- **Architecture detection from a bare state dict.** These checkpoints carry no
+  config, so every hyperparameter is solved from key names and tensor shapes —
+  window size from the `(2W−1)²`-row bias table, HAT's overlap ratio from its
+  second table, DySample's group count from the offset conv's width. The three
+  parameters that genuinely leave no trace are documented as assumptions instead
+  of guessed silently. A checkpoint tensor the graph never reads is a hard
+  error, since it almost always means a mis-detection.
+- **Tiled inference.** Graphs are shape-static, so the network compiles once for
+  one tile and every tile — edge tiles included — is that shape, edge-replicated.
+  Peak memory follows the tile, not the image. A test pins that tiled and
+  untiled runs agree.
+- **Compile-time folding.** SPAN's `Conv3XC` reparameterization, the Swin
+  lineage's relative-position bias, DAT's `DynamicPosBias` MLP and every
+  `BatchNorm2d` are resolved while building. Keeping the Swin mask at
+  `[1, nW, 1, N, N]` rather than the `[B·nW, nH, N, N]` a fused attention op
+  wants is 590 KB instead of 340 MB on a 192² tile.
+
+Two upstream findings worth recording:
+
+- **HAT's overlapping-cross-attention index is reproduced bug-compatibly.**
+  Upstream shifts by `ws − ows + 1` where centring needs `(ows − ws)/2 + ws − 1`,
+  so the index goes negative and PyTorch wraps it from the end of the table. The
+  released weights were *trained* that way; centring it would silently permute
+  the learned bias.
+- **A release SPAN checkpoint's stored `eval_conv` is 11% stale.** The reference
+  recomputes it on every forward, so the training branches are authoritative —
+  the fold is recomputed here and matches the unfused branches to 5e-7.
+
+Validated on **38 release checkpoints** spanning all fifteen architectures,
+scales ×1 / ×2 / ×3 / ×4, and **every upsampler tail** — `pixelshuffle` (single,
+×2×2 chained, and ×3), `pixelshuffledirect`, `nearest+conv`, `DySample`, the
+`residual` denoising tail, and Real-CUGAN's transposed-convolution and
+valid-U-Net tails. Correlation runs 0.9496 (anime restoration, which is
+*supposed* to change the picture) to 0.9999.
+
+PLKSR was the last architecture without real weights — the community moved
+wholesale to RealPLKSR, so nothing is on HuggingFace or in any model zoo. The
+author's official DF2K checkpoints are on Google Drive; all three (×2, ×4 and
+tiny ×4) load with zero unread tensors and round-trip at r=0.9997.
+
+The ×1 case previously had no real-weight coverage at all: the round-trip test
+skipped anything below ×2, so the restoration path was only ever exercised
+structurally. A ×1 model is now compared to the input directly.
+
+Real weights found three things the synthetic suite could not:
+
+- **The lightweight SwinIR tail was misdetected.** All three tails carry
+  `upsample.0.weight`, so matching on it first read `UpsampleOneStep` as
+  classical and then failed looking for a `conv_last` it never had. Ordering the
+  checks by `conv_up1` → `conv_before_upsample` → `upsample.0` fixes it.
+- **DAT's `qkv.bias` lives under `attn.`**, so `qkv_bias` came back false and
+  every attention bias was silently skipped. Caught by the unread-tensor guard,
+  which is exactly what it is there for.
+- **Tile defaults cannot be a per-family constant** — cost varies by two orders
+  of magnitude *within* a family. Measured peak RSS per input pixel: SPANV2
+  0.0027 MB, Compact 0.020, RealPLKSR 0.25, because im2col row width is
+  `C_in·k²` and RealPLKSR's whole idea is a 17×17 kernel. The flat transformer
+  default likewise had HAT-L OOM-killed while SwinIR-M was fine at the same
+  size. `ModelConfig::peak_working_set_bytes` now estimates the convolution and
+  attention terms with multipliers **fitted to measured RSS**, and
+  `default_tile` shrinks along the window grid to a 2 GiB budget: tiles come out
+  394 / 278 / 98 / 80 for SPANV2 / Compact / RealPLKSR / HAT-L, landing peak RSS
+  between 0.5 and 2.5 GB where RealPLKSR previously reached **16.6 GB**.
+
+Two memory fixes found by measuring rather than reasoning:
+
+- **MambaIRv2 was costed as a Swin-family transformer and is not one.** Its
+  `ConvFFN` runs a depthwise 5×5 at twice the embedding width in *every* layer —
+  108 of them in MambaIRv2-L — so its scratch behaves like a conv net's. The
+  estimate was 5× low and a real checkpoint peaked at **10.6 GB**; costed with
+  the conv-net live-buffer count it takes tile 64 and 2.26 GB, and the three
+  measured tiles fit `0.391 MB/px² · tile² + 663 MB` to within 0.5%.
+- **`Upscaler` no longer holds a second copy of the weights.** It handed them to
+  the graph and then kept the whole `Checkpoint` alive so a later recompile
+  could use it — 231 MB on DRCT-L, 158 MB on HAT-L, for an event that usually
+  never comes. It now remembers the path and re-reads if asked; an `Upscaler`
+  built from in-memory tensors still keeps them, since there is nothing to
+  re-read from. `holds_weights()` reports which.
+
+**Transparency is preserved.** Every path previously went through
+`image::open(..).to_rgb8()`, which flattens a logo, icon or sprite sheet onto an
+opaque rectangle and reports success — a silent data loss for exactly the assets
+people upscale most. `Upscaler::upscale_rgba8` splits the mask off and
+`AlphaMode` chooses its treatment: `upscale` (default) runs it through the same
+network so mask and colour edges agree, `resize` bicubic-resamples it for
+roughly free, `discard` returns RGB. A fully opaque image skips the second pass.
+None premultiply, and the docs say why.
+
+**ESRGAN / RRDBNet.** By volume the most deployed super-resolution architecture
+there is — `4x-UltraSharp`, `4x_foolhardy_Remacri`, BSRGAN, RealSR and most of
+OpenModelDB are this network. It ships under **three** naming schemes (old
+`model.N…`, Real-ESRGAN `conv_first`/`body.i.rdbj`, BSRGAN
+`RRDB_trunk.i.RDBj`), so `weights::esrgan_to_old_arch` normalizes all three on
+load, and a test asserts the three layouts detect to an identical config.
+Covers ESRGAN+ (the 1×1 side paths) and the `pixel_unshuffle` variants
+Real-ESRGAN uses at ×1/×2. Validated at r=0.9909 / 0.9906 / 0.9671.
+
+Writing it surfaced two bugs, both caught by tests before a real model hit them:
+
+- **`esrgan_to_old_arch` triggered on `conv_first` alone**, which SwinIR, DRCT,
+  DAT and MambaIRv2 all have — it would have quietly rewritten every
+  Swin-family stem into `model.0` and made them undetectable. Now requires an
+  actual residual-dense key.
+- **The trainer-wrapper stripper ate ESRGAN's own prefix.** Its old layout puts
+  the whole network under `model.`, so the unanimity check fired and left
+  `0.weight`, `1.sub.…`. A wrapper contains *named* submodules; a flattened
+  `nn.Sequential` starts with a bare index, so that case is now refused.
+
+**SwinIR's ×1 denoising / JPEG-artifact variant now loads.** Its tail is a bare
+`conv_last` whose output is *added to the input* — no upsampler at all — and
+since every other tail carries `conv_last` too, the check has to come last.
+Released checkpoints of this shape (`005_colorDN_DFWB_…`) previously failed
+outright with "no recognizable upsampler tail". Added as `Upsampler::Residual`,
+which asserts ×1 rather than silently producing a size mismatch.
+
+Five runnable examples, each answering a question you have when you download an
+upscaler: `identify` (walk a folder of unlabelled checkpoints and say what each
+one is, without loading a weight into a graph), `upscale` (the whole API end to
+end), `tile_sweep` (measure the real memory/speed trade-off on this machine,
+each configuration in a fresh process so peak RSS is not a stale high-water
+mark), `compare_models` (run them all over one image with fidelity and cost),
+and `gallery` (a labelled side-by-side sheet, captioned with a 5×7 bitmap font
+so it needs no typeface dependency; `--crop` runs the models only on the region
+the sheet shows). The sweep makes the estimator's calibration visible: it reads 3–4×
+conservative on a shallow net like SPANV2, whose live-buffer count was fitted to
+deeper models.
+
+The tile budget is overridable with the workspace-wide `RLX_MAX_RAM_BYTES`,
+because a smaller tile is not free: only the tile's interior survives the crop,
+so HAT-L on a 512×384 input took 539 s at tile 176 but **1028 s at tile 128** —
+nearly twice as long for 40% less memory. A 2 / 4 / 8 / 16 GiB budget gives
+HAT-L a tile of 80 / 112 / 160 / 224. `--inspect` and the runner resolve the
+same way, so what is reported is what runs, and each run now prints its halo
+overhead.
+
+The tier-2 halo is now one window rather than two. Tiling is exact for a conv
+net, whose receptive field a halo can cover; it cannot be for a twelve-group
+transformer, where shifted windows propagate half a window per block. One window
+keeps seams invisible and is honest about not being exact — and it made the
+tier-2 validation suite about twice as fast with no measurable quality change
+(HAT-L 47.2 → 47.5 dB).
+
+DAT's shift schedule is independently confirmed by a release checkpoint: it
+registers `attn_mask_0`/`_1` for precisely the blocks `is_shifted` predicts
+(`layers.0.blocks.2`, `layers.1.blocks.0`, `layers.1.blocks.4`), now pinned as a
+test.
+
+#### Backends: all fifteen on everything testable here
+
+`coreml` is now a feature, so the **Apple Neural Engine** is reachable — it was
+not merely unwired, it was unreachable: no feature existed, `parse_standard_device`
+rejects `Device::Ane` outright, MIL caps tensor rank at **5** while pixel shuffle
+and window partition are naturally rank-6, and four activations (`Mish`,
+`HardSwish`, `HardSigmoid`, `LogSigmoid`) hit an `unreachable!()` inside the
+backend. `Mish` is RealPLKSR's activation, so every RealPLKSR checkpoint crashed
+CoreML. All 24 rank-6 sites are now written with the batch axis elided — it is
+structurally 1, and `Builder::rank5` checks that rather than assuming it.
+
+Verified numerically against CPU across all fifteen architectures: Metal 4.2e-7,
+MLX 4.8e-7, wgpu 1.8e-7, Vulkan 1.8e-7, ANE 3.6e-7. CUDA and ROCm are **not**
+verified — no such hardware here, and the test reports them skipped rather than
+passing them silently.
+
+`scripts/upscale_backend_matrix.py` decides the rest statically, over every
+backend crate in the RLX tree. Reading `SUPPORTED_OPS` alone is not enough: an
+op is reachable by three routes, and two are invisible in the claim set — the
+legalize loop rewrites what a target does not claim (this is why `Pad` runs
+everywhere despite only Metal and CUDA having a kernel), and `OpCaps::FUSED`
+kinds decompose. CoreML leaves `SelectiveScan` *deliberately* unclaimed so the
+rewriter emits the compact `Op::Scan` form; a claim-only matrix calls that a gap.
+`--check` is a regression guard, not a demand that every cell be green: gaps on
+a backend with no FP32 datapath are expected, anything else fails.
+
+Ten backends cover all fifteen architectures; WebGL covers fourteen (MambaIRv2
+needs `ArgSort`). QNN and XDNA fall short but are int8/fp16 NPUs — XDNA's own
+source notes it has no FP32 datapath.
+
+#### OmniSR: grid channel-attention had the wrong shape
+
+Block attention batches over tiles and contracts positions; **grid does the
+opposite**. One shape was written for both. It is invisible to a value check —
+a reshape only relabels, so the flat buffer is identical either way — and what
+sees it is the *next* op, the attention matmul, which contracted `nw` where it
+should have contracted `ws²`. The first test passed against the buggy code for
+exactly that reason; asserting the declared shape makes it fail `[6,2,3,4]` vs
+`[4,2,3,6]`. The einops patterns were then re-derived independently in numpy to
+confirm the oracle. OmniSR ×3 51.5 → **53.8 dB**, ×1 DeJPG 38.3 → **41.1 dB**.
+
+**38 release checkpoints** now validate by round-trip correlation, covering all
+fifteen architectures, every scale and every upsampler tail.
+
+### Release prep (0.2.16)
+
+Worked the documented preflight. Findings, in order of how badly they would have
+bitten:
+
+**Two hard blockers remain, neither fixable from this repo alone.**
+
+1. **`rlx-torch-ckpt` has never been published** (404 on the sparse index). It is
+   a *normal* dependency of `rlx-upscale`, so the whole workspace fails to
+   resolve from crates.io — `cargo metadata` dies outright with the local
+   `.cargo/config.toml` patch moved aside. This is the `rlx-opscope` situation
+   recurring with a new crate. The crate exists upstream at
+   `../rlx/crates/io/rlx-torch-ckpt` and carries no `publish = false`; it simply
+   was never uploaded. Publish it with the next upstream release and this
+   clears. Every *other* upstream pin was checked against the index
+   individually: all 28 resolve at 0.2.16.
+2. **54 untracked files, including two whole crates** (`rlx-dsv41`,
+   `rlx-jina-ocr`) and **10 `src/` modules of `rlx-models-core` that are
+   `mod`-declared in `lib.rs`**. `cargo publish` refuses a dirty tree, and
+   `--allow-dirty` would exclude untracked files — so `rlx-models-core` would
+   ship as a crate that does not compile. These need committing before a
+   release run.
+
+**Fixed here:**
+
+- **`publish.sh` TIERS: 3 crates missing** (`rlx-dsv41`, `rlx-upscale` → tier 3;
+  `rlx-jina-ocr` → tier 4). A crate absent from every tier is silently never
+  published. Recomputed from `cargo metadata` over all deps incl. dev and
+  optional: now 198/198 covered with **0 ordering violations** (the previous
+  release's ordering fix held).
+- **The `include_str!` / `.gitignore` trap, worse than the documented case.**
+  Three baked assets were ignored — and three of them feed `include_bytes!` in
+  *library* `src/`, not just tests, so `rlx-ten-vad`, `rlx-ten-vad-core` and the
+  whisper DTW test do not build at all on a fresh clone. These were caught by
+  *directory* rules (`crates/*/weights/`, `crates/rlx-whisper/fixtures/`) rather
+  than the file globs the existing negations handle, and git will not descend
+  into an excluded directory — so the usual `!path/to/file` negation is inert.
+  Fixed with re-include-dir → re-exclude-contents → allow-one-file, and verified
+  both that the three are now trackable and that a stray blob dropped in either
+  directory is still ignored. 305 KB / 150 KB / 256 B, far under the 10 MiB cap.
+- **Two `include_*!` calls reached outside their own package** — a strictly
+  worse form of the trap above, and invisible to `.gitignore` fixes. Found by
+  running `cargo package` *with* build verification rather than `--no-verify`:
+
+  - `rlx-ten-vad-core/src/weights.rs` did
+    `include_bytes!("../../rlx-ten-vad/weights/ten_vad.safetensors")`. `cargo
+    package` ships only files under the crate root, so the published crate could
+    never compile — `cargo package -p rlx-ten-vad-core` failed outright.
+    Dependency direction is rlx-ten-vad → rlx-ten-vad-core, so the blob was
+    moved *down* into core (which already owns the tensor layout) and exported
+    as `weights::SAFETENSORS`; `rlx-ten-vad` now re-uses that constant instead
+    of embedding a second 305 KB copy. `cargo package` on core now build-verifies.
+  - `rlx-models/tests/whisper_word_dtw.rs` pulled its fixture from
+    `../../rlx-whisper/fixtures/`. Nothing in rlx-whisper used it, so it moved to
+    `rlx-models/tests/fixtures/` where its only consumer lives.
+
+  A repo-wide scan now reports **0** cross-package includes. Note the library
+  build passing is *not* sufficient evidence here: the stale path left behind in
+  core's `#[cfg(test)]` block still compiled the lib fine and only surfaced when
+  the tests were actually run.
+- **`cargo fmt --all`**: 155 files were unformatted (the documented inter-release
+  drift). Now clean.
+- **Catalog drift, and a checker so it stops recurring.** MODELS.md says it is
+  "generated from each crate's `Cargo.toml`" — there is no generator; it is
+  hand-maintained and stale in four independent ways:
+
+  - **Five model crates had no row at all**: `rlx-dsv41`, `rlx-jina-ocr`,
+    `rlx-upscale`, `rlx-wespeaker`, `rlx-translate`. The last one hid from a
+    substring search because `rlx-translategemma` contains its name — only an
+    exact row-name comparison found it. The other ten absentees are
+    infrastructure (`rlx-ssm`, `rlx-llama-base`, `rlx-vlm-base`, …) and are
+    correctly excluded.
+  - **Six backend cells were wrong**, including one that over-claimed:
+    `rlx-mamba` advertised wgpu with no `gpu` feature. Four understated —
+    `rlx-minimax-h3` (listed 4 backends, actually all 7), `rlx-diarize` (listed
+    CPU, actually Metal/MLX/CUDA/wgpu/CoreML) — and `rlx-ten-vad`,
+    `rlx-voice-gender`, `rlx-wespeaker` omitted CoreML.
+  - **The category table was independently stale**: it read 45 for TTS against
+    46 actual rows, which is why the headline said 176 while the tables summed
+    to 177.
+  - Counts recomputed from the rows: **182 families across 16 categories**,
+    updated in MODELS.md (headline, category table, total) and the three places
+    README repeats it.
+
+  Added `scripts/check-models-catalog.py`, wired into the fmt-clippy workflow
+  and `just lint-all` (metadata only — no build). It checks all seven failure
+  modes above: missing crates, rows naming crates that do not exist, cells
+  claiming a backend the crate has no feature for, cells omitting one it does
+  have (unless the cell carries a prose status caveat), category counts, the
+  total, the headline counts in both files, and `STUB` markers against the crate
+  description. Mutation-tested — deleting a row, renaming one to a nonexistent
+  crate, over-claiming a backend, understating one, and corrupting either count
+  each produce a finding, so it is not vacuous.
+- **149 GB of stale `target/debug`** — the known `cargo test --workspace` blowup
+  — left the volume 98% full with 40 GiB free, too little to run the clippy
+  preflight at all. Removed; 169 GiB free.
+
+**Release documentation.** The process lived in `publish.sh`'s header and in
+nobody's notes, so each release rediscovered the same traps. Added
+`docs/releasing.md`: preconditions, the gate commands, and the five trap classes
+with what each actually broke. Linked from AGENTS.md.
+
+**Stale instruction docs corrected.** AGENTS.md and TODO.md still told readers
+the workspace pins `^0.2.14` — it has been `^0.2.16` since the last bump — in
+six places, and two were wrong in a second way: `rlx-models-core` was described
+as tier 0 (it is tier 1) and `kitten_tts_mini_rlx` as tier 2 (tier 0, ahead of
+`rlx-kittentts` in tier 7). AGENTS.md also had `rlx-opscope` at upstream tier 9;
+it is tier 8. Recomputed all of these from `publish.sh` rather than editing by
+hand.
+
+**Tier 0 verified end to end.** All **28** tier-0 crates `cargo package` *with*
+build verification (not `--no-verify`, which is what missed the include trap) —
+28 ok, 0 failures, largest 783.9 KiB. Tier 0 is the only tier verifiable ahead
+of a release; every later tier depends on crates not yet on the index, so their
+packaging failure is expected rather than a defect.
+
+**The upstream blocker is fully characterized.** `rlx-torch-ckpt` packages and
+build-verifies cleanly in `../rlx` (74 KB, complete metadata, no
+`publish = false`) and depends only on third-party crates — anyhow, flate2,
+half, plus a tempfile dev-dep. Nothing gates its upload; it sits in upstream
+tier 0 and was simply missed. One `cargo publish` clears this repo's blocker.
+
+**New: `scripts/check-publishable.py`.** Every blocker found this release was
+caught by hand, with throwaway scans — nothing would stop any of them recurring.
+This script is those scans made permanent. It checks the classes that no cargo
+command catches, because they only surface from `cargo publish` or on a *fresh
+clone* that lacks files the developing machine happened to have:
+
+1. `include_str!`/`include_bytes!` escaping its own package (the published crate
+   cannot compile; `cargo package --no-verify` misses it too);
+2. an include target that git ignores (compile-time input, so a fresh clone
+   cannot build the target at all);
+3. a path dependency with no version — self dev-deps excluded, since cargo
+   strips those;
+4. a packaged crate over the 10 MiB crates.io cap;
+5. `publish.sh` TIERS coverage, **ordering**, and crates listed in more than one
+   tier (last one silently wins).
+
+With `--release` it also checks that every upstream `rlx*` pin resolves on the
+crates.io index, and that the tree is clean — both of which fail every ordinary
+development day, which is why they are opt-in. Running it today reports exactly
+the two known blockers and nothing else.
+
+Wired into the fmt-clippy workflow and `just lint-all` (offline, fast); `just
+release-preflight` runs the full set.
+
+All nine checks are mutation-tested rather than trusted because they went green:
+each was made to fire by breaking the thing it guards. Two attempts initially
+produced *zero* findings and both turned out to be bad tests, not weak checks —
+the tier-ordering mutation added a crate to a second tier without removing it
+from the first, which last-wins made a no-op (that near-miss is why the
+duplicate-tier check now exists), and an earlier over-claimed-backend mutation
+edited the description cell instead of the backend cell.
+
+**Checked, no action needed:** five crates carry a self path dev-dep with no
+version (`rlx-orpheus`, `rlx-moshi`, `rlx-mimi`, `rlx-neutts`, `rlx-kyutai-tts`
+each depend on themselves to enable test features), which looks like the
+publish-rejecting class of bug — it is not: a scratch-crate probe shows cargo
+strips self dev-deps entirely, emitting an empty `[dev-dependencies]`. No
+publishable crate has a genuine versionless path dep. Packaged size is far under
+the 10 MiB cap — largest is `rlx-qwen3-tts` at 1.73 MiB compressed, and
+`rlx-assets` dry-run packages at 93.3 KiB. Also: all package versions agree at 0.2.16 (the one
+crate at 0.1.0 is `publish = false`); the two bench crates that pin `rlx-ir` /
+`rlx-runtime` literally instead of through `[workspace.dependencies]` are
+currently consistent, so they are noted rather than churned.
+
+### rlx-qwen35 prefill/decode equivalence
+
+`rlx-qwen35` had no test that decode, stepped one token at a time, reproduces
+what prefill computes for the same context (`rlx-glm5next` has one). Building
+the equivalent — `tests/decode_equivalence.rs` — turned up three real bugs.
+All are fixed; greedy generation on `Ternary-Bonsai-2-27B` now matches the
+reference runtime character-for-character over 40 tokens instead of the first
+6, and plain `Qwen3.8-27B` is fixed with it.
+
+The two state bugs share one cause: **the prefill-cache graph is built once at
+`max_seq` and every shorter prompt is padded up to it.** Attention is immune —
+it masks padding causally and has its padded KV scrubbed afterwards
+(`zero_prompt_padding_kv`) — but the recurrent layers carry state forward, and
+nothing masked it.
+
+- **FIXED: padding advanced the GatedDeltaNet scan.** Every padded position
+  still updated the state, so the exported state described the prompt *plus* a
+  run of pad tokens, and the amount depended on `max_seq`. The scan now takes a
+  per-position pad mask and zeroes `g` and `β` there: by the recurrence
+  `S *= exp(g); S += k ⊗ ((v − Sᵀk)·β)` a step is a no-op only when **both**
+  are zero — zeroing `β` alone still decays the state.
+- **FIXED: the short-conv window was exported from the padding.**
+  `narrow(padded, 1, seq, k-1)` takes the last `k-1` positions, which are pad
+  tokens unless the prompt fills the compiled extent. It now gathers the window
+  ending at the last real token.
+- **FIXED: `predict_logits` returned position 0.** With
+  `last_logits_only == false` the logits are `[batch, max_seq, vocab]` but the
+  row was sliced at `b * vocab` — always the first prompt position, so every
+  call returned the same logits however the prompt grew.
+
+Both graph inputs default-degrade: `gdn_pad_l{il}` is "pad" polarity and
+`gdn_conv_shift_l{il}` is an offset, so an unbound input reads zeros and
+reproduces the previous behaviour rather than corrupting the scan.
+
+Also added `cpu_gated_delta_net_carry_splits_without_changing_the_scan` in
+`rlx-runtime`, which pins the contract the whole hybrid decode path rests on:
+splitting a scan into `s-1` + `1` must be exact. It passes — the op was never
+at fault, which is what let the search converge on the wiring.
+
+### Lazy `token_embd` (rlx-qwen35) — 24.0 → 18.9 GB
+
+Ternary Bonsai 2's embedding table is `[248320, 5120]`: 278 MB packed, 4.74 GiB
+expanded to F32, and decode reads one row per token. It now stays packed and
+rows are gathered on demand, with the `prism.hadamard` inverse applied per row
+rather than to all 248320 at load. Weight load drops 4.69 s → 11 ms.
+
+Gated on the packed table being readable (`token_embd_lm`) and host-gather
+being on, so neither the lookup nor the LM head needs the F32 copy — **tied
+heads included**, since both the host and graph LM-head paths prefer
+`token_embd_lm` and only fall back to the F32 table when it is absent. Every
+packed qwen35 model benefits:
+
+| model | RSS dense | RSS lazy |
+|---|---:|---:|
+| Ternary Bonsai 2 (untied) | 24.05 GB | 18.78 GB |
+| Bonsai 1 Q1_0 (tied) | 16.51 GB | 11.61 GB |
+| Qwen3.8-27B-Q3_K_S (tied) | 32.24 GB | 20.19 GB |
+
+`RLX_QWEN35_NO_LAZY_EMBED=1` opts out, and
+`lazy_embed_rows_match_the_materialized_table` checks the gather row-for-row
+against the dense table on real weights.
+
+`Qwen35Weights::token_embd` is now `pub(crate)` behind an accessor that
+**panics** under a lazy table instead of handing back an empty slice — callers
+index it directly, so empty reads as zeros and the model would emit plausible
+tokens from nothing. That turned ~45 sites across five crates into compile
+errors, each resolved deliberately: metadata to `embd_elems()`, gathers to
+`embed_row_into`, excluded paths left to panic. `from_dense_parts` is the
+constructor for adapters that build a bundle outside the loader.
+
+Also added `rlx_gguf::dequant_typed`, split out of `GgufFile::dequant_f32`, so
+a caller can decode a slice — one embedding row — without materializing the
+whole tensor.
+
+### Stream packed weight uploads (rlx-qwen3)
+
+The same mmap-borrow upload as the qwen35 fix below, in two places:
+`high_level_runner.rs` borrowed the blob and handed it to `set_param_typed`
+(which copies through it, faulting in the whole checkpoint), and
+`generator.rs` additionally `to_vec()`d from that borrow, paying the fault-in
+*and* the copy. Both now `pread`, falling back to the borrow when the loader
+has no streaming backing. Output-identical on Qwen3-0.6B-Q4_K_M; only 50 MB
+there because the checkpoint is 400 MB, but it scales — the same change was
+worth 4.7-19.6 GB on qwen35's 5.5/13 GB checkpoints. Revert with
+`RLX_QWEN3_MMAP_UPLOAD=1`.
+
+### Stream packed weight uploads (rlx-dflash, rlx-gemma, rlx-lfm)
+
+The remaining three crates sharing the pattern, each now verified against real
+weights rather than taken on faith. All are token-identical to the mmap arm
+across interleaved runs, with the anonymous footprint flat and the whole saving
+in file-backed pages — the expected signature.
+
+| crate | checkpoint | RSS | revert |
+|---|---|---|---|
+| rlx-gemma | translategemma-4b Q4_K_M, 2.49 GB | 24.08 → 22.10 GB (−1.98) | `RLX_GEMMA_MMAP_UPLOAD=1` |
+| rlx-dflash | Qwen3.8-27B-DFlash2 Q4_K_M, 1.14 GB | 22.29 → 21.31 GB (−0.98) | `RLX_DFLASH_MMAP_UPLOAD=1` |
+| rlx-lfm | LFM2-350M Q4_K_M, 229 MB | 1.28 → 1.11 GB (−0.17) | `RLX_LFM_MMAP_UPLOAD=1` |
+
+Two of the three needed more than the upload site. `rlx-dflash` and `rlx-lfm`
+reach the checkpoint through wrapper loaders (`ReplayLoader`, and `GgufNameShim`
+which remaps HF names to GGUF ones); both only forwarded
+`tensor_bytes_borrowed`, so without also forwarding `read_tensor_bytes_into` the
+trait default returns `false` and the change is a silent no-op that still
+borrows. Instrumenting `bind` confirmed the live path: 57 packed tensors /
+1.09 GB, all streamed, and 0 streamed under the revert flag. `rlx-dflash`'s
+`dflash_forward` example carries its own copy of `bind` — fixed too, or the
+example would keep demonstrating the pattern the library no longer uses.
+
+Gemma's fused-component case concatenates several tensors into one param; it
+streams each into a second scratch and extends, so a fused upload still costs
+one component rather than the whole mmap.
+
+### LFM2 decode was silently non-exact — `RLX_Q4K_FUSED_MIN_N` override removed
+
+`build_decode_session` forced `RLX_Q4K_FUSED_MIN_N=2048` on CPU, citing a "~2×
+decode win". That is what broke `decode_parity_live` (below), and re-measuring
+on real checkpoints does not support the claim.
+
+The fused kernel quantizes the *activation* to Q8_K. Upstream rlx defaults it
+off — "rlx keeps decode on f32 for fidelity (and decode↔prefill parity)" — and
+this override silently reversed that policy process-wide, via an `env::set`
+from inside a builder (so it leaked into every other model in the process).
+Once the threshold is low enough to pull in the FFN matmuls, the error
+compounds through every remaining layer; the LM head alone is terminal and
+cannot compound.
+
+Agreement with the f32 prefill reference, 8 random-id prompts × 8 tokens
+(deterministic, so these numbers are exact):
+
+| `RLX_Q4K_FUSED_MIN_N` | 350M | 2.6B |
+|---|---|---|
+| unset (off) | 100% | 100% |
+| 65536 (LM head only) | 100% | 100% |
+| 4096 | 75.9% | 90.6% |
+| 2048 (was the default) | 72.2% | 92.2% |
+
+Throughput, arms alternated **inside one process**, min-of-5. Sequential
+per-config runs were worthless here — two arms executing identical code
+differed by 28% on machine drift, and a first pass that way produced a
+confident "2048 halves 2.6B throughput" that is simply not true:
+
+| arm | 350M | 2.6B |
+|---|---|---|
+| off | 33.7 tok/s | 8.4 tok/s |
+| 65536 | +1.4% | −0.4% |
+| 2048 | −14.1% | +11.1% |
+
+The threshold also decides peak RSS, because the exact path dequantizes Q4_K
+into an f32 cache while the fused kernel reads packed bytes in place — on 2.6B,
+**14.45 GB exact vs 5.17 GB fused**, stable to ±0.02 GB over three interleaved
+rounds (8.7× vs 3.1× amplification of the 1.67 GB checkpoint). An earlier draft
+of this entry quoted 13.39/4.57 from single unrepeated runs; the direction was
+right but the figures were not reproducible.
+
+So the old default was strictly worse on 350M (slower *and* lossy), while on
+2.6B it bought ~11% decode and ~8.8 GB for non-bit-exact output. That is a real
+tradeoff — and on a memory-constrained box the RSS saving dwarfs the throughput
+delta — but not one to make silently on a crate whose own test asserts
+exactness. Default is now upstream's (off, exact); opt in with
+`RLX_Q4K_FUSED_MIN_N=2048`. Cache-thrash protection is untouched: rlx-cpu's
+`prefer_cached_blas` routes to the fused kernel on its own when the f32 cache
+would thrash, independent of this threshold.
+
+`decode_parity_live` now passes on both LFM2-350M and LFM2.5-2.6B.
+
+### New: exact Q4_K decode GEMV that never materializes f32 (`RLX_Q4K_EXACT_GEMV`)
+
+Removing the override above left a gap. For a Q4_K decode GEMV there were only
+two strategies, and neither is exact-and-cheap:
+
+- **cached-f32-BLAS** — exact, but materializes the matrix as f32 (8.7× the
+  checkpoint on 2.6B);
+- **packed Q8_K** — reads packed bytes in place, but quantizes the activation.
+
+`prefer_cached_blas` switches to the second on its own once `cache_thrashing()`
+trips, so on a machine where the f32 cache does not fit, decode numerics
+silently degrade. `RLX_DEQUANT_CACHE=0` is exact but re-dequantizes the whole
+weight per call.
+
+Added a third arm: dequantize each Q4_K super-block to f32 on the fly and dot it
+against the *unquantized* activation, row-parallel over the output. The
+primitive for this (`rlx_gguf::q4_k_dot_f32`) already existed but was referenced
+only by tests — no GEMV was built on it. Opt in with `RLX_Q4K_EXACT_GEMV=1`.
+
+Throughput against the other two *exact* options (arms alternated in one
+process, min-of-4):
+
+| exact path | 350M | 2.6B |
+|---|---|---|
+| cached-f32-BLAS | 36.0 tok/s | 9.0 tok/s |
+| `RLX_DEQUANT_CACHE=0` | 12.0 | 1.8 |
+| this kernel | 23.8 | 5.1 |
+
+It does not beat the f32 cache when the cache fits; it is **2.8× the throughput
+of the only other exact option when it does not**. `decode_parity_live` passes
+on both LFM2 checkpoints with this arm enabled and fails with the Q8_K arm, and
+a unit test pins it within 1e-4 of f32 BLAS while asserting it is strictly
+closer than the Q8_K arm (so the test keeps its teeth if either kernel is
+retuned).
+
+**Not established: its effect on RSS.** Routing is adaptive — `cache_thrashing()`
+is accumulated runtime state — so per-arm peak RSS is path-dependent and did not
+hold still across flag combinations. One oddity is worth flagging because it
+reproduces *without* this kernel: lowering `RLX_Q4K_FUSED_MIN_N` from 2048 to 1
+sends strictly more matmuls to the packed path, yet *raised* 2.6B RSS from
+5.17 GB to 14.46 GB. That is backwards and is left open.
+
+### rlx-gguf streaming reads: drop a checkpoint-sized memset and a per-tensor `open`
+
+Two pieces of waste in `read_tensor_bytes_into`, the shared path behind every
+crate's streaming weight upload:
+
+- `buf.clear()` before `buf.resize(nbytes, 0)` forced the resize to zero-fill
+  all `nbytes` immediately before `read_exact_at` overwrote every one of them —
+  a memset of the entire checkpoint per load. `Vec::resize` only initializes
+  elements it *adds*, so dropping the `clear()` zeroes just the growth delta: a
+  reused scratch now pays at most the largest single tensor, once.
+- `File::open` ran per tensor (hundreds per model) for a full path walk and an
+  `open`/`close` pair. `pread` needs no per-call seek state, so one lazily
+  opened `OnceLock<File>` serves every tensor.
+
+**No measurable end-to-end win**, and the honest reason is worth recording: an
+interleaved A/B on translategemma-4b (2.49 GB) put best-of-5 at 5.72 s new vs
+5.43 s old — load is disk-bound, and ~2.5 GB of memset is ~0.12 s of it. An
+earlier sequential reading suggested 9.7 s → 5.2 s; that was page-cache state,
+not the change. Both fixes are kept as removal of plain waste, not as a
+speedup. Verified unchanged: rlx-gguf/rlx-cpu suites (292 + 98 tests), the
+Bonsai-2-27B real-weight suite on the 5.95 GB PTQ1_0 checkpoint, and
+token-identical output from gemma, dflash and lfm.
+
+#### How the LFM2 parity failure was tracked down
+
+`decode_parity_live` is gated on `RLX_LFM_WEIGHTS`, and with no LFM2 checkpoint
+on this machine it had never run. Pulling LFM2-350M to verify the upload change
+ran it for the first time: it **fails**, byte-identically with and without the
+change (`RLX_LFM_MMAP_UPLOAD=1` reproduces the same two token lists), so it is
+pre-existing and unrelated. `warm_cache_speedup_live` passes.
+
+The trail is worth keeping, because two plausible readings were both wrong.
+Trailing pad in `generate_prefill` was ruled out first (its first token is
+invariant across `n_new` 1→24). "Near-tie greedy flip" was ruled out next, and
+decisively: at length 6 decode picked a token ranked **16th** in the prefill
+logits, 1.272 below the top — a tie flip would be rank 1 at ~1e-6. Dumping full
+logit vectors then showed decode's `sum|logit|` running 1–6% above prefill's at
+*every* length, including lengths where the argmax happened to agree, so the
+"sporadic" divergence was really a systematic one that only surfaced when the
+top-2 gap was narrow. Finally, comparing at length 1 — one token, zero history,
+empty KV — still disagreed, which ruled out the KV/conv-state advance and
+pointed at the graph itself. The `env::set` in `build_decode_session` was two
+lines up from there.
+
+### Stream packed weight uploads (rlx-qwen35) — RSS −4.7 to −19.6 GB
+
+`upload_packed_opt`'s low-mem path borrowed each packed tensor from the mmap.
+The arena copy reads through that borrow, so it faulted in every page of the
+checkpoint and left a second full-size copy resident; on macOS that is
+unreclaimable short of `munmap`, since `release_mapped_pages` is a Linux-only
+win. Now it `pread`s into one reused scratch, capping resident cost at the
+largest single tensor.
+
+| | RSS before | RSS after |
+|---|---:|---:|
+| Ternary Bonsai 2 (5.5 GB weights) | 28.6 GB | 23.9 GB |
+| Qwen3.8-27B-Q3_K_S (13 GB weights) | 41.7 GB | 22.1 GB |
+
+Reproducible to 0.1 GB, benefits every qwen35 model, costs ~400 ms of one-time
+upload. Falls back to borrowing when the loader has no streaming backing;
+revert with `RLX_QWEN35_MMAP_UPLOAD=1`. rlx-llama32 already made this trade and
+measured 5.93 GB vs 0.07 GB on a 6 GB checkpoint.
+
+### PTQ1_0 arena scratch (rlx-metal) — peak memory 32.2 → 23.1 GB
+
+Adding the fused PTQ1_0 GEMV updated the run-time dispatch but not the
+compile-time arena sizing: `dequant_gguf_scratch_bytes` had skip arms for
+Q1_0, Q2_0 and G8_0 and none for PTQ1_0, so every graph still reserved an f32
+dequant slab the fused kernel never writes. Ternary Bonsai 2's
+`[248320, 5120]` LM head is ~5 GiB of that on its own.
+
+**Peak memory footprint 32.2 → 23.1 GB (−28%)**, reproducible to 0.1 GB across
+repeats. The skip mirrors the dispatch exactly (`m == 1`, `k % 128`, `n % 8`,
+same off-switch), because the two disagreeing in either direction is a bug: one
+way reserves a slab nothing writes, the other way the encoder reaches for one
+that was never allocated.
+
+Note for anyone measuring this: quote `peak memory footprint` from
+`/usr/bin/time -l`, not `maximum resident set size` — RSS moved by several GB
+between identical runs here while the footprint was stable to a tenth.
+
+### Small-m square GEMMs to MPS (rlx-metal cost model)
+
+`prism.hadamard`'s rotation reshapes to `[-1, 1024]`, so it runs as
+`m = 5/6/17, k = n = 1024` about 190 times per decoded token. `m` is not a
+multiple of 8, so `Simd` is ineligible and these land on `SimdPadded`, which
+pads `m` up to a simdgroup and wastes most of the tile. Routing them to MPS
+instead takes Ternary Bonsai 2 from 111.3 → 103.2 ms/token, winning every
+interleaved round.
+
+The rule is deliberately narrow — `2 <= m < 32`, `m % 8 != 0`, `k == n >= 256`.
+`k == n` is the discriminator and is not arbitrary: a square operator is a
+rotation or basis change, never a transformer projection. An earlier version
+without it also caught rectangular shapes and cost `Qwen3.8-27B-Q3_K_S` 1.6%.
+`RLX_METAL_SMALL_M_MPS_TRACE=1` confirms the final rule fires on **no** shape
+in either Qwen3.8-27B or Bonsai-1, so it cannot regress them. Opt out with
+`RLX_METAL_NO_SMALL_M_MPS=1`.
+
+Also: `RLX_QWEN35_GPU_KV=1` (in-place KV append instead of a concat) was
+measured and showed no gain, so it stays off.
+
+### Fused PTQ1_0 decode GEMV (Metal)
+
+`Ternary-Bonsai-2-27B` decode was spending **89.8%** of its GPU time in
+`dequant_matmul_gguf` (`RLX_METAL_THUNK_PROFILE=1`): with no fused kernel,
+every `PTQ1_0` weight was re-expanded to an f32 scratch on every token — for a
+5.9 GB model, tens of GB of dequant traffic per token.
+
+`ptq1_0_mv_f32_sg` reads the packed 28-byte blocks straight out of the arena,
+simdgroup-cooperative, modelled on `q1_0_mv_f32_sg`. Two details specific to
+this format: `(b · 3ⁿ) mod 256` collapses to a single multiply because every
+`3ⁿ` for `n < 5` is already < 256, and the staged element → (byte, digit) map
+depends only on the lane, so it is resolved once per lane instead of once per
+row.
+
+**0.61 → 4.34 tok/s (7.1×)** (median over decode steps ≥ 2, min of 4 trials),
+output character-for-character unchanged.
+Decode is now 74% GEMV, i.e. mostly irreducible weight streaming. Off-switch
+`RLX_METAL_PTQ1_0_FUSED_DISABLE=1`; `m > 1` (prefill) still takes the scratch
+path, and `dequant_gguf_scratch_bytes` mirrors that. Also wired `PTQ1_0` into
+`rlx_gguf::quantize` so the parity tests can build packed fixtures.
+
+A second kernel, `ptq1_0_mv_f32_sg_fp`, is now the default and takes decode to
+**8.1 tok/s / 124 ms**, and with the cost-model rule above **9.7 tok/s /
+103 ms** — **~16× the 0.61 tok/s** this started at. Against the reference the
+interleaved ratio is a stable **~2.0×**; absolute ms/token on this machine
+swings by 2× with background load and should not be quoted without min-of-N. Ported from the fork's own Metal GEMV: the base-3 digit extraction
+moves entirely into the float pipe — `digit_n = floor(3^(n+1)·u) − 3·floor(3^n·u)`
+for `u = b/256`, telescoped so each trit costs one floor and one fma — because
+this ISA cannot co-issue integer and floating-point work; and each thread owns
+whole *bytes*, so a block's bytes are read once instead of five times.
+`RLX_METAL_PTQ1_0_INT_PIPE=1` selects the integer kernel, which is kept as the
+A/B reference and stays covered by its own parity test.
+
+With it the profile is flat — `dequant_matmul_gguf` 28%, `sgemm` 22%, `concat`
+17% — so no single term dominates any more.
+
+**Measurement note.** Run sequentially, the float-pipe kernel looked 40%
+*slower*; run interleaved against the integer one it won 5 rounds out of 5.
+The difference was drift on a machine that was also running other jobs. GPU
+A/Bs here have to alternate the variants, not follow one with the other, and
+`ps -Ao pcpu,comm | sort -rn | head` is worth a look before trusting a number.
+
+**Left on the table, measured but not taken.** The Hadamard rotation is
+`m=5, k=1024, n=1024` — 5 MFLOP, below `mps_threshold_flop`, so it takes
+rlx-metal's `m < 32` MSL cascade. Forcing MPS (`RLX_METAL_SGEMM_MPS=1`) won 5 of
+6 interleaved rounds (~6%), and the cost model already special-cases
+`m == 1 && n < 64` → MPS for the same occupancy-starvation reason. Not changed:
+that cascade is globally tuned with its own sweep test, and 6% from one noisy
+A/B on one model does not justify moving it. Recorded in PARITY.md for a proper
+multi-model sweep.
+
+Two other attempts measured slower and were reverted, with the numbers recorded
+in-place: 16 rows per simdgroup instead of 8 (`x` is already cached), and
+factoring the rotation as `H_1024 = H_32 ⊗ H_32` (exactly equal, 4 KB instead of
+4 MB, but the matrix stays cached and doubling the dispatch count costs more
+than the traffic saved).
+
+### Ternary-Bonsai-2-27B
+
+`prism-ml/Ternary-Bonsai-2-27B-gguf` runs through `rlx-qwen35`. Its
+architecture is unchanged from the base Qwen3.8-27B — same 64 blocks, same
+hybrid 3:1 linear/full attention, byte-for-byte the hparams the crate already
+ran — so the port is entirely about how the weights are *stored*.
+
+- **Two new GGUF quant types.** `PQ2_0` (on-disk type 142) is byte-identical
+  to the existing `GgufQ2_0` codec at a distinct type id, so it is a pure
+  remap. `PTQ1_0` (type 143) is new: base-3 trits, five per byte, 28 bytes per
+  128 weights (1.75 bpw), with the f16 scale *last* in the block. Its
+  element → (byte, digit) map is staged rather than sequential, so a
+  sequential walk still decodes to a valid ternary tensor — just a permuted
+  one. `rlx_gguf::ptq1_dequant` is checked against the fork's own CUDA
+  element-map reference, and the Metal and WGSL kernels against the CPU codec.
+- **⚠ Type id 143 collides.** Doses AI's `mortar.cpp` uses it for `G8_0`
+  (Pestle) and PrismML's llama.cpp for `PTQ1_0`; nothing in the id
+  distinguishes them. `rlx_gguf::TypeDialect` picks per file from the
+  `prism.*` metadata, leaving the historical `G8_0` reading untouched.
+- **The weights are in a rotated basis.** Each matrix is folded by a
+  blockwise normalized Sylvester–Walsh Hadamard rotation (block 1024) with a
+  per-width sign flip, so a matmul against them is only correct if the
+  *activation* gets the matching transform first. `rlx_qwen35::prism_hadamard`
+  parses the `prism.hadamard.*` contract and `emit_linear` applies
+  permute → signs → rotation ahead of each of the 401 folded weights;
+  `token_embd` stores rotated rows and is un-rotated once at load. The GDN
+  `ssm_out` path additionally needs a tiled → grouped head reorder.
+  Skipping any of this does not fail — the rotation is orthogonal, so the
+  model still runs and still emits fluent text, just not this model's — so
+  the transform lives on the weight (`Proj::Folded`), `Proj::dense()` refuses
+  it rather than letting a fusion fast-path take the raw matrix, and an
+  unrecognized metadata variant is an error rather than a fallback.
+- **The bug this actually shipped with, caught on real weights.** The
+  embedding table's inverse is `h = s ⊙ (H z)` — rotation *then* sign flip,
+  because the forward transform is `H(s ⊙ x)` and the two do not commute. The
+  port applied only the rotation, which flipped the signs of the wrong 5120
+  channels: the model loaded, ran, and emitted EOS as its first token. Every
+  synthetic test passed, because they were self-consistent about an ordering
+  that was wrong on both sides. What found it was dumping the reference's own
+  graph (`llama-eval-callback`), where the `MUL(..., prism.hadamard.signs.5120)`
+  right after the embedding rotation is plainly visible.
+- **Real-weight parity.** Prefill argmax is token-exact with the reference —
+  `"The capital of France is"` → `"Paris.\nThe capital of Germany"` — and
+  ChatML answers `"Paris"`. See PARITY.md, including a pre-existing
+  `rlx-qwen35` prefill-vs-decode drift (reproduced on plain Qwen3.8 with no
+  Hadamard) and the current 0.61 tok/s decode.
+- **Tests.** `tests/prism_hadamard_projection.rs` builds the same tiny model
+  twice — folded and dense — and requires matching logits;
+  `tests/bonsai2_manifest.rs` checks the port against the real published
+  header (175 KB fixture, `scripts/bonsai2_manifest.py`): 402 ternary tensors,
+  401 folded names all resolving to real tensors, sign vectors splitting at
+  5120/6144/17408, and 48 permuted `ssm_out` weights at (128, 16, 3).
+
+### Jina-OCR-v1
+
+`jinaai/jina-ocr-v1` is a DeepSeek-OCR derivative, and `baidu/Unlimited-OCR`
+is the same architecture under the same 2 722 tensor names — so the new
+`rlx-jina-ocr` crate reuses `rlx-unlimited-ocr`'s SAM+CLIP DeepEncoder, linear
+projector, expert packing and compiled MoE decoder outright, and contributes
+only what actually differs. Every difference fails silently, which is why each
+has its own test:
+
+- **No sliding window.** jina's `config.json` has no `sliding_window` key and
+  `modeling_deepseekv2.py` reads it as `getattr(self, "sliding_window", None)`
+  — plain causal attention over the whole history. Unlimited-OCR's card sets
+  `128`, so inheriting that fallback would have clamped attention to the last
+  128 tokens and still produced fluent text.
+- **`rope_theta = 1e6`**, where Unlimited-OCR omits the key and falls back to
+  `10_000`.
+- **No BOS.** The processor calls `text_encode(..., bos=False)` and
+  `tokenizer_config.json` sets `add_bos_token: false`; the id stream starts at
+  the `<|User|>:` chunk. Unlimited-OCR's own assembly prepends BOS.
+- **`dynamic_preprocess(max_num=9)`** vs 32, and the tiling threshold is
+  `image_size` rather than a constant.
+- **n-gram guard 35 / 1024** with `<td>` / `</td>` whitelisted, so long tables
+  are not truncated by the repeat blocker.
+
+Also new: `postprocess` (ports `decode_ocr`, `parse_refs` and
+`extract_markdown_and_crops` — the two reference regexes are hand-scanned so
+the crate stays dependency-free) and `mtp`, the FastMTP draft head.
+
+**Verified on the real checkpoint (CPU).** Running it end to end surfaced two
+pre-existing bugs in the shared compiled decoder — see below — and after fixing
+them rlx reproduces the reference implementation's greedy output **token for
+token** (first-token logit 14.877 vs 14.875) and transcribes the bundled page
+correctly. `tests/checkpoint_inventory.rs` additionally checks every tensor name
+and shape against the published safetensors *headers*, read over HTTP range
+requests and baked into a 16 KB fixture; `tests/prompt_ids.rs` checks the chat
+template and prompt-id splice against the checkpoint's own `tokenizer.json`.
+
+**All five available backends now agree.** Fed the same `inputs_embeds`, CPU,
+Metal, MLX, wgpu and Vulkan return token-identical greedy output, matching the
+reference. Getting there took two more backend fixes (below). CUDA/ROCm are not
+present on this machine and were not checked.
+
+| precision | cpu | metal | mlx | wgpu | vulkan |
+|---|---|---|---|---|---|
+| f32 / f16 | exact | exact | exact | capacity | capacity |
+| q8_0 / q4_0 | exact | exact | exact | exact | exact |
+
+`capacity` is a loud refusal, not a wrong answer: wgpu declines to stripe a
+20 GiB activation arena across 4 GiB buffers (striping silently corrupts), and
+Vulkan reports the 10.3 GiB weight prefix exceeding `maxStorageBufferRange`.
+Both run fine at `--lm-precision q8_0`.
+
+**FastMTP is now wired into decode.** The multi-token-with-past graph it
+needed (`seq = K+1`, `MaskKind::Bias`) is the chunked verify pass added to
+`rlx-unlimited-ocr` (see below); `JinaMtp` loads the draft head and the
+target tensors it shares, and `JinaOcrRunner::generate_with_mtp` runs it.
+On the real checkpoint the output is **byte-identical** to plain decode, which
+is the property that matters — the verify pass keeps a draft token only when
+it equals the target's own greedy pick.
+
+It is **opt-in**, and measures as follows on the bundled page (Metal, q8_0,
+927-token prompt). Two defects were found and fixed getting here: the graph
+tapped the *post*-norm hidden state where FastMTP wants the pre-norm one
+(`pre_norm_hidden_states` in `modeling_deepseekv2.py`), and the draft block —
+a transformer layer with its own KV cache — was never primed over the prompt.
+
+`examples/mtp_probe.rs` scores the head directly, and prints a control first:
+the target's own tapped hidden, through the shared norm and host LM head, must
+reproduce the tokens the target actually generated. It does, at **47/47**, so
+the draft numbers under it mean something. That control is not ceremony — an
+earlier version of this probe lacked it and spent a run producing draft scores
+that could not be interpreted.
+
+- **Concat order settled by measurement**, since the checkpoint ships the draft
+  weights but not the module that runs them (the card points at a vLLM
+  plugin): `eh_proj([enorm(e); hnorm(h)])` scores **25.5%** top-1 agreement
+  with the target against **0.0%** reversed. That matches DeepSeek-V3's *code*
+  — not its paper, which writes `M[RMSNorm(h_i); RMSNorm(Emb(t_{i+1}))]` with
+  the operands the other way round.
+- **`K = 3` from the config is the wrong depth.** The draft-depth curve shows
+  step 1 accepting 25.5%, step 2 6.4%, and **step 3 exactly 0.0%** — a third of
+  the host draft cost buying nothing. `K = 1` gets 1.26 tokens/round of the
+  1.32 available at `K = 2`; `MtpHead::set_steps` overrides it.
+- **1.30 tokens/round end to end**, which independently matches the probe's
+  curve.
+
+**And it is a net loss on this model — the draft head is not why.**
+Drafting costs ~10 ms of a ~1250 ms round, under 2%. What kills it is the
+verify forward: `examples/mtp_cost.rs` times a plain decode step against a
+chunked one *interleaved in one process*, at a real 927-token context and
+after a warm-up so no timing pays for a graph compile, and the chunk costs
+**1.6x-2.6x a single-token step**. At 1.26-1.41 tokens/round that comes out at
+**0.47x-0.83x** — slower than plain decode, which the 192-token end-to-end run
+independently reproduces at 0.62x.
+
+The chunk cost is also nearly flat in `n` (1247 / 1253 / 1217 ms for
+`n = 2 / 3 / 4`), which says it is not the extra tokens but the `n > 1` path
+itself taking a slower route than the single-token one. That is the thing to
+fix: if a chunked forward reached parity with a decode step, `K = 2` at 1.32
+tokens/round would be a ~1.3x win. Until then `generate_with_mtp` stays
+opt-in.
+
+Measuring this correctly took three tries, and the wrong ways are worth
+recording. This box is shared: identical work returned 88 s, 129 s and 255 s
+depending on what else was running, so **timing the two arms sequentially
+compares load, not code** — that is what produced an apparent 1.05x speedup
+that a later run flatly contradicted. Deriving the plain per-token cost by
+subtracting an estimated prefill was no better, because on a 48-token
+transcription the vision encode plus the 927-token prefill is ~101 s of ~131 s
+and swamps what is being measured. Only interleaved timings of the three terms
+in one process reproduced.
+
+Also note the draft head needs its own host-resident f32 copy of `lm_head`
+(129280x1280, 662 MB) because the draft hidden never enters the compiled
+graph; `JinaMtp::host_bytes` reports it. The embedding table is *not*
+duplicated — draft steps look rows up through the already-packed weights.
+
+### rlx-unlimited-ocr
+
+**Two silent correctness bugs in the compiled decoder.** Both predate this work
+and made the compiled path wrong for *every* checkpoint this crate serves,
+including `baidu/Unlimited-OCR` itself. Neither was caught because
+`backend_quick_check` only asserts that logits are finite, and the end-to-end
+parity test needs a checkpoint that was never downloaded. The eager
+[`lm_flow`] path was correct throughout, which is what made the split
+diagnosable: fed the reference implementation's own `inputs_embeds`, eager
+returned the published logits and the compiled graph did not.
+
+- **`Op::Rope` on rank-4 BHSD input wrote almost nothing** (fixed upstream in
+  `rlx-cpu`'s `thunk::ops::attention::compile_rope`). It read the shape as
+  `[batch, seq, hidden]` positionally, so for the `[B, H, S, D]` tensor that
+  `apply_rope_bhsd` produces it took `seq = H` and `hidden = S`, sized the
+  output as `B*H*S` instead of `B*H*S*D`, and left the rest of the destination
+  zero. Attention over a near-zero K is uniform, so the model emitted confident
+  nonsense rather than crashing. `executor.rs`'s RoPE handles rank 4 correctly;
+  the thunk path shadows it. New `tests/rope_lowering.rs` pins the rotation
+  (with a control proving the reshape/transpose round-trip is identity, so the
+  failure cannot be a harness artifact).
+- **The MoE router gathered expert weights with ONNX `Gather` instead of
+  `take_along_axis`.** `[rows, experts]` × `[rows, k]` came back
+  `[rows, rows, k]`, and the following `reshape([rows, 1])` silently
+  reinterpreted a `rows*k` buffer as `rows` — so each token was weighted by an
+  arbitrary other token's routing probability. The expert *indices* were right,
+  which is why every layer stayed plausible while drifting further from the
+  reference. Now `Op::GatherElements { axis: 1 }`; new
+  `tests/moe_router_lowering.rs` checks selection and that the weights are raw
+  softmax probabilities that do **not** sum to 1 (`norm_topk_prob=false`).
+
+**Four more silent bugs, found by running the op suite on every backend rather
+than only CPU, and across op *variants* rather than one shape.** `tests/` now carries a `common` device
+enumerator, and the RoPE, GroupedMatMul, MoE-router, packed-quant,
+view-readback and bucketed-decode checks all run on every backend compiled in
+and present, reporting every failing backend at once. The RoPE suite covers both
+pairing conventions, partial rotation, GQA head counts, decode-width sequences,
+multi-batch and `heads == 1` — the last of which is where the rank-4 bug was
+invisible.
+
+- **Metal and Vulkan had the same rank-4 BHSD `Op::Rope` defect as CPU** — both
+  read the shape as `[batch, seq, hidden]` positionally. Fixed the same way
+  (fold leading axes into `batch`). Metal already carried a comment about
+  fixing this exact class of bug for the *rank-2* case; rank 4 was missed.
+- **Metal's fused per-row grouped dequant read `expert_idx` on the host without
+  syncing first.** Its own doc says the indices "must already be resident"; the
+  slower grouped path below it calls `sync_gpu!()` for precisely that reason,
+  the fast path did not. With routing produced by a `TopK` earlier in the same
+  command buffer — i.e. every MoE decoder — it read stale bytes and routed every
+  row to whatever the buffer held (usually expert 0). In range, so the
+  `debug_assert` passed. Fixed by syncing before the encode.
+
+- **rlx-mlx read strided views linearly.** `to_f32` / `to_bytes` in the C++ shim
+  tested `flags().row_contiguous` **before** `eval()`, and on a lazily built
+  graph those flags describe nothing yet — so the contiguity check passed and
+  the `memcpy` walked the base buffer, turning a sliced column into the first N
+  elements of its parent. Every host-lowered op that reads a view was affected;
+  it surfaced as the MoE router sending each token to the wrong expert (ids
+  stayed in range, so nothing complained). Fixed with
+  `materialize_row_contiguous`: evaluate, *then* test, then materialize.
+  `tests/view_readback_parity.rs` pins it by reading the same view through two
+  different consumers, across slice / transpose / double-narrow shapes.
+- **wgpu indexed the RoPE tables by `rot_half` instead of the table's own row
+  width.** Correct only when `n_rot == head_dim`; under partial rotation it read
+  the wrong table row for every position past the first, while still producing a
+  correctly-normed rotation — so it looked right. The CPU kernel already carried
+  a `cos_row_stride` field for exactly this reason (and a comment describing the
+  trap); wgpu's shader never got it, and its own Rust-side doc claimed a stride
+  the shader did not use. `RopeParams` now carries `cos_row_stride`.
+
+- **`Op::RopeBackward` carried the same rank-4 defect in *seven* backends**
+  (cpu, metal, vulkan, wgpu, cuda, rocm, oneapi) — the forward fix had not been
+  mirrored onto the gradient. With BHSD input it wrote `B*H*S` of `B*H*S*D`
+  elements, so **100% of the gradient came back zero** in every case the new
+  test covers, `heads == 1` included (where the forward bug was a no-op).
+  Nothing here trains a BHSD-RoPE model, so it degraded training silently
+  rather than failing. Fixed in all seven; cuda/rocm/oneapi are **untested
+  here** (no device on this machine) but the change is mechanical and provably
+  a no-op at rank 3. `rope_lowering.rs` now checks the backward pass against the
+  negated forward rotation on every available backend.
+- **A second pre-`eval()` `flags()` check in the MLX shim** (`rlx_mlx_row_bytes`)
+  had the same ordering bug; there a wrong-direction flag would corrupt an
+  in-place row write rather than a read. Reordered.
+
+**No backend is clamped.** `device_supports_packed_quant` is kept as the hook
+for "this backend computes the wrong answer, downgrade rather than trust the
+user's `--lm-precision`", but currently returns true for everything.
+
+Support for checkpoints with no sliding window, which the crate could not run:
+
+- `sliding_window == 0` previously computed `window = usize::MAX` and then
+  `prefill_len + window`, which overflows. Both the compiled path and the eager
+  host flow now carry the window as `Option<usize>`.
+- Full-causal decode grows its KV every token, so the exact-shape
+  `MaskKind::Causal` graph would be recompiled once per generated token. New
+  `build_unlimited_ocr_decode_built{,_from_pack}_ext` take a `use_custom_mask`
+  flag that adds a `[batch, past_seq + 1]` keep-mask input and switches
+  attention to `MaskKind::Custom`; `CompiledLm` pads the past to a 256-row
+  bucket and masks the padding, compiling once per bucket.
+  `tests/full_causal_decode.rs` asserts bucketed decode matches the exact-shape
+  graph (with a negative control that unmasked padding does change the logits),
+  and that one bucket compiles one graph.
+- `validate()` accepts `deepseek_vl_v2` alongside `unlimited-ocr`; `SampleOpts`
+  gained `ngram_whitelist`; `UnlimitedOcrRunner` gained `open_with_config` and
+  `generate_from_ids` so a derivative crate can supply its own resolved config
+  and prompt-id layout. Windowed behaviour is unchanged.
+
+### FIXED: MLX returned all-zero qwen35 logits — a redundant gather, found by bisect
+
+The one finding from the test sweep that was recorded rather than fixed. The
+graph bisect it needed — compile each node as the sole output on CPU and MLX and
+walk for the first divergence — puts it at node 221 of 223, and the cause is
+plain once seen:
+
+`emit_qwen35_prefill_tail` gathers the last token **out of the logits**, while
+every caller that passes it a `last_token_idx` has *already* narrowed the hidden
+(the flow runs `gather_last_token_dynamic` before the tail). Its own
+`logit_rows = if last_token_idx.is_some() { 1 }` assumes exactly that. So the
+projection is `[batch, 1, vocab]` and the trailing gather asks for index
+`seq - 1` along an axis of length **1**. CPU clamps an out-of-range index and
+returned the right row by luck; MLX returns zeros. Every qwen35 prefill on MLX
+produced all-zero logits unless the last token happened to sit at index 0 —
+which is why a 1-token prompt looked fine.
+
+Why the earlier hunt missed it: the bisect skipped non-F32 nodes, and the
+suspicion had landed on the gather's *index* path. Every isolated reproduction —
+gather alone, gather + matmul, gather + RMSNorm + matmul, two I32 inputs — was
+correct, because none of them reproduced the one thing that mattered: a gather
+applied to an axis that was already length 1.
+
+**The self-cleaning exclusions did their job.** Three tests carried
+`assert_matches_cpu_except(.., &[("mlx", ..)], ..)` for this bug. Two of them
+failed the moment it was fixed, with "excused as a known failure … but now
+MATCHES CPU — drop the exclusion". That is the whole point of running an excused
+backend anyway rather than skipping it.
+
+The third kept failing, and for a different reason: **`prefill_seed_from_hidden`
+never fed the GDN pad masks.** The text prefill path feeds them; the multimodal
+one built its own feed list and did not, so MLX refused the graph with
+`missing input 'gdn_pad_l0'` and every other backend silently scanned the
+zero-padded tail as though it were prompt. Same class as the `last_token_idx`
+omissions above — an unbound input that CPU tolerates.
+
+Also fixed while clearing the last failures:
+
+- **Two kimi-k3 decode tests had not compiled in a long time.**
+  `decode_full` and `mla_decode` both sized their V cache at
+  `num_heads * qk()`, but the vdim path — the default — stores V at
+  `num_heads * v_head_dim`, so `concat` refused to join a `[1, s_past, 12]`
+  cache to a `[1, 1, 8]` new row. Both are real decode-vs-prefill parity tests;
+  the crate went from 5 passing to 34. `mla::mla_vdim` is now public, because it
+  changes a shape the caller has to allocate.
+- **`glare_smoke` ran CUDA on a machine with no CUDA.** Its cases gate on
+  `#[cfg(feature = ...)]`, which says the backend was compiled in, not that a
+  device exists. Now checks `is_available` and announces the skip.
+
+### The rest of the finite-only tests — and four more bugs
+
+Finishing the sweep. Roughly 26 more tests converted, and the classification
+itself needed correcting: counting *files* over-reported, and several tests
+flagged by a keyword scan already had real oracles. The ones deliberately left
+alone are listed at the end, with the reason checked rather than assumed.
+
+- **A test fixture mis-sized every indexer and attention-output weight in
+  `rlx-glm5next`, and the suite passed anyway.** `tensor_manifest`'s shape
+  dispatcher matches on name suffixes in order, and
+  `blk.N.attn_output.weight` ends with `output.weight` — so it hit the LM-head
+  arm first and got `[vocab, hidden]` instead of `[hidden, proj]`. The
+  `indexer.*` arms sat *after* the generic `attn_k` / `attn_q_b` ones, so every
+  indexer weight was sized as the attention block's. The graph was malformed in
+  four places; the reshapes downstream silently fabricated or dropped elements
+  to fit, and the test went green. The reshape element-count guard is what
+  surfaced it.
+- **`rlx-hoct` computed the wrong segment-to-segment distance for parallel
+  segments.** The parallel branch pins `sc = 0` and projects onto the other
+  segment, but skips the clamp-back step the non-parallel branch does — so two
+  *touching* collinear segments reported the distance between their start
+  points (1.0 for a unit pair) instead of 0. The test asserted only that the
+  distance was finite, which the wrong answer is. It now checks three cases
+  against the closed form: touching-collinear (0), parallel-offset (2), and
+  skew (5).
+- **Two more test files had not compiled in a long time.**
+  `llama32_apple_parity.rs` and `llama32_gpu_backend_parity.rs` — the actual
+  CPU-vs-GPU comparisons — were missing three `Llama32Config` fields. Being
+  feature-gated, nothing noticed. They run now.
+- **`glass_posterior_runs` could not fail.** `sample_posterior` writes into an
+  `out_z` the caller hands in, and the test pre-filled it with zeros before
+  asserting every element was finite — so it passed whether or not the function
+  wrote anything. It now checks that the buffer was written, that the result is
+  deterministic, that identical inputs give position-independent output, and
+  that scaling the noise changes the answer.
+- **`decoder_rlx_matches_eager` never compared anything to eager.** It checked
+  the backend *name*, the length, and finiteness. A real comparison is not
+  reachable from an integration test (`decode_forward` is `pub(crate)`) and
+  would be tautological today anyway, since `decoder::rlx::decode` delegates
+  straight to it. Renamed to what it verifies, with the reasoning recorded and
+  a pointer to where the parity test belongs once the rlx path has its own
+  implementation.
+
+Converted to cross-backend parity: FunASR (SenseVoice, Paraformer, FSMN-VAD,
+CAM++ — all four already looped every device and compared none of them),
+GLM-5.3 sparse-DSA and ragged-tail prefill, Ling's softplus-gate and ungated-MLA
+variants, Motif's no-sliding-window and dense-only variants, MiniMax M3 text
+flow and projector, Kimi-K3's vision tower under arena reuse, VibeVoice's two
+VAE encoders, TimesFM3's device sweep, and the Qwen2.5-VL / Qwen3.5-VL
+multimodal prefill+decode paths. Converted to determinism / closed-form /
+non-degeneracy where a device does not change the computation: TimesFM3 synth
+forward, the DIAMOND posterior and re-noise, `early_stop_ddpm` (linearity), the
+wake-word trainer, and the NeuTTS decoders.
+
+**Left alone, having checked why.** The `cpu_reference_logits_finite` family
+across the `*_backend_parity.rs` files is *not* vacuous in context: its siblings
+call `assert_logits_match_cpu(Device::Metal, ...)` and do the real comparison,
+so asserting the reference is finite is exactly the right scope for it.
+`vit_parity::metal_full_output_finite` is a Metal-only guard for a specific
+LayerNorm-clamp NaN, with `forward_parity_*` siblings doing the comparison.
+`jlens::mlx_status` is `#[ignore = "diagnostic"]` and documented as a reporting
+tool. `qwen35_forward_check`'s four tests assert real cache state
+(`cache.past_seq`, output counts); the `is_finite` in them is incidental.
+
+### Finite-only tests converted to real oracles — and the six bugs that fell out
+
+~43 test files asserted only that their output was *finite*. That is the
+weakest useful property: an all-zero result passes it, so does a tensor with one
+head's worth of real values and the rest zero, and so does a router that sent
+every token to the wrong expert. Converting them to compare against CPU — or,
+where a device does not change the computation, to assert determinism and
+framing — immediately surfaced defects that had been sitting in a green suite.
+
+`rlx_models_core::backend_matrix` grew `assert_matches_cpu_on_all` for the
+common case, plus `assert_matches_cpu_except` for backends excused by a known
+bug. Exclusions are **self-cleaning**: the excused backend still runs, and if it
+*passes* the test fails and tells you to drop the exclusion. An exclusion that
+silently outlives its bug is how a suite stops testing the thing it was written
+for.
+
+**A harness bug first.** `candidate_devices()` was cfg-gated on *this* crate's
+backend features, but model crates forward theirs to `rlx-runtime`, not here —
+so the sweep would have reported "cpu only" in precisely the crates that needed
+it, without even announcing a skip. It now lists every device and lets
+`rlx_runtime::is_available` decide.
+
+- **The qwen35 MoE router weighted every token by another token's routing
+  probability.** `gather_(probs, top_idx, 1)` is ONNX Gather, which applies each
+  row's index list to *every* row: `[rows, experts]` x `[rows, k]` comes back
+  `[rows, rows, k]`, and the following `reshape([rows, 1])` silently
+  reinterpreted it. The expert *indices* were right, so every MoE layer stayed
+  finite and plausible. This is the same defect this workspace already fixed in
+  `rlx-unlimited-ocr`'s router; it was caught here by the new reshape
+  element-count guard, which turned the silent truncation into an error.
+- **`enable_mtp_head = true` panicked for everyone.** `lower_qwen35_mtp_head`
+  gathered the last token with a rank-2 index, which ONNX Gather turns into rank
+  4, and then asserted against a rank-3 `out_shape`. Nobody hit it because the
+  test that covers it needs `qwen35` *and* a backend feature together, which CI
+  does not build.
+- **Five llama32 backend checks had not compiled in a long time.**
+  `Llama32Config` gained `sliding_window`, `sliding_window_pattern` and
+  `final_logit_softcap`; the tests were never updated, and being feature-gated,
+  nothing noticed. Same story for `Qwen35Weights::output_fold` in
+  `qwen35_vlm_quick_check`.
+- **Two tests never fed `last_token_idx`.** The graph declares it under
+  `last_logits_only`; CPU ran anyway with the input unbound, so the omission was
+  invisible until MLX refused. Same class as the next one.
+- **qwen35 dynamic prefill was broken on MLX.** `prompt_pad_mask_feeds`
+  deliberately returned an empty vec when nothing was padded, documented as "the
+  caller can skip the feed, the graph input defaults to all-zero". MLX does not
+  default unbound inputs, so it failed with `missing input 'gdn_pad_l0'`. It now
+  always emits the mask; the buffer is `batch * seq` floats per GDN layer.
+- **A nemotron-ASR fixture sized every strided conv as the wrong kind.** Its
+  shape heuristic had depthwise and pointwise inverted, handing the encoder 64
+  elements where it declares `[c, 1, 3, 3]` = 72. CPU ran on the short buffer;
+  MLX rejected it.
+
+Two findings are recorded rather than fixed, because both are honest behaviour
+or need work beyond this pass:
+
+- **MLX returns all-zero qwen35 logits** whenever `last_logits_only` is set and
+  `last_token_idx != 0`. Metal and wgpu are fine. Not the gather, the RMSNorm,
+  the matmul, the index dtype, the GDN layers, run order, MLX compile mode or
+  the fusion profile — each reproduced standalone on MLX and each is correct.
+  **Since fixed** — see the MLX entry above; the graph bisect found a redundant
+  gather over an axis of length 1, and the `#[ignore]` and all three exclusions
+  are gone.
+- **wgpu's qwen35 logits are CPU's times 1.0146..1.0161** — a *uniform gain*,
+  spread 1.5e-3, so the predicted token is unchanged. That signature is a
+  lower-precision `inversesqrt` in a normalization, not a lowering that
+  misplaced values, so the test asserts the gain property rather than widening a
+  tolerance to 2e-2 and calling it agreement.
+
+Vulkan's refusal to run MLA (`asymmetric v_head_dim not yet supported`) is
+excused rather than silenced — it is the right behaviour, and the exclusion
+drops out automatically if Vulkan gains the feature.
+
+### rlx-unlimited-ocr — speculative decoding, and four bugs the suite could not see
+
+Adding a draft-head seam to the shared decoder, plus the correctness work that
+fell out of testing it. Every bug below was silent: the model kept emitting
+fluent, in-range output.
+
+- **Chunked verify pass.** `build_unlimited_ocr_decode_chunk_built` scores
+  `n` tokens against a bucketed past in one forward, using `MaskKind::Bias`
+  for the additive per-query mask that plain decode never exercises (one
+  query only needs the cheaper binary keep-mask). `CompiledLm::decode_chunk`
+  drives it; `DeviceKvCache::rollback_to` drops a rejected draft.
+- **`decode_chunk` with `n == 1` fed the wrong mask.** The graph picks its
+  mask *kind* from `seq`, so a single-query chunk compiles the `Custom`
+  keep-mask path while `chunk_bias_mask` always built the `[1, heads, n, k]`
+  bias — a leaf-shape mismatch (`host len 1028 != shape [1, 257]`). It only
+  fires when a drafter proposes nothing, which the first adversarial test did.
+- **`speculative.rs`: greedy speculation that is provably lossless.** A
+  `Drafter` trait so the property is testable without any particular draft
+  head, and `generate_speculative` accepts a draft token only when it equals
+  the target's own greedy pick. `tests/speculative_equivalence.rs` runs four
+  adversarial drafters (empty, constant, always-wrong, oracle) on every
+  backend and requires byte-identical output.
+- **That test was vacuous about the KV rollback.** Deleting
+  `lm.rollback(...)` entirely — leaving every rejected draft token in the
+  cache for later queries to attend to — changed no emitted token, because on
+  a model this small the perturbation never moves an argmax. Fixed by
+  asserting on cache state directly (`CompiledLm::layer_kv`): with the
+  rollback removed the cache holds 47 rows where plain decode leaves 17.
+  Both this and the accept condition are now sabotage-verified.
+- **The KV cache row width is `num_kv_heads * head_dim`, not
+  `hidden_size`.** `lm_device.rs` used `hidden_size` as the stride in all
+  three paths. The two coincide for every config the suite had — jina-ocr-v1
+  included, at 10 query heads and 10 K/V heads — so nothing covered GQA at
+  all. New `UnlimitedOcrConfig::kv_hidden()` and
+  `tests/gqa_cache_stride.rs`, whose oracle needs no reference: prefilling
+  `n` tokens and prefilling `n-1` then decoding the last one must agree, and
+  only the second route touches the cache.
+- **The hidden tap published the post-norm state; the draft head wants
+  pre-norm.** `DeepseekV2Model.forward` keeps `pre_norm_hidden_states =
+  hidden_states` *before* `self.norm(...)` and hands that to FastMTP, which
+  applies its own `hnorm`. Feeding the normed tensor is not a crash — the
+  draft head still emits valid tokens, just uninformed ones, so the only
+  symptom is a low acceptance rate. Prefill now also taps *every* position
+  rather than the last, since a draft head that is itself a transformer layer
+  has to be primed over the prompt.
+- **And that test was covering one of four tap sites.** The tap is wired
+  separately in each of {packed, raw} x {prefill, decode}; the old test only
+  built the raw prefill graph, so reverting the packed branch — the one the
+  real checkpoint runs — left it green. Now swept over both LM-head
+  lowerings and both graph kinds, and each of the four sites individually
+  sabotage-checked.
+
+`rlx_models_core::backend_matrix` is the shared harness behind these:
+`available_devices()` announces skips rather than hiding them, and `Failures`
+accumulates so one run reports every failing (backend, variant) pair instead
+of stopping at the first.
+
+### Upstream `../rlx`: reshape stopped silently discarding elements
+
+`Shape::reshape` accepted any target shape and truncated or zero-filled to fit.
+Two real bugs were hiding behind that, both found the moment it became an
+error:
+
+- **`splat_common` summed a gradient with `keep_dim = false`**, producing
+  `[count]` where `[count, 1]` was needed; the reshape quietly papered over the
+  rank change.
+- **`build_kv_compressor_pool` relied on the truncation** to trim a padded
+  window, which now trims explicitly with `narrow_`.
+
 ### DeepSeek-V4.1-Flash
 
 `deepseek-ai/DeepSeek-V4.1-Flash` (`model_type: deepseek_v41`, released
@@ -48,6 +1365,38 @@ the vision tower and the DSpark draft head (rings, logits, Markov bias,
 confidence, and the greedy draft tokens) match their own fixtures. End-to-end on
 real weights stays out of reach: the only checkpoint is 510 GB of fp8/fp4.
 
+Real weights are reachable without the download, and four tests do it.
+
+A safetensors header gives every tensor's byte range, so `scripts/dsv41_ref/`
+range-fetches only what a test touches — ~300 MB of the 510 GB:
+
+- `real_layer_attention_matches_reference` runs the port's own `DsV41Loader` and
+  attention over real fp8 bytes at 160 tokens (past `sliding_window`, so the
+  window evicts), for layer 0 **and** layer 2. Layer 0 is sliding-window only;
+  layer 2 is a KV *and* index source, so the compressor's gated pooling, the
+  index keys and the YaRN-scaled compressed RoPE all run on trained weights.
+  Agreement is **7.5e-7** relative.
+- `dequant_matches_reference_on_real_bytes` decodes one real tensor per scale
+  layout **exactly** — FP8 tiles, FP4 nibble pairs, and 64 rows of the
+  384-million-row Engram table, which is FP8 but row-wise scaled. The Engram
+  slice costs 17 KB of a 98 GB tensor.
+- `engram_token_map_matches_the_real_tokenizer` runs the normalization over the
+  real 129,280-token vocab and must land on exactly **99092** — the constant
+  every hash multiplier is derived from — and fingerprints every individual
+  merge, because two different normalizations can share a bucket count.
+- `tensor_manifest_matches_the_real_checkpoint` needs no download at all: a
+  15 KB inventory distilled from the 48 shard headers pins all **96,085**
+  tensors against `DeepseekV41Spec::expected_tensors`, both directions, so a
+  subsystem the port forgot shows up as an unexplained tensor rather than as
+  silence. The only ones it knowingly skips are the DSpark stages'
+  `gate.bias_vl` (drafts are text).
+
+Each was mutation-checked. Swapping the FP4 nibble order, reading the Engram
+table as tiled, mapping a compressed latent to position `j` instead of
+`j · ratio`, dropping the inverse output RoPE, or dropping accent stripping are
+all caught — and the compressed-latent one is caught by layer 2 while layer 0
+still passes, which is the evidence that the second layer buys real coverage.
+
 Two details worth knowing when reading the code. The reference round-trips
 activations through FP8/FP4 in place (`act_quant(..., inplace=True)`); those
 calls are precision simulation, not semantics, and the port computes the
@@ -57,6 +1406,109 @@ so any position every head dislikes scores exactly zero) — the port keeps the
 lowest index, matching `Op::TopK`, and the parity harness pins torch to the same
 rule. A thresholding gate instead keeps *every* tied entry and quietly overruns
 the `index_topk` budget.
+
+### DeepSeek-V4.1: one block builder instead of three
+
+Prefill, decode and the DSpark draft head were three ways of walking the same
+block, and each carried its own copy of the Hyper-Connection wrapper — the part
+of V4.1 that is easiest to get subtly wrong, because the pre-mix is *lagged*
+(the mix a sublayer computes is consumed by the next one). Three copies of that
+is three chances to restart the chain in the wrong place, and no test would
+notice until the logits moved.
+
+There is now one copy, in a new `dsv41_block` module: `hc_sublayer` takes the
+body as a closure, and the three builders supply only what actually differs —
+how they assemble keys. `dsv41_moe` moved out of the prefill module too, since
+all three route through it; `dsv41_decode` used to import ten items from
+`dsv41_graph`, which had the layering backwards.
+
+Along with it:
+
+- **`Ctx`** bundles the graph, its parameters, the packed side table, the
+  checkpoint and the spec, which is what made the helpers take a handful of
+  meaningful arguments instead of a dozen positional ones.
+- **`AttnProj`** separates loading the attention weights from applying them.
+  `WeightLoader::take` is destructive and DSpark needs two KV latents from the
+  same `wkv` — one from the main model's stream, one from its draft block — so a
+  load-and-apply helper could not serve both.
+- **`StageSpan`** replaces `(layers, first, last)`; `..., true, false, ...` at a
+  call site said nothing. It also checks the split: every `kv_source_layer` has
+  to sit in the same stage as the layers reading it, or the consumers find an
+  empty compressed cache.
+- **`Tap`** replaces re-reading the environment at each of eight tap sites. It
+  reads once, so a concurrently-running test cannot change the tap mid-build, and
+  **a tap that never fires is an error** — previously, asking for a stage a layer
+  does not have silently compared logits instead and read as a failure of that
+  stage. That check immediately caught a second bug: the taps are process-global
+  and `cargo test` is multi-threaded, so graph-building tests now hold a shared
+  lock and set the tap through an RAII guard.
+
+Behaviour is unchanged: all 14 parity tests still pass, on CPU, Metal and MLX,
+including the real-weight runs.
+
+### Known: CPU arena reuse miscompiles a real-scale V4.1 attention graph
+
+Compiling and running the same graph with the same inputs on the same device
+returns a different answer on roughly **one attempt in ten**, and the wrong
+answer is badly wrong — a contiguous band of query rows, every column, max |Δ|
+≈ 3.5 against activations averaging 0.5.
+
+`RLX_ARENA_NO_REUSE=1` fixes it completely, so it is slot reuse rather than a
+kernel. It reproduces single-threaded (not a race), with a fresh session per run
+and with one reused session. `RLX_MEM_VERIFY=1` reports no overlap, no
+read-after-death and no view-past-root — so the verifier's liveness model does
+not describe whatever is going on, which is a finding in itself. Disabling
+fusion or shared-input matmul only lowers the rate. `build_v4_sink_attention`
+alone, at the same shape, is deterministic over hundreds of runs, so it needs the
+surrounding layer.
+
+It is captured as `arena_reuse_is_deterministic` (`#[ignore]`d, run with
+`--ignored`) with `examples/dsv41_determinism_probe` as a standalone reproducer;
+`real_layer_attention_matches_reference` pins the arena so that it measures the
+port rather than re-discovering this. Until it is fixed, **any CPU number from a
+real-scale graph is a coin flip unless the arena is pinned** — which also means
+this is not specific to V4.1.
+
+### Fixed: two backends broke DeepSeek-V4/V4.1 attention, upstream in `../rlx`
+
+The V4.1 port had only ever run on CPU. Running the parity suite on Metal and
+MLX found one bug each, both in shared code rather than anything V4.1-specific,
+and both of a kind that CPU cannot see.
+
+**Metal: a rank-2 RoPE input was read with heads and tokens transposed.** A
+partial (tail) RoPE feeds `[tokens, heads · head_dim]` — tokens outermost, heads
+striding *within* a row — which is what DeepSeek-V4 and V4.1 do to rotate the
+last `rope_head_dim` dims of every head. `rlx-metal`'s forward RoPE derived
+`(batch, seq, hidden) = (total / (s · head_dim), s, head_dim)` from that shape,
+inventing a batch of `heads` and then indexing it as `(b · seq + s)`. It is a
+no-op when `heads == 1`, which is why it survived; with more heads it silently
+rotates the wrong elements. `RopeBackward` in the same file, and the CPU thunk,
+already used the right derivation.
+
+It hid well: the forward `q`/`k` errors largely cancel in `q·kᵀ` (RoPE's whole
+point is relative position), so attention output was only ~0.4% off, while the
+*inverse* rope on the attention output — which has no cancelling partner — was
+91% off. **V4 is affected too**, and so is any model that rotates a multi-head
+rank-2 tensor on Metal.
+
+**MLX: `Op::TopK` broke ties by the largest index, not the smallest.** The op
+documents "ties broken by smaller index", CPU and Metal implement it by repeated
+argmax with a strict `>`, and `rlx-mlx` used `argpartition`, which picks an
+arbitrary member of a tied group — the lowering's own comment conceded the point.
+On an all-tied row it returned the highest indices. That is not a corner case
+here: the Indexer rectifies its head scores, so any compressed position every
+head dislikes scores *exactly* zero, and the tie rule alone decides which
+positions the model attends to. It now selects the set arithmetically —
+strictly-greater entries always win, and the group equal to the threshold is
+filled lowest-index-first — then converts that to indices via a key with no ties
+left, so no sort-stability assumption is involved. `rlx-mlx` also refused the
+rank-2 multi-head shape outright (`Cannot reshape array of size 384 into shape
+(12,8,2)`); its split/transpose path is rank-agnostic and was simply gated on
+rank ≥ 3.
+
+With both fixed, every stage of the V4.1 prefill agrees across CPU, Metal and
+MLX to ~3e-7, and `prefill_matches_reference_on_all_backends` covers it. The
+upstream suites stay green (`rlx-metal` 325, `rlx-mlx` 195).
 
 ### Fixed: DeepSeek-V4 Hyper-Connections mixed the streams transposed
 

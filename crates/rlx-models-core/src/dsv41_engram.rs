@@ -24,11 +24,10 @@
 //! `Engram` module in `inference/model.py`.
 
 use crate::dsv41::EngramSpec;
-use crate::standard_decoder::{load_p, synth_const, synth_zero};
-use crate::weight_loader::WeightLoader;
+use crate::dsv41_block::Ctx;
 use anyhow::{Result, anyhow};
 use rlx_ir::GraphExt;
-use rlx_ir::graph::{Graph, NodeId};
+use rlx_ir::graph::NodeId;
 use std::collections::HashMap;
 
 /// Bit-exact re-implementation of the pieces of `numpy.random` that
@@ -63,7 +62,9 @@ pub mod np_rng {
             v
         };
         let mix = |x: u32, y: u32| -> u32 {
-            let mut r = MIX_MULT_L.wrapping_mul(x).wrapping_sub(MIX_MULT_R.wrapping_mul(y));
+            let mut r = MIX_MULT_L
+                .wrapping_mul(x)
+                .wrapping_sub(MIX_MULT_R.wrapping_mul(y));
             r ^= r >> XSHIFT;
             r
         };
@@ -314,7 +315,12 @@ impl EngramHashPlan {
     /// look-back for later positions — an n-gram never spans a dead token.
     /// `start_pos` shifts the window for a continuation; `history` holds the
     /// compressed ids of everything before it (empty for a fresh prefill).
-    pub fn hash_ids(&self, compressed: &[u32], alive: Option<&[bool]>, history: &[u32]) -> Vec<i64> {
+    pub fn hash_ids(
+        &self,
+        compressed: &[u32],
+        alive: Option<&[bool]>,
+        history: &[u32],
+    ) -> Vec<i64> {
         let seq = compressed.len();
         let n_layers = self.multipliers.len();
         let cols = self.n_hash_cols();
@@ -369,7 +375,10 @@ fn normalize_token(text: &str) -> String {
     use unicode_normalization::char::is_combining_mark;
     // NFKC then NFD; strip accents drops the combining marks NFD exposed.
     let decomposed: String = text.nfkc().collect::<String>().nfd().collect();
-    let stripped: String = decomposed.chars().filter(|c| !is_combining_mark(*c)).collect();
+    let stripped: String = decomposed
+        .chars()
+        .filter(|c| !is_combining_mark(*c))
+        .collect();
     // `tokenizers::Lowercase` lowercases char by char.
     let lowered: String = stripped.chars().flat_map(char::to_lowercase).collect();
     // collapse runs of the four ASCII space characters
@@ -422,143 +431,102 @@ pub fn compress_token_map(decoded: &[String], pieces: &[String]) -> (Vec<u32>, u
     (map, n)
 }
 
-/// Emit one **Engram** block: `x + gate · value`, where the gate measures how well
-/// the fetched key matches the stream.
+/// Emit one **Engram** block: `x + gate · value`, where the gate measures how
+/// well the fetched key matches the stream.
 ///
-/// `x` is the Hyper-Connection stream `[rows, hc, dim]`; `rows_ids` is an
-/// `[rows, n_hash_cols]` I32 node holding this layer's slice of
-/// [`EngramHashPlan::hash_ids`]. `table` is the layer's dequantized
-/// `[num_embeddings, head_dim]` lookup. `alive_mask`, when given, is `[rows, 1]`
-/// with `0` at positions that must pass through untouched.
+/// `x` is the Hyper-Connection stream `[rows, hc, dim]`; `row_ids` is a
+/// `[rows, n_hash_cols]` node holding this layer's slice of
+/// [`EngramHashPlan::hash_ids`]. `alive`, when given, is `[rows, 1]` with `0` at
+/// positions that must pass through untouched — image spans take no part in an
+/// n-gram.
 ///
 /// Mirrors `Engram.forward`: `wkv` turns the flattened rows into one key per hc
-/// copy plus a shared value; the gate is a per-(token, copy) normalized dot
-/// product of stream against key, passed through a signed square root and a
-/// sigmoid. The normalization is per `(token, copy)` over `dim` — **not** jointly
-/// over the copies.
-#[allow(clippy::too_many_arguments)]
-pub fn build_v41_engram(
-    g: &mut Graph,
-    params: &mut HashMap<String, Vec<f32>>,
-    x: NodeId,
-    row_ids: NodeId,
-    table: NodeId,
-    wkv_t: NodeId,
-    q_weight: NodeId,
-    k_weight: NodeId,
-    alive_mask: Option<NodeId>,
-    rows: usize,
-    hc: usize,
-    dim: usize,
-    head_dim: usize,
-    n_hash_cols: usize,
-    eps: f32,
-    tag: &str,
-) -> NodeId {
-    let (r, h, d) = (rows as i64, hc as i64, dim as i64);
-    // embed(hash_ids).flatten(-2) → [rows, n_hash_cols·head_dim]
-    let fetched = g.gather_(table, row_ids, 0); // [rows, n_hash_cols, head_dim]
-    let fetched = g.reshape_(fetched, vec![r, (n_hash_cols * head_dim) as i64]);
-    let kv = g.mm(fetched, wkv_t); // [rows, (hc+1)·dim]
-    let key = g.narrow_(kv, 1, 0, hc * dim);
-    let value = g.narrow_(kv, 1, hc * dim, dim);
-    let key = g.reshape_(key, vec![r, h, d]);
-
-    // weight = q_weight · k_weight, only ever used as a product → [1, hc, dim]
-    let weight = g.mul(q_weight, k_weight);
-    let weight = g.reshape_(weight, vec![1, h, d]);
-
-    let eps_c = synth_const(g, params, &format!("{tag}.eng.eps"), vec![eps], &[1, 1, 1]);
-    let msq = |g: &mut Graph, t: NodeId| -> NodeId {
-        let sq = g.mul(t, t);
-        let m = g.mean(sq, vec![2], true); // [rows, hc, 1]
-        let m = g.add(m, eps_c);
-        g.rsqrt(m)
-    };
-    let rstd_x = msq(g, x);
-    let rstd_k = msq(g, key);
-    let rstd = g.mul(rstd_x, rstd_k);
-
-    let xw = g.mul(x, weight);
-    let dot = g.mul(xw, key);
-    let dot = g.sum(dot, vec![2], true); // [rows, hc, 1]
-    let dot = g.mul(dot, rstd);
-    let inv_sqrt_d = synth_const(
-        g,
-        params,
-        &format!("{tag}.eng.dscale"),
-        vec![(dim as f32).powf(-0.5)],
-        &[1, 1, 1],
-    );
-    let dot = g.mul(dot, inv_sqrt_d);
-
-    // gate = sigmoid(copysign(sqrt(clamp_min(|dot|, 1e-6)), dot)) — the signed
-    // square root the training kernel applies before the sigmoid.
-    let adot = g.abs(dot);
-    let adot = g.clamp_(adot, 1e-6, f32::MAX);
-    let root = g.sqrt(adot);
-    // `copysign(root, dot)`. `Activation::Sign` returns 0 at exactly zero while
-    // `copysign` treats +0 as positive, so fold that one case back to +1:
-    // `s + (1 - |s|)` is `s` when |s| == 1 and `1` when s == 0.
-    let dot_shape = g.shape(dot).clone();
-    let s_raw = g.activation(rlx_ir::op::Activation::Sign, dot, dot_shape);
-    let s_abs = g.abs(s_raw);
-    let one = synth_const(g, params, &format!("{tag}.eng.one"), vec![1.0], &[1, 1, 1]);
-    let gap = g.sub(one, s_abs);
-    let sign = g.add(s_raw, gap);
-    let signed = g.mul(root, sign);
-    let mut gate = g.sigmoid(signed); // [rows, hc, 1]
-    if let Some(mask) = alive_mask {
-        let m3 = g.reshape_(mask, vec![r, 1, 1]);
-        gate = g.mul(gate, m3);
-    }
-    let value3 = g.reshape_(value, vec![r, 1, d]);
-    let add = g.mul(gate, value3);
-    g.add(x, add)
-}
-
-/// Load one layer's Engram weights and emit the block. `lp` is the layer prefix
-/// (`layers.{N}`); the checkpoint stores the table as `engram.embed.weight` with a
-/// companion `engram.embed.scale`, which the loader is expected to have already
-/// folded in (see [`crate::dsv41_quant`]).
-#[allow(clippy::too_many_arguments)]
-pub fn load_and_build_v41_engram(
-    g: &mut Graph,
-    params: &mut HashMap<String, Vec<f32>>,
-    weights: &mut dyn WeightLoader,
+/// copy plus a shared value; the gate is a per-`(token, copy)` normalized dot
+/// product of stream against key, through a signed square root and a sigmoid.
+/// The normalization is per `(token, copy)` over `dim` — **not** jointly over
+/// the copies.
+pub(crate) fn build_v41_engram(
+    ctx: &mut Ctx<'_>,
     lp: &str,
     x: NodeId,
     row_ids: NodeId,
-    alive_mask: Option<NodeId>,
-    rows: usize,
-    hc: usize,
-    dim: usize,
+    alive: Option<NodeId>,
     spec: &EngramSpec,
-    eps: f32,
 ) -> Result<NodeId> {
-    let table = load_p(g, params, weights, &format!("{lp}.engram.embed.weight"), false)?;
-    let wkv_t = load_p(g, params, weights, &format!("{lp}.engram.wkv.weight"), true)?;
-    let q_weight = load_p(g, params, weights, &format!("{lp}.engram.q_weight"), false)?;
-    let k_weight = load_p(g, params, weights, &format!("{lp}.engram.k_weight"), false)?;
-    let _ = synth_zero(g, params, &format!("{lp}.engram.unused"), 0);
-    Ok(build_v41_engram(
-        g,
-        params,
-        x,
-        row_ids,
-        table,
-        wkv_t,
-        q_weight,
-        k_weight,
-        alive_mask,
-        rows,
-        hc,
-        dim,
-        spec.head_dim,
-        spec.n_hash_cols(),
-        eps,
-        lp,
-    ))
+    let (rows, hc, dim) = (ctx.rows, ctx.spec.hc_mult, ctx.spec.dim);
+    let (head_dim, cols, eps) = (spec.head_dim, spec.n_hash_cols(), ctx.eps());
+    let (r, h, d) = (rows as i64, hc as i64, dim as i64);
+
+    // the checkpoint stores the table quantized; the loader folds its scale in
+    let table = ctx.param(&format!("{lp}.engram.embed.weight"), false)?;
+    let wkv_t = ctx.param(&format!("{lp}.engram.wkv.weight"), true)?;
+    let q_weight = ctx.param(&format!("{lp}.engram.q_weight"), false)?;
+    let k_weight = ctx.param(&format!("{lp}.engram.k_weight"), false)?;
+
+    // embed(hash_ids).flatten(-2) → [rows, n_hash_cols·head_dim]
+    let fetched = ctx.g.gather_(table, row_ids, 0);
+    let fetched = ctx.g.reshape_(fetched, vec![r, (cols * head_dim) as i64]);
+    let kv = ctx.g.mm(fetched, wkv_t); // [rows, (hc+1)·dim]
+    let key = ctx.g.narrow_(kv, 1, 0, hc * dim);
+    let value = ctx.g.narrow_(kv, 1, hc * dim, dim);
+    let key = ctx.g.reshape_(key, vec![r, h, d]);
+
+    // `q_weight · k_weight`, only ever used as a product → [1, hc, dim]
+    let weight = ctx.g.mul(q_weight, k_weight);
+    let weight = ctx.g.reshape_(weight, vec![1, h, d]);
+
+    let eps_c = ctx.konst(&format!("{lp}.eng.eps"), vec![eps], &[1, 1, 1]);
+    let rstd_x = inv_rms(ctx, x, eps_c);
+    let rstd_k = inv_rms(ctx, key, eps_c);
+    let rstd = ctx.g.mul(rstd_x, rstd_k);
+
+    let xw = ctx.g.mul(x, weight);
+    let dot = ctx.g.mul(xw, key);
+    let dot = ctx.g.sum(dot, vec![2], true); // [rows, hc, 1]
+    let dot = ctx.g.mul(dot, rstd);
+    let inv_sqrt_d = ctx.konst(
+        &format!("{lp}.eng.dscale"),
+        vec![(dim as f32).powf(-0.5)],
+        &[1, 1, 1],
+    );
+    let dot = ctx.g.mul(dot, inv_sqrt_d);
+
+    let signed = signed_sqrt(ctx, dot, lp);
+    let mut gate = ctx.g.sigmoid(signed); // [rows, hc, 1]
+    if let Some(mask) = alive {
+        let m3 = ctx.g.reshape_(mask, vec![r, 1, 1]);
+        gate = ctx.g.mul(gate, m3);
+    }
+    let value3 = ctx.g.reshape_(value, vec![r, 1, d]);
+    let add = ctx.g.mul(gate, value3);
+    Ok(ctx.g.add(x, add))
+}
+
+/// `rsqrt(mean(t²) + eps)` over the last axis, keeping the axis.
+fn inv_rms(ctx: &mut Ctx<'_>, t: NodeId, eps: NodeId) -> NodeId {
+    let sq = ctx.g.mul(t, t);
+    let m = ctx.g.mean(sq, vec![2], true); // [rows, hc, 1]
+    let m = ctx.g.add(m, eps);
+    ctx.g.rsqrt(m)
+}
+
+/// `copysign(sqrt(max(|d|, 1e-6)), d)` — the signed square root the training
+/// kernel applies before the sigmoid.
+///
+/// `Activation::Sign` returns 0 at exactly zero while `copysign` treats `+0` as
+/// positive, so that one case is folded back to `+1`: `s + (1 - |s|)` is `s`
+/// when `|s| == 1` and `1` when `s == 0`.
+fn signed_sqrt(ctx: &mut Ctx<'_>, dot: NodeId, lp: &str) -> NodeId {
+    let adot = ctx.g.abs(dot);
+    let adot = ctx.g.clamp_(adot, 1e-6, f32::MAX);
+    let root = ctx.g.sqrt(adot);
+    let shape = ctx.g.shape(dot).clone();
+    let s_raw = ctx.g.activation(rlx_ir::op::Activation::Sign, dot, shape);
+    let s_abs = ctx.g.abs(s_raw);
+    let one = ctx.konst(&format!("{lp}.eng.one"), vec![1.0], &[1, 1, 1]);
+    let gap = ctx.g.sub(one, s_abs);
+    let sign = ctx.g.add(s_raw, gap);
+    ctx.g.mul(root, sign)
 }
 
 #[cfg(test)]
@@ -574,9 +542,33 @@ mod tests {
         let bound = ((i64::MAX as u64 / 99092) / 2).max(1);
         assert_eq!(bound, 46_539_438_283_891);
         let cases: [(u64, [i64; 4]); 3] = [
-            (1, [38316048023122, 2419938046656, 17979836159674, 36993668729195]),
-            (14, [33858405369630, 25755403400457, 15460673601360, 41309613242795]),
-            (3, [13763488024408, 40829620617460, 5438965595765, 35148471906864]),
+            (
+                1,
+                [
+                    38316048023122,
+                    2419938046656,
+                    17979836159674,
+                    36993668729195,
+                ],
+            ),
+            (
+                14,
+                [
+                    33858405369630,
+                    25755403400457,
+                    15460673601360,
+                    41309613242795,
+                ],
+            ),
+            (
+                3,
+                [
+                    13763488024408,
+                    40829620617460,
+                    5438965595765,
+                    35148471906864,
+                ],
+            ),
         ];
         for (layer, want) in cases {
             let mut g = np_rng::Pcg64::new(10007 * layer);
@@ -593,11 +585,21 @@ mod tests {
         let cases: [(u64, [i64; 4]); 2] = [
             (
                 1,
-                [59325216104801821, 3746820326864244, 27838405073976278, 57277759714273634],
+                [
+                    59325216104801821,
+                    3746820326864244,
+                    27838405073976278,
+                    57277759714273634,
+                ],
             ),
             (
                 14,
-                [52423392263866304, 39877413027471626, 23937954195406833, 63960190553987139],
+                [
+                    52423392263866304,
+                    39877413027471626,
+                    23937954195406833,
+                    63960190553987139,
+                ],
             ),
         ];
         for (layer, want) in cases {
@@ -677,7 +679,10 @@ mod tests {
                     let v = out[(i * 2 + l) * cols + c];
                     let lo = plan.offsets[l][c] as i64;
                     let hi = lo + flat[c] as i64;
-                    assert!(v >= lo && v < hi, "pos {i} layer {l} col {c}: {v} ∉ [{lo},{hi})");
+                    assert!(
+                        v >= lo && v < hi,
+                        "pos {i} layer {l} col {c}: {v} ∉ [{lo},{hi})"
+                    );
                     assert!(v < spec.num_embeddings[l] as i64);
                 }
             }
@@ -759,7 +764,10 @@ mod tests {
         assert_eq!(map[0], map[3]);
         assert_eq!(map[4], map[5], "accents are stripped");
         assert_ne!(map[0], map[6]);
-        assert_ne!(map[0], map[7], "a lone space is its own id, not the empty key");
+        assert_ne!(
+            map[0], map[7],
+            "a lone space is its own id, not the empty key"
+        );
         assert_eq!(n, 4); // {the, cafe, x, " "}
     }
 
@@ -776,7 +784,9 @@ mod tests {
     fn plan_rejects_pad_token_outside_the_map() {
         let mut spec = ga_engram();
         spec.pad_token_id = 999;
-        let err = EngramHashPlan::new(&spec, &[0, 1, 2]).unwrap_err().to_string();
+        let err = EngramHashPlan::new(&spec, &[0, 1, 2])
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("pad token id 999"), "{err}");
     }
 }

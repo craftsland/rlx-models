@@ -2,7 +2,7 @@
 
 Concrete model graph builders + weight loaders for RLX — the "what actually runs" layer.
 
-**[176 model families](MODELS.md)** across 16 categories — language & multimodal LLMs, vision, speech (ASR/TTS), audio codecs, and more — each a standalone crate under `crates/`. See **[MODELS.md](MODELS.md)** for the complete catalog with per-model backend support.
+**[182 model families](MODELS.md)** across 16 categories — language & multimodal LLMs, vision, speech (ASR/TTS), audio codecs, and more — each a standalone crate under `crates/`. See **[MODELS.md](MODELS.md)** for the complete catalog with per-model backend support.
 
 Standalone repo: [github.com/MIT-RLX/rlx-models](https://github.com/MIT-RLX/rlx-models). Clone next to [`rlx`](https://github.com/MIT-RLX/rlx):
 
@@ -51,7 +51,7 @@ Agent-oriented quick reference: [AGENTS.md](AGENTS.md).
 
 ## Model catalog
 
-This workspace ships **176 model families** (one crate per architecture), plus 4 training crates and shared infrastructure. Highlights:
+This workspace ships **182 model families** (one crate per architecture), plus 4 training crates and shared infrastructure. Highlights:
 
 - **36 language models** — Qwen3 / 3.5 / 3.6 / 3.8, Llama 3.2 / 4, Gemma, DeepSeek-V3 / V4, GLM-4.x / GLM-5.3, MiniMax, Jamba, Mamba, Phi, gpt-oss, Ling 3.0, Motif-3, MiniCPM5, TinyLlama, … plus two **diffusion LMs** (DiffusionGemma, LLaDA2) and speculative-decoding drafters (EAGLE3, DFlash).
 - **12 vision-language / omni** — Fara1.5, Qwen2.5-VL, Llama-3.2-Vision, Florence-2, LocateAnything, Kimi-K3, Inkling, …
@@ -80,7 +80,7 @@ rlx-models/
 
 ### Crates
 
-The table below highlights shared infrastructure and a selection of model crates; for the **complete** model list (all 176 families, with backends) see **[MODELS.md](MODELS.md)**.
+The table below highlights shared infrastructure and a selection of model crates; for the **complete** model list (all 182 families, with backends) see **[MODELS.md](MODELS.md)**.
 
 | Crate | Model / role |
 |---|---|
@@ -143,6 +143,7 @@ The table below highlights shared infrastructure and a selection of model crates
 | [`rlx-qwen3-tts`](crates/rlx-qwen3-tts/README.md) | Qwen3-TTS — voice clone + CustomVoice TTS, progressive streaming, duplex voice chat (Whisper + Qwen3 LM). [JFK samples + roundtrip audio](crates/rlx-qwen3-tts/examples/audio/) ship in the crate. |
 | [`rlx-tts`](crates/rlx-tts/README.md) | RLX FastSpeech2 + WaveRNN TTS (Hub `rlx-tts.rlxp`) |
 | `rlx-locateanything` | NVIDIA LocateAnything-3B VLM (grounding) |
+| [`rlx-jina-ocr`](crates/rlx-jina-ocr/README.md) | Jina-OCR-v1 (DeepSeek-OCR DeepEncoder + MoE LM + FastMTP) |
 | [`rlx-unlimited-ocr`](crates/rlx-unlimited-ocr/README.md) | Baidu Unlimited-OCR VLM (SAM+CLIP DeepEncoder + MoE LM) |
 | [`rlx-ppocrv6`](crates/rlx-ppocrv6/README.md) | PP-OCRv6 tiny/small OCR — native HIR + safetensors (no runtime ONNX) |
 | [`rlx-asr`](crates/rlx-asr/README.md) | RLX streaming Conformer ASR (`weights/asr/model.rlxp`); facade `streaming-asr` |
@@ -914,6 +915,21 @@ just locateanything -- --model-dir $RLX_LOCATEANYTHING_DIR \
 | `just bench-locateanything-backends` | E2E timing per backend; **one subprocess per backend** by default (avoids OOM). Single backend: `--device wgpu --no-isolate` |
 
 Weights are HF safetensors only (770 tensors: vision / projector / `language_model.*`).
+
+## Jina-OCR-v1
+
+[jinaai/jina-ocr-v1](https://huggingface.co/jinaai/jina-ocr-v1) — a DeepSeek-OCR derivative sharing Unlimited-OCR's architecture and tensor names, so `rlx-jina-ocr` reuses `rlx-unlimited-ocr`'s DeepEncoder, projector and compiled MoE decoder. What differs is all silent when wrong: **full causal attention** (no `sliding_window` key, where Unlimited-OCR sets 128), **`rope_theta = 1e6`**, a `<|User|>:` chat template with **no BOS**, `max_num = 9` tiling, and a 1024-token n-gram window with `<td>` whitelisted. Runbook: [crates/rlx-jina-ocr/README.md](crates/rlx-jina-ocr/README.md).
+
+Verified on real weights (CPU): rlx reproduces the reference implementation's greedy output token for token and transcribes correctly. Getting there surfaced **two pre-existing silent bugs in the shared compiled decoder** that made it wrong for Unlimited-OCR too — a rank-4 BHSD `Op::Rope` that wrote almost nothing, and an MoE router that gathered expert weights with ONNX `Gather` instead of `take_along_axis`; both are fixed. Five backends (cpu/metal/mlx/wgpu/vulkan) now return **token-identical** output; eight silent bugs were fixed to get there, spanning cpu/metal/mlx/vulkan/wgpu — including one rank-4 RoPE defect shared by three backends, MLX reading strided views linearly, and wgpu indexing the RoPE tables by the wrong stride under partial rotation.
+
+```bash
+just fetch-jina-ocr
+# optional: export RLX_JINA_OCR_DIR=/path/to/snapshot
+
+just jina-ocr -- --image page.png --device auto
+```
+
+Model weights are CC BY-NC 4.0 (non-commercial).
 
 ## Unlimited-OCR
 

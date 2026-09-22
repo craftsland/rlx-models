@@ -151,6 +151,8 @@ fn m3_runner_predicts_and_generates() {
     let logits = runner.predict_logits(&prompt).expect("predict");
     assert_eq!(logits.len(), cfg.vocab_size);
     assert!(logits.iter().all(|v| v.is_finite()), "logits finite");
+    // Finiteness alone is passed by an all-zero result; pin the value too.
+    assert!(logits.iter().any(|v| v.abs() > 1e-9), "logits are all zero");
 
     // Default re-prefill greedy generate (grows context, recompiles per length).
     let mut got = Vec::new();

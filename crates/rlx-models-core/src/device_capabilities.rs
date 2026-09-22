@@ -153,6 +153,79 @@ pub fn validate_sam_device(family: &str, device: Device) -> Result<()> {
     }
 }
 
+/// Every device this build can actually reach: CPU, plus each GPU backend whose
+/// cargo feature is on *and* whose hardware is present.
+///
+/// Both halves matter. A feature can be enabled on a machine with no such
+/// device, and a device can be present in a build that cannot talk to it — so
+/// neither `cfg!` nor [`rlx_runtime::is_available`] alone is the right question.
+/// The feature gating has to live here rather than in `rlx-runtime`, because it
+/// is *this* crate's features that pull the backends in.
+///
+/// Cross-backend tests should iterate this rather than hard-code a device: a
+/// port that only ever ran on CPU is a port that has not been tested.
+pub fn available_devices() -> Vec<Device> {
+    compiled_devices()
+        .into_iter()
+        .filter(|d| *d == Device::Cpu || rlx_runtime::is_available(*d))
+        .collect()
+}
+
+/// Every device this build *could* reach, whether or not the hardware is here.
+///
+/// Kept separate from [`available_devices`] so a caller can tell "the feature is
+/// off" from "the feature is on but the driver is missing". A cross-backend test
+/// that only sees the second list silently passes on CPU alone, which is the
+/// worst outcome: the feature flag was set, the suite was green, and nothing was
+/// actually checked.
+pub fn compiled_devices() -> Vec<Device> {
+    #[allow(unused_mut)]
+    let mut v = vec![Device::Cpu];
+    #[cfg(feature = "metal")]
+    v.push(Device::Metal);
+    #[cfg(feature = "mlx")]
+    v.push(Device::Mlx);
+    #[cfg(feature = "gpu")]
+    v.push(Device::Gpu);
+    #[cfg(feature = "vulkan")]
+    v.push(Device::Vulkan);
+    #[cfg(feature = "coreml")]
+    v.push(Device::Ane);
+    #[cfg(feature = "cuda")]
+    v.push(Device::Cuda);
+    #[cfg(feature = "rocm")]
+    v.push(Device::Rocm);
+    v.dedup();
+    v
+}
+
+/// Devices this build has compiled in but cannot reach right now.
+pub fn unavailable_compiled_devices() -> Vec<Device> {
+    let live = available_devices();
+    compiled_devices()
+        .into_iter()
+        .filter(|d| !live.contains(d))
+        .collect()
+}
+
+/// Devices a run insists on, from `RLX_REQUIRE_DEVICES` (comma-separated, e.g.
+/// `metal,mlx`).
+///
+/// A cross-backend test can consult this to turn "the GPU was not there, so only
+/// CPU ran" from a silent pass into a failure — which is what CI wants, and what
+/// a developer checking a specific backend wants.
+pub fn required_devices() -> Vec<String> {
+    std::env::var("RLX_REQUIRE_DEVICES")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .map(|t| t.trim().to_ascii_lowercase())
+                .filter(|t| !t.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

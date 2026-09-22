@@ -73,6 +73,7 @@ pub mod llama_reference;
 mod lm_head;
 mod moe_offload;
 mod moe_store;
+pub mod prism_hadamard;
 mod profile;
 mod rope;
 mod runner;
@@ -108,8 +109,9 @@ pub use builder::{
 };
 pub use cache::{
     Qwen35DecodeCache, Qwen35LayerState, build_decode_attention_mask, decode_step_feeds,
-    last_token_indices, pack_input_ids, pad_kv_to_bucket, recurrent_output_count,
-    seed_cache_from_outputs, slice_kv_from_bucket, zero_prompt_padding_kv, zero_recurrent_inputs,
+    last_token_indices, pack_input_ids, pad_kv_to_bucket, prompt_pad_mask_feeds,
+    recurrent_output_count, seed_cache_from_outputs, slice_kv_from_bucket, zero_prompt_padding_kv,
+    zero_recurrent_inputs,
 };
 pub use capabilities::{STANDARD_DEVICE_NAMES, STANDARD_DEVICES, validate_device};
 pub use config::{FAST_MTP_VOCAB, Qwen35Config, mtp_draft_vocab_size};

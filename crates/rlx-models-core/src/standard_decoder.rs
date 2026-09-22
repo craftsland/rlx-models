@@ -943,7 +943,12 @@ fn load_stacked_group_experts_mlx(
 }
 
 /// Create a `[1]` f32 constant param (for broadcast scalar mul/add).
-pub(crate) fn const1(g: &mut Graph, params: &mut HashMap<String, Vec<f32>>, name: &str, v: f32) -> NodeId {
+pub(crate) fn const1(
+    g: &mut Graph,
+    params: &mut HashMap<String, Vec<f32>>,
+    name: &str,
+    v: f32,
+) -> NodeId {
     let node = g.param(name, Shape::new(&[1], DType::F32));
     params.insert(name.to_string(), vec![v]);
     node
@@ -2524,6 +2529,23 @@ pub fn build_kv_compressor_pool(
 ) -> NodeId {
     let nwin = s / ratio;
     let (bb, nw, r, d) = (b as i64, nwin as i64, ratio as i64, hd as i64);
+    // Only whole windows are compressed, so drop the `seq % ratio` trailing
+    // rows the caller passes (`s` is already `seq - seq % ratio`). This used to
+    // happen implicitly: reshaping `[seq, hd]` to `[b, nwin, ratio, hd]` had
+    // fewer elements than the input and the old shape rule silently kept the
+    // leading prefix. Correct here only because the rows to drop are trailing
+    // and the buffer is row-major — state it instead of relying on it.
+    let rows = b * s;
+    let trim = |g: &mut Graph, t: NodeId| -> NodeId {
+        let have = g.node(t).shape.dim(0).unwrap_static();
+        if have > rows {
+            g.narrow_(t, 0, 0, rows)
+        } else {
+            t
+        }
+    };
+    let kv = trim(g, kv);
+    let score = trim(g, score);
     let kv4 = g.reshape_(kv, vec![bb, nw, r, d]);
     let sc4 = g.reshape_(score, vec![bb, nw, r, d]);
     let ape4 = g.reshape_(ape, vec![1, 1, r, d]);

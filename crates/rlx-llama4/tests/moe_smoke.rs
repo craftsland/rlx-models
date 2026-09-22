@@ -13,14 +13,6 @@ use rlx_llama4::moe::emit_moe_ffn;
 use rlx_runtime::Device;
 use std::collections::HashMap;
 
-fn dev() -> Device {
-    std::env::var("RLX_TEST_DEVICE")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(|s| rlx_cli::parse_device(&s).expect("bad RLX_TEST_DEVICE"))
-        .unwrap_or(Device::Cpu)
-}
-
 fn fill(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
     (0..n)
@@ -33,8 +25,7 @@ fn fill(n: usize, seed: u64) -> Vec<f32> {
         .collect()
 }
 
-#[test]
-fn moe_ffn_compiles_and_runs() {
+fn run_case(device: Device) -> Vec<f32> {
     let (h, inter, e, seq, top_k) = (8usize, 16usize, 4usize, 3usize, 1usize);
     let mut t: HashMap<String, (Vec<f32>, Vec<usize>)> = HashMap::new();
     t.insert("ff.router.weight".into(), (fill(e * h, 1), vec![e, h]));
@@ -73,7 +64,7 @@ fn moe_ffn_compiles_and_runs() {
         .output("out")
         .build_with(&mut WeightMapSource(&mut wm), None)
         .expect("build moe flow");
-    let mut compiled = compile_built(built, dev()).expect("compile moe flow");
+    let mut compiled = compile_built(built, device).expect("compile moe flow");
 
     let hidden = fill(seq * h, 42);
     let out = compiled
@@ -81,9 +72,16 @@ fn moe_ffn_compiles_and_runs() {
         .into_iter()
         .next()
         .expect("moe forward returned an output");
-    assert_eq!(out.len(), seq * h);
-    assert!(
-        out.iter().all(|v| v.is_finite()),
-        "moe output must be finite"
-    );
+    assert_eq!(out.len(), seq * h, "unexpected output length");
+    out
+}
+
+/// Every backend must agree with CPU, not merely produce finite numbers.
+///
+/// This test previously ran on one device and asserted only that the
+/// output was finite — a bar that an all-zero result, or a tensor with
+/// one head's worth of real values and the rest zero, still clears.
+#[test]
+fn moe_ffn_compiles_and_runs_matches_cpu_on_every_backend() {
+    rlx_core::backend_matrix::assert_matches_cpu_on_all("llama4 MoE", 2e-3, run_case);
 }

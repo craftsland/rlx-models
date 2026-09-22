@@ -260,6 +260,12 @@ impl WeightLoader for ReplayLoader<'_> {
     fn tensor_bytes_borrowed(&self, key: &str) -> Option<&[u8]> {
         self.inner.tensor_bytes_borrowed(key)
     }
+    /// Forwarded so `bind` can `pread` instead of borrowing the mmap. Without
+    /// this the trait default returns `false` and the streaming upload
+    /// silently falls back to the borrow.
+    fn read_tensor_bytes_into(&self, key: &str, buf: &mut Vec<u8>) -> Result<bool> {
+        self.inner.read_tensor_bytes_into(key, buf)
+    }
     fn packed_meta(&self, key: &str) -> Option<(rlx_ir::quant::QuantScheme, Vec<usize>)> {
         self.inner.packed_meta(key)
     }
@@ -277,7 +283,19 @@ fn bind(
     for (name, data) in &params {
         compiled.set_param(name, data);
     }
+    // `pread` into one reused scratch rather than borrowing the mmap:
+    // `set_param_typed` copies through the slice it is given, so a borrow
+    // faults in every page of the checkpoint and leaves a second full-size
+    // copy resident (unreclaimable on macOS short of `munmap`). Falls back to
+    // the borrow when the loader has no streaming backing. Revert:
+    // RLX_DFLASH_MMAP_UPLOAD=1.
+    let stream = !rlx_ir::env::flag("RLX_DFLASH_MMAP_UPLOAD");
+    let mut scratch: Vec<u8> = Vec::new();
     for name in packed.keys() {
+        if stream && weights.read_tensor_bytes_into(name, &mut scratch)? {
+            compiled.set_param_typed(name, &scratch, DType::U8);
+            continue;
+        }
         let bytes = weights
             .tensor_bytes_borrowed(name)
             .with_context(|| format!("dflash: packed bytes for {name}"))?;

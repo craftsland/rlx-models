@@ -113,6 +113,25 @@ pub struct KvCache {
     layers: Vec<LayerKv>,
 }
 
+impl KvCache {
+    pub fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Post-RoPE K rows for `layer`, `[cur_len * hidden]` row-major.
+    ///
+    /// Exposed so a caller can diff this reference path against the compiled
+    /// graph's KV side outputs layer by layer — the two must agree, and when
+    /// they do not, the first disagreeing layer names the faulty lowering.
+    pub fn layer_k(&self, layer: usize) -> &[f32] {
+        &self.layers[layer].k
+    }
+
+    pub fn layer_v(&self, layer: usize) -> &[f32] {
+        &self.layers[layer].v
+    }
+}
+
 /// Uncompiled DeepSeek-V2-MoE decoder graph + weights.
 pub struct LmFlow {
     pub config: UnlimitedOcrConfig,
@@ -258,11 +277,8 @@ impl LmFlow {
         );
         let heads = self.config.num_attention_heads;
         let head_dim = self.config.head_dim();
-        let window = if self.config.sliding_window == 0 {
-            usize::MAX
-        } else {
-            self.config.sliding_window
-        };
+        // `None` = no sliding window (plain causal over the whole history).
+        let window = (self.config.sliding_window > 0).then_some(self.config.sliding_window);
 
         let mut x = step_embed.to_vec();
         for (layer, layer_kv) in self.layers.iter().zip(kv.layers.iter_mut()) {
@@ -297,19 +313,26 @@ impl LmFlow {
             );
 
             let cur_len = layer_kv.k.len() / hidden;
-            if cur_len < layer_kv.prefill_len + window {
-                layer_kv.k.extend_from_slice(&k_new);
-                layer_kv.v.extend_from_slice(&v_new);
-                let new_len = cur_len + 1;
-                if new_len >= layer_kv.prefill_len + window {
-                    layer_kv.ring_pos = Some(0);
+            match window {
+                None => {
+                    layer_kv.k.extend_from_slice(&k_new);
+                    layer_kv.v.extend_from_slice(&v_new);
                 }
-            } else {
-                let ring_pos = layer_kv.ring_pos.unwrap_or(0);
-                let slot = layer_kv.prefill_len + ring_pos;
-                layer_kv.k[slot * hidden..(slot + 1) * hidden].copy_from_slice(&k_new);
-                layer_kv.v[slot * hidden..(slot + 1) * hidden].copy_from_slice(&v_new);
-                layer_kv.ring_pos = Some((ring_pos + 1) % window);
+                Some(window) if cur_len < layer_kv.prefill_len + window => {
+                    layer_kv.k.extend_from_slice(&k_new);
+                    layer_kv.v.extend_from_slice(&v_new);
+                    let new_len = cur_len + 1;
+                    if new_len >= layer_kv.prefill_len + window {
+                        layer_kv.ring_pos = Some(0);
+                    }
+                }
+                Some(window) => {
+                    let ring_pos = layer_kv.ring_pos.unwrap_or(0);
+                    let slot = layer_kv.prefill_len + ring_pos;
+                    layer_kv.k[slot * hidden..(slot + 1) * hidden].copy_from_slice(&k_new);
+                    layer_kv.v[slot * hidden..(slot + 1) * hidden].copy_from_slice(&v_new);
+                    layer_kv.ring_pos = Some((ring_pos + 1) % window);
+                }
             }
 
             let n_k = layer_kv.k.len() / hidden;

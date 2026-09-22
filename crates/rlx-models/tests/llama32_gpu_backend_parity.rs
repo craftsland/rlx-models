@@ -28,6 +28,13 @@ use std::collections::HashMap;
 
 fn tiny_cfg() -> Llama32Config {
     Llama32Config {
+        // Plain full-causal attention, no Gemma-style softcap. These three
+        // fields were added to `Llama32Config` and never reached this
+        // feature-gated test, so the file stopped compiling — silently,
+        // because CI builds default features only.
+        sliding_window: None,
+        sliding_window_pattern: None,
+        final_logit_softcap: None,
         embedding_scale: None,
         residual_scale: None,
         attention_scale: None,

@@ -517,6 +517,12 @@ pub fn ggml_type_to_quant_scheme(dtype: rlx_gguf::GgmlType) -> Option<QuantSchem
         // Doses AI Pestle exact ternary — the 248320 × 5120 `token_embd`
         // and `output` tables are 636 MB packed but 5.1 GB each as F32.
         GgmlType::G8_0 => Some(QuantScheme::GgufG8_0),
+        // PrismML Ternary Bonsai 2 (`prism-ml/Ternary-Bonsai-2-27B-gguf`).
+        // PQ2_0 is the group-128 Q2_0 codec at its own type id; PTQ1_0 is
+        // base-3 ternary, 28 bytes / 128 elements. Keep both packed —
+        // the 27B is 5.9 GB on disk and ~108 GB expanded to F32.
+        GgmlType::PQ2_0 => Some(QuantScheme::GgufQ2_0),
+        GgmlType::PTQ1_0 => Some(QuantScheme::GgufPtq1_0),
         // IQ family. Everything downstream already supported these — the IQ
         // variants exist in `QuantScheme`, `rlx_gguf::iq_dequant` has every
         // kernel, rlx-cpu's `dequant_block` has all 9 arms, Metal ships
@@ -688,6 +694,18 @@ pub trait WeightLoader: Send {
         let _ = key;
         None
     }
+
+    /// The backing GGUF file, when this loader is GGUF-backed.
+    ///
+    /// Exists so a model can read format-private metadata — e.g. the
+    /// `prism.hadamard.*` rotation basis Ternary Bonsai 2 stores its
+    /// weights in — without the caller threading the parsed header
+    /// alongside the loader. Missing such a key silently changes the
+    /// model's function rather than failing, so every load path needs
+    /// to see it, not just the packed one.
+    fn gguf_file(&self) -> Option<&rlx_gguf::GgufFile> {
+        None
+    }
     /// **Structure-only** metadata for an MLX packed Linear: the byte length of
     /// the (large) `w_q` codes plus the small scales/biases + scheme/shape, so a
     /// builder can size the U8 codes param WITHOUT retaining the codes
@@ -765,6 +783,9 @@ impl WeightLoader for Box<dyn WeightLoader> {
     }
     fn packed_meta(&self, key: &str) -> Option<(rlx_ir::quant::QuantScheme, Vec<usize>)> {
         (**self).packed_meta(key)
+    }
+    fn gguf_file(&self) -> Option<&rlx_gguf::GgufFile> {
+        (**self).gguf_file()
     }
     fn remaining_keys(&self) -> Vec<String> {
         (**self).remaining_keys()
@@ -1381,6 +1402,9 @@ impl WeightLoader for GgufLoader {
     fn format_id(&self) -> &'static str {
         "gguf"
     }
+    fn gguf_file(&self) -> Option<&rlx_gguf::GgufFile> {
+        Some(&self.file)
+    }
     fn arch_hint(&self) -> Option<&str> {
         Some(&self.arch)
     }
@@ -1533,6 +1557,146 @@ impl GgufLoader {
             .filter(|k| self.is_mtp_tensor(k))
             .cloned()
             .collect()
+    }
+}
+
+/// A [`WeightLoader`] that invents deterministic weights from a shape manifest.
+///
+/// Every value is a pure function of the tensor's **name**, so the same manifest
+/// gives the same model on any machine, in any order, with no checkpoint on disk
+/// — which is what lets a parity fixture carry only shapes and outputs instead of
+/// hundreds of megabytes of weights, and lets a reference implementation in
+/// another language reproduce the identical model from the same rule.
+///
+/// It is also strict on purpose: a tensor not in the manifest is an error rather
+/// than zeros, so a builder asking for a name the checkpoint does not have shows
+/// up immediately instead of quietly training on silence.
+///
+/// The generator is FNV-1a over the name seeding splitmix64, scaled by
+/// `1/sqrt(fan_in)` for matrices and `0.2` for vectors.
+pub struct SyntheticLoader {
+    shapes: std::collections::BTreeMap<String, Vec<usize>>,
+    /// Tensors whose values were supplied instead of generated.
+    presets: std::collections::BTreeMap<String, Vec<f32>>,
+    asked: Vec<String>,
+}
+
+impl SyntheticLoader {
+    pub fn new(shapes: std::collections::BTreeMap<String, Vec<usize>>) -> Self {
+        SyntheticLoader {
+            shapes,
+            presets: std::collections::BTreeMap::new(),
+            asked: Vec::new(),
+        }
+    }
+
+    /// Supply `key`'s values instead of generating them.
+    ///
+    /// The generated values are deliberately generic — well-conditioned, no
+    /// ties, nothing degenerate. That is the wrong input for testing behaviour
+    /// that only appears at a degenerate one, such as a router whose scores are
+    /// all exactly equal. `preset` lets a test pin that case without inventing a
+    /// second loader.
+    pub fn preset(&mut self, key: &str, values: Vec<f32>) {
+        self.presets.insert(key.to_string(), values);
+    }
+
+    /// Names requested so far, in order — a builder's actual demand, which is
+    /// what a "does it ask for the right tensors?" check needs.
+    pub fn asked(&self) -> &[String] {
+        &self.asked
+    }
+
+    /// Does the manifest carry this tensor?
+    pub fn has(&self, key: &str) -> bool {
+        self.shapes.contains_key(key)
+    }
+
+    /// The values [`SyntheticLoader`] would produce for `name` at `shape`.
+    ///
+    /// Public so a reference implementation can be seeded identically.
+    pub fn values(name: &str, shape: &[usize]) -> Vec<f32> {
+        let n: usize = shape.iter().product::<usize>().max(1);
+        let scale = if shape.len() >= 2 {
+            (1.0f64 / *shape.last().unwrap() as f64).sqrt()
+        } else {
+            0.2
+        };
+        let mut s = Self::seed(name);
+        (0..n)
+            .map(|_| {
+                // splitmix64
+                s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = s;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^= z >> 31;
+                // top 53 bits -> [0, 1)
+                let f = (z >> 11) as f64 / (1u64 << 53) as f64;
+                ((f - 0.5) * 2.0 * scale) as f32
+            })
+            .collect()
+    }
+
+    /// FNV-1a over the name. The prime is `0x100000001b3`; writing it grouped as
+    /// `0x1000_0000_01b3` silently adds a digit, which produces a perfectly
+    /// plausible but entirely different stream.
+    fn seed(name: &str) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in name.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+}
+
+impl WeightLoader for SyntheticLoader {
+    fn format_id(&self) -> &'static str {
+        "synthetic"
+    }
+
+    fn take(&mut self, key: &str) -> Result<(Vec<f32>, Vec<usize>)> {
+        let shape = self
+            .shapes
+            .get(key)
+            .ok_or_else(|| anyhow!("synthetic loader has no tensor `{key}`"))?
+            .clone();
+        self.asked.push(key.to_string());
+        if let Some(v) = self.presets.get(key) {
+            let want: usize = shape.iter().product();
+            if v.len() != want {
+                return Err(anyhow!(
+                    "synthetic loader: preset for `{key}` is {} values, manifest says {shape:?} ({want})",
+                    v.len()
+                ));
+            }
+            return Ok((v.clone(), shape));
+        }
+        Ok((Self::values(key, &shape), shape))
+    }
+
+    fn take_transposed(&mut self, key: &str) -> Result<(Vec<f32>, Vec<usize>)> {
+        let (d, s) = self.take(key)?;
+        if s.len() != 2 {
+            return Ok((d, s));
+        }
+        let (r, c) = (s[0], s[1]);
+        let mut o = vec![0f32; d.len()];
+        for i in 0..r {
+            for j in 0..c {
+                o[j * r + i] = d[i * c + j];
+            }
+        }
+        Ok((o, vec![c, r]))
+    }
+
+    fn len(&self) -> usize {
+        self.shapes.len()
+    }
+
+    fn remaining_keys(&self) -> Vec<String> {
+        self.shapes.keys().cloned().collect()
     }
 }
 

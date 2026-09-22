@@ -4,8 +4,12 @@ model.py
 engram.py
 vision.py
 image_processor.py
+config.json
 __pycache__/
 # Regenerated dumps; the trimmed copies under ../../tests/fixtures are tracked.
 dsv41_ref.json
 dsv41_vision_ref.json
 dsv41_dspark_ref.json
+dsv41_real_layer_ref.json
+# Weight subsets fetched by fetch_subset.py (~130 MB each).
+*.safetensors

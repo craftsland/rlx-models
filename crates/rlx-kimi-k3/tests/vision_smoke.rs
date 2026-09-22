@@ -11,18 +11,6 @@ use rlx_kimi_k3::vision::{VisionBlockWeights, VisionDims, VisionWeights, build_v
 use rlx_runtime::Device;
 use std::collections::HashMap;
 
-fn dev() -> Device {
-    match std::env::var("RLX_TEST_DEVICE").ok().as_deref() {
-        Some("metal") | Some("mtl") => Device::Metal,
-        Some("mlx") => Device::Mlx,
-        Some("gpu") | Some("wgpu") => Device::Gpu,
-        Some("coreml") | Some("ane") => Device::Ane,
-        Some("cuda") => Device::Cuda,
-        Some("vulkan") | Some("vk") => Device::Vulkan,
-        _ => Device::Cpu,
-    }
-}
-
 fn fill(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
     (0..n)
@@ -35,8 +23,7 @@ fn fill(n: usize, seed: u64) -> Vec<f32> {
         .collect()
 }
 
-#[test]
-fn vision_tower_compiles_and_runs() {
+fn run_case(device: Device) -> Vec<f32> {
     let d = VisionDims {
         hidden: 8,
         qkv_hidden: 12,
@@ -84,7 +71,7 @@ fn vision_tower_compiles_and_runs() {
     g.set_outputs(vec![out]);
 
     let built = built_from_hir(hir, params).expect("build model");
-    let mut compiled = compile_built(built, dev()).expect("compile vision");
+    let mut compiled = compile_built(built, device).expect("compile vision");
 
     let hin = fill(l * hid, 1);
     let cosv = fill(l * (hd / 2), 2);
@@ -100,8 +87,16 @@ fn vision_tower_compiles_and_runs() {
         .expect("vision output");
     let n_merged = (d.grid_h / d.merge) * (d.grid_w / d.merge);
     assert_eq!(y.len(), n_merged * d.text_hidden);
-    assert!(
-        y.iter().all(|v| v.is_finite()),
-        "vision tokens must be finite"
-    );
+    y
+}
+
+/// Every backend must agree with CPU, not merely produce finite numbers.
+///
+/// This ran on one device — whichever `RLX_TEST_DEVICE` named, CPU by
+/// default — and asked only for finite output. An all-zero result, or a
+/// tensor with one head's worth of real values and the rest zero, passes
+/// that; neither passes a comparison against CPU.
+#[test]
+fn vision_tower_compiles_and_runs_matches_cpu_on_every_backend() {
+    rlx_core::backend_matrix::assert_matches_cpu_on_all("kimi-k3 vision tower", 2e-3, run_case);
 }

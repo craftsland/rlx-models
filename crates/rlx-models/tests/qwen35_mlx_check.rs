@@ -18,20 +18,48 @@
 mod compile_support;
 
 #[cfg(all(target_os = "macos", feature = "mlx"))]
-#[test]
-fn qwen35_tiny_graph_runs_on_mlx() {
+mod parity {
     use rlx_models::qwen35::synth;
     use rlx_models::{Qwen35RunnerBuilder, build_qwen35_graph_sized};
     use rlx_runtime::Device;
 
-    let _ = Qwen35RunnerBuilder::default();
-    let cfg = synth::tiny_cfg();
-    let weights = synth::synth_weights(&cfg);
-    let (graph, params, _packed) =
-        build_qwen35_graph_sized(&cfg, weights, 1, 4, true, true, true).expect("build");
-    let mut compiled = compile_support::compile_qwen35_prefill(Device::Mlx, graph, params);
-    let ids = vec![1.0f32, 2.0, 3.0, 4.0];
-    let outs = compiled.run(&[("input_ids", &ids), ("last_token_idx", &[3.0f32])]);
-    assert!(!outs.is_empty());
-    assert!(outs[0].iter().all(|v| v.is_finite()));
+    /// Build and run the tiny qwen35 graph on `device`, returning last-token logits.
+    fn run(device: Device, enable_mtp_head: bool) -> Vec<f32> {
+        let cfg = synth::tiny_cfg();
+        let weights = synth::synth_weights(&cfg);
+        let (graph, params, _packed) =
+            build_qwen35_graph_sized(&cfg, weights, 1, 4, true, true, enable_mtp_head)
+                .expect("build");
+        let mut compiled = super::compile_support::compile_qwen35_prefill(device, graph, params);
+        let ids = vec![1.0f32, 2.0, 3.0, 4.0];
+        let outs = compiled.run(&[("input_ids", &ids), ("last_token_idx", &[3.0f32])]);
+        outs[0].clone()
+    }
+
+    /// The mlx result must equal CPU's, not merely be finite.
+    ///
+    /// This test used to assert only that the logits were finite — a bar that a
+    /// lowering emitting almost all zeros still clears.
+    /// The mlx result must equal CPU's, not merely be finite.
+    ///
+    /// MLX used to return all-zero logits here whenever `last_token_idx != 0` —
+    /// a redundant second gather in the qwen35 tail asking for index `seq - 1`
+    /// along an axis of length 1. CPU clamped and looked right; MLX did not.
+    #[test]
+    fn qwen35_tiny_graph_matches_cpu_on_mlx() {
+        let _ = Qwen35RunnerBuilder::default();
+        // Sweep the MTP draft head: it adds a whole second head to the graph,
+        // and building it was broken outright until recently, so "the main
+        // logits still match" is a different claim with it on than with it off.
+        for mtp in [false, true] {
+            let cpu = run(Device::Cpu, mtp);
+            let dev = run(Device::Mlx, mtp);
+            super::compile_support::assert_matches_cpu(
+                &format!("mlx (mtp_head={mtp})"),
+                &cpu,
+                &dev,
+                2e-3,
+            );
+        }
+    }
 }

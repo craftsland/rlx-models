@@ -229,6 +229,58 @@ pub fn zero_recurrent_inputs(cfg: &Qwen35Config, batch: usize) -> Vec<(String, V
     out
 }
 
+/// Per-GDN-layer prompt-padding masks for a prefill-cache seed graph.
+///
+/// `1.0` marks a position that is zero padding rather than a prompt token.
+/// The scan uses it to make those steps no-ops, so the recurrent state it
+/// exports is the state after the last *real* token — see
+/// `LinearRecurrentIo::pad_mask`. Attention needs no equivalent: it masks
+/// padding causally and its padded KV rows are scrubbed by
+/// [`zero_prompt_padding_kv`].
+///
+/// Always returns one feed per GDN layer — an all-zero mask when nothing is
+/// padded — rather than an empty vec.
+///
+/// It used to return empty and let the caller skip the feed, relying on an
+/// unbound graph input defaulting to zero. CPU does that; MLX refuses to run a
+/// graph with an input it was never given, so qwen35 dynamic prefill failed
+/// there with `missing input 'gdn_pad_l0'`. The buffer is `batch * seq` floats
+/// per GDN layer, so feeding it unconditionally costs nothing and removes a
+/// silent dependency on per-backend leniency.
+pub fn prompt_pad_mask_feeds(
+    cfg: &Qwen35Config,
+    batch: usize,
+    padded_seq: usize,
+    prompt_lens: &[usize],
+) -> Vec<(String, Vec<f32>)> {
+    let mut mask = vec![0f32; batch * padded_seq];
+    for b in 0..batch {
+        let len = prompt_lens.get(b).copied().unwrap_or(padded_seq);
+        for t in len..padded_seq {
+            mask[b * padded_seq + t] = 1.0;
+        }
+    }
+    // `gdn_conv_shift_l{il}` moves the exported short-conv window back off
+    // the padding to end at the last real token; 0 means "no padding".
+    let shift: Vec<f32> = (0..batch)
+        .map(|b| {
+            let len = prompt_lens.get(b).copied().unwrap_or(padded_seq);
+            len as f32 - padded_seq as f32
+        })
+        .collect();
+    trunk_layer_kinds(cfg)
+        .into_iter()
+        .enumerate()
+        .filter(|(_, is_full)| !*is_full)
+        .flat_map(|(il, _)| {
+            [
+                (format!("gdn_pad_l{il}"), mask.clone()),
+                (format!("gdn_conv_shift_l{il}"), shift.clone()),
+            ]
+        })
+        .collect()
+}
+
 fn linear_conv_channels(cfg: &Qwen35Config) -> usize {
     let n_state = cfg.ssm_state_size;
     let n_k_heads = cfg.ssm_group_count;

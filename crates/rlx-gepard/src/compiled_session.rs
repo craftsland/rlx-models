@@ -48,7 +48,7 @@ impl GepardCompiledSession {
 
         let (qcfg, qweights) = load_gepard_qwen35_bundle(&st, &cfg.backbone)?;
         let hidden_size = cfg.backbone.hidden_size;
-        let token_embd = qweights.token_embd.clone();
+        let token_embd = qweights.token_embd_arc();
         let output_norm = qweights.output_norm.clone();
         let rms_eps = cfg.backbone.rms_norm_eps as f32;
 

@@ -162,6 +162,188 @@ pub struct DeepseekV41Spec {
     /// `0` falls back to the backbone counts.
     pub dspark_n_routed_experts: usize,
     pub dspark_n_activated_experts: usize,
+    /// `quantization_config.weight_block_size[0]`; `0` = the checkpoint is dense.
+    pub weight_block_size: usize,
+    /// `quantization_config.expert_dtype == "fp4"` — routed experts are stored as
+    /// nibble pairs, so their column count on disk is halved.
+    pub expert_fp4: bool,
+}
+
+/// Reader over a config that may be in either of two spellings.
+///
+/// The HF `config.json` nests the language model under `text_config` and uses
+/// `transformers` key names; the flat `inference/config.json` the reference repo
+/// ships uses the modelling code's own shorter names at the top level. Every
+/// accessor here looks in `text_config` first and falls back to the root, and the
+/// `*a` variants take both spellings — so one call site covers both files.
+struct Cfg<'a> {
+    root: &'a Value,
+    text: &'a Value,
+}
+
+impl<'a> Cfg<'a> {
+    fn new(root: &'a Value) -> Self {
+        Cfg {
+            root,
+            text: root.get("text_config").unwrap_or(root),
+        }
+    }
+
+    fn get(&self, k: &str) -> Option<&'a Value> {
+        self.text.get(k).or_else(|| self.root.get(k))
+    }
+
+    fn u(&self, k: &str) -> Option<usize> {
+        self.get(k).and_then(Value::as_u64).map(|x| x as usize)
+    }
+
+    fn f(&self, k: &str) -> Option<f64> {
+        self.get(k).and_then(Value::as_f64)
+    }
+
+    fn b(&self, k: &str) -> Option<bool> {
+        self.get(k).and_then(Value::as_bool)
+    }
+
+    /// Non-numeric entries are dropped rather than failing the parse: a missing
+    /// or malformed list means "empty", which the callers already handle.
+    fn vec_u(&self, k: &str) -> Vec<usize> {
+        self.get(k)
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|e| e.as_u64().map(|n| n as usize))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// HF name `k`, then the flat config's name `alt`.
+    fn ua(&self, k: &str, alt: &str) -> Option<usize> {
+        self.u(k).or_else(|| self.u(alt))
+    }
+
+    fn fa(&self, k: &str, alt: &str) -> Option<f64> {
+        self.f(k).or_else(|| self.f(alt))
+    }
+
+    fn va(&self, k: &str, alt: &str) -> Vec<usize> {
+        let r = self.vec_u(k);
+        if r.is_empty() { self.vec_u(alt) } else { r }
+    }
+
+    /// A required key. The error names the HF spelling, which is the one a user
+    /// editing a `config.json` will be looking at.
+    fn need(&self, k: &str, alt: &str) -> Result<usize> {
+        self.ua(k, alt)
+            .ok_or_else(|| anyhow!("deepseek_v41 config missing `{k}`"))
+    }
+
+    /// A field of a nested object, e.g. `rope_scaling.factor`.
+    fn obj_u(&self, obj: &str, k: &str) -> Option<usize> {
+        self.get(obj)
+            .and_then(|o| o.get(k))
+            .and_then(Value::as_u64)
+            .map(|x| x as usize)
+    }
+
+    fn obj_f(&self, obj: &str, k: &str) -> Option<f64> {
+        self.get(obj).and_then(|o| o.get(k)).and_then(Value::as_f64)
+    }
+}
+
+/// The n-gram hash memory, present only when the config names the layers it
+/// sits on.
+fn parse_engram(c: &Cfg) -> Option<EngramSpec> {
+    let layer_ids = c.vec_u("engram_layer_ids");
+    if layer_ids.is_empty() {
+        return None;
+    }
+    Some(EngramSpec {
+        num_embeddings: c.vec_u("engram_num_embeddings"),
+        layer_ids,
+        max_ngram_size: c.u("engram_max_ngram_size").unwrap_or(1),
+        vocab_size: c.u("engram_vocab_size").unwrap_or(0),
+        n_heads: c.u("engram_n_heads").unwrap_or(0),
+        head_dim: c.u("engram_head_dim").unwrap_or(0),
+        pad_token_id: c.ua("engram_pad_token_id", "engram_pad_id").unwrap_or(2),
+        compressed_vocab_size: c.u("engram_compressed_vocab_size").unwrap_or(0),
+    })
+}
+
+/// The ViT, present only on a vision-enabled checkpoint. Its keys live under a
+/// nested `vision_config` (HF) or as flat `vision_*` keys.
+///
+/// The defaults are the released checkpoint's values, so a config that names
+/// only `vision_n_layers` still describes the shipped tower.
+fn parse_vision(c: &Cfg) -> Option<VisionSpec> {
+    let vc = c.root.get("vision_config");
+    let vu = |k: &str, alt: &str| {
+        vc.and_then(|o| o.get(k))
+            .and_then(Value::as_u64)
+            .map(|x| x as usize)
+            .or_else(|| c.u(alt))
+    };
+    let vf = |k: &str, alt: &str| {
+        vc.and_then(|o| o.get(k))
+            .and_then(Value::as_f64)
+            .or_else(|| c.f(alt))
+    };
+    let n_layers = vu("num_hidden_layers", "vision_n_layers").unwrap_or(0);
+    if n_layers == 0 {
+        return None;
+    }
+    Some(VisionSpec {
+        n_layers,
+        dim: vu("hidden_size", "vision_dim").unwrap_or(1024),
+        n_heads: vu("num_attention_heads", "vision_n_heads").unwrap_or(16),
+        inter_dim: vu("intermediate_size", "vision_inter_dim").unwrap_or(2816),
+        patch_size: vu("patch_size", "vision_patch_size").unwrap_or(14),
+        rope_theta: vf("rope_theta", "vision_rope_theta").unwrap_or(10000.0),
+        downsample_ratio: vu("downsample_ratio", "vision_downsample_ratio").unwrap_or(3),
+        max_n_token: vu("max_image_tokens", "vision_max_n_token").unwrap_or(1024),
+        min_pixels: vu("min_pixels", "vision_min_pixels").unwrap_or(295936),
+        max_wh_ratio: vf("max_wh_ratio", "vision_max_wh_ratio"),
+    })
+}
+
+/// How the routed-expert gate turns logits into scores.
+fn parse_score_func(c: &Cfg) -> Result<ScoreFunc> {
+    match c
+        .get("scoring_func")
+        .or_else(|| c.get("score_func"))
+        .and_then(Value::as_str)
+        .unwrap_or("sqrtsoftplus")
+    {
+        "softmax" => Ok(ScoreFunc::Softmax),
+        "sigmoid" => Ok(ScoreFunc::Sigmoid),
+        "sqrtsoftplus" => Ok(ScoreFunc::SqrtSoftplus),
+        other => Err(anyhow!("deepseek_v41: unknown scoring_func `{other}`")),
+    }
+}
+
+/// `(expert_fp4, weight_block_size)`.
+///
+/// The flat `inference/config.json` names no block size — the reference
+/// hard-codes 32 in `kernel.py` — so any quantized config that omits it means
+/// 32, and only a dense one means "no blocks".
+fn parse_quant(c: &Cfg) -> (bool, usize) {
+    let qc = c.root.get("quantization_config");
+    let expert_fp4 = qc
+        .and_then(|q| q.get("expert_dtype"))
+        .or_else(|| c.root.get("expert_dtype"))
+        .and_then(Value::as_str)
+        == Some("fp4");
+    let quantized =
+        expert_fp4 || qc.is_some() || c.root.get("dtype").and_then(Value::as_str) == Some("fp8");
+    let block = qc
+        .and_then(|q| q.get("weight_block_size"))
+        .and_then(Value::as_array)
+        .and_then(|a| a.first())
+        .and_then(Value::as_u64)
+        .map(|x| x as usize)
+        .unwrap_or(if quantized { 32 } else { 0 });
+    (expert_fp4, block)
 }
 
 impl DeepseekV41Spec {
@@ -256,158 +438,86 @@ impl DeepseekV41Spec {
     /// name the same quantities differently, so every field is looked up under
     /// both spellings and the first hit wins.
     pub fn from_config(v: &Value) -> Result<Self> {
-        let text = v.get("text_config").unwrap_or(v);
-        let get = |k: &str| text.get(k).or_else(|| v.get(k));
-        let u = |k: &str| get(k).and_then(Value::as_u64).map(|x| x as usize);
-        let fl = |k: &str| get(k).and_then(Value::as_f64);
-        let b = |k: &str| get(k).and_then(Value::as_bool);
-        let vec_u = |k: &str| -> Vec<usize> {
-            get(k)
-                .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(|e| e.as_u64().map(|n| n as usize)).collect())
-                .unwrap_or_default()
-        };
-        // `k` (HF) then `alt` (flat inference config).
-        let ua = |k: &str, alt: &str| u(k).or_else(|| u(alt));
-        let fa = |k: &str, alt: &str| fl(k).or_else(|| fl(alt));
-        let va = |k: &str, alt: &str| {
-            let r = vec_u(k);
-            if r.is_empty() { vec_u(alt) } else { r }
-        };
-
-        let n_layers = ua("num_hidden_layers", "n_layers")
-            .ok_or_else(|| anyhow!("deepseek_v41 config missing `num_hidden_layers`"))?;
-        let dim = ua("hidden_size", "dim")
-            .ok_or_else(|| anyhow!("deepseek_v41 config missing `hidden_size`"))?;
-        let moe_inter = ua("moe_intermediate_size", "moe_inter_dim")
-            .ok_or_else(|| anyhow!("deepseek_v41 config missing `moe_intermediate_size`"))?;
-
-        // YaRN lives under `rope_scaling` (HF) or as flat `rope_*` keys.
-        let rs = get("rope_scaling");
-        let rs_u = |k: &str| rs.and_then(|r| r.get(k)).and_then(Value::as_u64).map(|x| x as usize);
-        let rs_f = |k: &str| rs.and_then(|r| r.get(k)).and_then(Value::as_f64);
-
-        let score_func = match get("scoring_func")
-            .or_else(|| get("score_func"))
-            .and_then(Value::as_str)
-            .unwrap_or("sqrtsoftplus")
-        {
-            "softmax" => ScoreFunc::Softmax,
-            "sigmoid" => ScoreFunc::Sigmoid,
-            "sqrtsoftplus" => ScoreFunc::SqrtSoftplus,
-            other => return Err(anyhow!("deepseek_v41: unknown scoring_func `{other}`")),
-        };
-
-        // `candidate_source_layer < 0` (flat config) disables candidate blocks;
-        // HF omits the key entirely when off.
-        let candidate_source_layer = get("candidate_source_layer_id")
-            .or_else(|| get("candidate_source_layer"))
-            .and_then(Value::as_i64)
-            .and_then(|x| (x >= 0).then_some(x as usize));
-
-        let engram_layer_ids = va("engram_layer_ids", "engram_layer_ids");
-        let engram = (!engram_layer_ids.is_empty()).then(|| EngramSpec {
-            num_embeddings: va("engram_num_embeddings", "engram_num_embeddings"),
-            layer_ids: engram_layer_ids,
-            max_ngram_size: u("engram_max_ngram_size").unwrap_or(1),
-            vocab_size: u("engram_vocab_size").unwrap_or(0),
-            n_heads: u("engram_n_heads").unwrap_or(0),
-            head_dim: u("engram_head_dim").unwrap_or(0),
-            pad_token_id: ua("engram_pad_token_id", "engram_pad_id").unwrap_or(2),
-            compressed_vocab_size: u("engram_compressed_vocab_size").unwrap_or(0),
-        });
-
-        // Vision: nested `vision_config` (HF) or flat `vision_*` keys.
-        let vc = v.get("vision_config");
-        let vu = |k: &str, alt: &str| {
-            vc.and_then(|c| c.get(k))
-                .and_then(Value::as_u64)
-                .map(|x| x as usize)
-                .or_else(|| u(alt))
-        };
-        let vision_layers = vu("num_hidden_layers", "vision_n_layers").unwrap_or(0);
-        let vision = (vision_layers > 0).then(|| VisionSpec {
-            n_layers: vision_layers,
-            dim: vu("hidden_size", "vision_dim").unwrap_or(1024),
-            n_heads: vu("num_attention_heads", "vision_n_heads").unwrap_or(16),
-            inter_dim: vu("intermediate_size", "vision_inter_dim").unwrap_or(2816),
-            patch_size: vu("patch_size", "vision_patch_size").unwrap_or(14),
-            rope_theta: vc
-                .and_then(|c| c.get("rope_theta"))
-                .and_then(Value::as_f64)
-                .or_else(|| fl("vision_rope_theta"))
-                .unwrap_or(10000.0),
-            downsample_ratio: vu("downsample_ratio", "vision_downsample_ratio").unwrap_or(3),
-            max_n_token: vu("max_image_tokens", "vision_max_n_token").unwrap_or(1024),
-            min_pixels: vu("min_pixels", "vision_min_pixels").unwrap_or(295936),
-            max_wh_ratio: vc
-                .and_then(|c| c.get("max_wh_ratio"))
-                .and_then(Value::as_f64)
-                .or_else(|| fl("vision_max_wh_ratio")),
-        });
-
-        let n_mtp_layers = ua("num_nextn_predict_layers", "n_mtp_layers").unwrap_or(0);
-
+        let c = Cfg::new(v);
+        let (expert_fp4, weight_block_size) = parse_quant(&c);
         Ok(DeepseekV41Spec {
-            vocab_size: u("vocab_size")
-                .ok_or_else(|| anyhow!("deepseek_v41 config missing `vocab_size`"))?,
-            dim,
-            n_layers,
-            hc_mult: u("hc_mult").unwrap_or(4),
-            n_heads: ua("num_attention_heads", "n_heads")
-                .ok_or_else(|| anyhow!("deepseek_v41 config missing `num_attention_heads`"))?,
-            head_dim: u("head_dim")
-                .ok_or_else(|| anyhow!("deepseek_v41 config missing `head_dim`"))?,
-            rope_head_dim: ua("qk_rope_head_dim", "rope_head_dim").unwrap_or(64),
-            q_lora_rank: u("q_lora_rank").unwrap_or(0),
-            n_groups: u("o_groups").unwrap_or(1),
-            o_lora_rank: u("o_lora_rank")
-                .ok_or_else(|| anyhow!("deepseek_v41 config missing `o_lora_rank`"))?,
-            compress_ratios: vec_u("compress_ratios"),
-            kv_source_layers: va("kv_source_layer_ids", "kv_source_layers"),
-            index_source_layers: va("index_source_layer_ids", "index_source_layers"),
-            index_head_dim: u("index_head_dim").unwrap_or(0),
-            index_n_heads: u("index_n_heads").unwrap_or(0),
-            index_topk: u("index_topk").unwrap_or(0),
-            candidate_source_layer,
-            candidate_topk_blocks: u("candidate_topk_blocks").unwrap_or(0),
-            candidate_block_size: u("candidate_block_size").unwrap_or(0),
-            window_size: ua("sliding_window", "window_size").unwrap_or(usize::MAX / 4),
-            moe_intermediate_size: moe_inter,
-            n_routed_experts: u("n_routed_experts")
-                .ok_or_else(|| anyhow!("deepseek_v41 config missing `n_routed_experts`"))?,
-            n_activated_experts: ua("num_experts_per_tok", "n_activated_experts").unwrap_or(8),
-            n_shared_experts: u("n_shared_experts").unwrap_or(0),
-            score_func,
-            gate_temp: fl("gate_temp").unwrap_or(1.0) as f32,
-            norm_topk_prob: b("norm_topk_prob").unwrap_or(true),
-            route_scale: fa("routed_scaling_factor", "route_scale").unwrap_or(1.0) as f32,
-            swiglu_limit: fl("swiglu_limit").unwrap_or(0.0) as f32,
-            rms_norm_eps: fa("rms_norm_eps", "norm_eps").unwrap_or(1e-6) as f32,
-            rope_theta: fl("rope_theta").unwrap_or(10000.0),
-            compress_rope_theta: fl("compress_rope_theta").unwrap_or(10000.0),
-            original_seq_len: rs_u("original_max_position_embeddings")
-                .or_else(|| u("original_seq_len"))
+            vocab_size: c.need("vocab_size", "vocab_size")?,
+            dim: c.need("hidden_size", "dim")?,
+            n_layers: c.need("num_hidden_layers", "n_layers")?,
+            hc_mult: c.u("hc_mult").unwrap_or(4),
+            n_heads: c.need("num_attention_heads", "n_heads")?,
+            head_dim: c.need("head_dim", "head_dim")?,
+            rope_head_dim: c.ua("qk_rope_head_dim", "rope_head_dim").unwrap_or(64),
+            q_lora_rank: c.u("q_lora_rank").unwrap_or(0),
+            n_groups: c.u("o_groups").unwrap_or(1),
+            o_lora_rank: c.need("o_lora_rank", "o_lora_rank")?,
+            compress_ratios: c.vec_u("compress_ratios"),
+            kv_source_layers: c.va("kv_source_layer_ids", "kv_source_layers"),
+            index_source_layers: c.va("index_source_layer_ids", "index_source_layers"),
+            index_head_dim: c.u("index_head_dim").unwrap_or(0),
+            index_n_heads: c.u("index_n_heads").unwrap_or(0),
+            index_topk: c.u("index_topk").unwrap_or(0),
+            // `candidate_source_layer < 0` (flat config) disables candidate
+            // blocks; HF omits the key entirely when off.
+            candidate_source_layer: c
+                .get("candidate_source_layer_id")
+                .or_else(|| c.get("candidate_source_layer"))
+                .and_then(Value::as_i64)
+                .and_then(|x| (x >= 0).then_some(x as usize)),
+            candidate_topk_blocks: c.u("candidate_topk_blocks").unwrap_or(0),
+            candidate_block_size: c.u("candidate_block_size").unwrap_or(0),
+            window_size: c
+                .ua("sliding_window", "window_size")
+                .unwrap_or(usize::MAX / 4),
+            moe_intermediate_size: c.need("moe_intermediate_size", "moe_inter_dim")?,
+            n_routed_experts: c.need("n_routed_experts", "n_routed_experts")?,
+            n_activated_experts: c
+                .ua("num_experts_per_tok", "n_activated_experts")
+                .unwrap_or(8),
+            n_shared_experts: c.u("n_shared_experts").unwrap_or(0),
+            score_func: parse_score_func(&c)?,
+            gate_temp: c.f("gate_temp").unwrap_or(1.0) as f32,
+            norm_topk_prob: c.b("norm_topk_prob").unwrap_or(true),
+            route_scale: c.fa("routed_scaling_factor", "route_scale").unwrap_or(1.0) as f32,
+            swiglu_limit: c.f("swiglu_limit").unwrap_or(0.0) as f32,
+            rms_norm_eps: c.fa("rms_norm_eps", "norm_eps").unwrap_or(1e-6) as f32,
+            rope_theta: c.f("rope_theta").unwrap_or(10000.0),
+            compress_rope_theta: c.f("compress_rope_theta").unwrap_or(10000.0),
+            // YaRN lives under `rope_scaling` (HF) or as flat `rope_*` keys.
+            original_seq_len: c
+                .obj_u("rope_scaling", "original_max_position_embeddings")
+                .or_else(|| c.u("original_seq_len"))
                 .unwrap_or(0),
-            rope_factor: rs_f("factor").or_else(|| fl("rope_factor")).unwrap_or(1.0),
-            beta_fast: rs_f("beta_fast").or_else(|| fl("beta_fast")).unwrap_or(32.0),
-            beta_slow: rs_f("beta_slow").or_else(|| fl("beta_slow")).unwrap_or(1.0),
-            hc_mult_sinkhorn_iters: u("hc_sinkhorn_iters").unwrap_or(20),
-            hc_eps: fl("hc_eps").unwrap_or(1e-6) as f32,
-            engram,
-            vision,
-            image_token_id: u("image_token_id").unwrap_or(0),
-            n_mtp_layers,
-            dspark_block_size: u("dspark_block_size").unwrap_or(0),
-            dspark_noise_token_id: u("dspark_noise_token_id").unwrap_or(0),
-            dspark_target_layer_ids: va("dspark_target_layer_ids", "dspark_target_layer_ids"),
-            dspark_markov_rank: u("dspark_markov_rank").unwrap_or(256),
-            dspark_n_routed_experts: u("dspark_n_routed_experts").unwrap_or(0),
-            dspark_n_activated_experts: ua(
-                "dspark_num_experts_per_tok",
-                "dspark_n_activated_experts",
-            )
-            .unwrap_or(0),
+            rope_factor: c
+                .obj_f("rope_scaling", "factor")
+                .or_else(|| c.f("rope_factor"))
+                .unwrap_or(1.0),
+            beta_fast: c
+                .obj_f("rope_scaling", "beta_fast")
+                .or_else(|| c.f("beta_fast"))
+                .unwrap_or(32.0),
+            beta_slow: c
+                .obj_f("rope_scaling", "beta_slow")
+                .or_else(|| c.f("beta_slow"))
+                .unwrap_or(1.0),
+            hc_mult_sinkhorn_iters: c.u("hc_sinkhorn_iters").unwrap_or(20),
+            hc_eps: c.f("hc_eps").unwrap_or(1e-6) as f32,
+            engram: parse_engram(&c),
+            vision: parse_vision(&c),
+            image_token_id: c.u("image_token_id").unwrap_or(0),
+            n_mtp_layers: c
+                .ua("num_nextn_predict_layers", "n_mtp_layers")
+                .unwrap_or(0),
+            dspark_block_size: c.u("dspark_block_size").unwrap_or(0),
+            dspark_noise_token_id: c.u("dspark_noise_token_id").unwrap_or(0),
+            dspark_target_layer_ids: c.vec_u("dspark_target_layer_ids"),
+            dspark_markov_rank: c.u("dspark_markov_rank").unwrap_or(256),
+            dspark_n_routed_experts: c.u("dspark_n_routed_experts").unwrap_or(0),
+            dspark_n_activated_experts: c
+                .ua("dspark_num_experts_per_tok", "dspark_n_activated_experts")
+                .unwrap_or(0),
+            weight_block_size,
+            expert_fp4,
         })
     }
 
@@ -487,6 +597,283 @@ impl DeepseekV41Spec {
             }
         }
         Ok(())
+    }
+}
+
+/// One tensor the port reads, named and shaped as the checkpoint stores it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TensorNeed {
+    pub name: String,
+    /// Logical `[out, in]` (or `[n]`). FP4-packed tensors are stored with half
+    /// as many columns — see [`packed_fp4`](Self::packed_fp4).
+    pub shape: Vec<usize>,
+    /// The checkpoint stores this quantized, with a companion `<stem>.scale`.
+    pub quantized: bool,
+    /// Stored as `[out, in / 2]` nibble pairs rather than one byte per element.
+    pub packed_fp4: bool,
+}
+
+impl TensorNeed {
+    fn plain(name: String, shape: Vec<usize>) -> Self {
+        TensorNeed {
+            name,
+            shape,
+            quantized: false,
+            packed_fp4: false,
+        }
+    }
+    fn quant(name: String, shape: Vec<usize>) -> Self {
+        TensorNeed {
+            name,
+            shape,
+            quantized: true,
+            packed_fp4: false,
+        }
+    }
+    fn fp4(name: String, shape: Vec<usize>, packed: bool) -> Self {
+        TensorNeed {
+            name,
+            shape,
+            quantized: true,
+            packed_fp4: packed,
+        }
+    }
+    /// Shape as it sits on disk.
+    pub fn stored_shape(&self) -> Vec<usize> {
+        if self.packed_fp4 && self.shape.len() == 2 {
+            vec![self.shape[0], self.shape[1] / 2]
+        } else {
+            self.shape.clone()
+        }
+    }
+    /// Companion scale tensor's name, when there is one.
+    pub fn scale_name(&self) -> Option<String> {
+        self.quantized
+            .then(|| {
+                self.name
+                    .strip_suffix(".weight")
+                    .map(|s| format!("{s}.scale"))
+            })
+            .flatten()
+    }
+}
+
+/// Accumulator for [`DeepseekV41Spec::expected_tensors`], so each tensor is one
+/// line rather than a four-line `push`.
+struct Needs(Vec<TensorNeed>);
+
+impl Needs {
+    fn plain(&mut self, name: String, shape: &[usize]) {
+        self.0.push(TensorNeed::plain(name, shape.to_vec()));
+    }
+    fn quant(&mut self, name: String, shape: &[usize]) {
+        self.0.push(TensorNeed::quant(name, shape.to_vec()));
+    }
+    fn fp4(&mut self, name: String, shape: &[usize], packed: bool) {
+        self.0.push(TensorNeed::fp4(name, shape.to_vec(), packed));
+    }
+}
+
+impl DeepseekV41Spec {
+    /// Every tensor the port can read, across all of its paths, with the shape it
+    /// must have.
+    ///
+    /// This is the union over prefill, decode, vision and DSpark — a host
+    /// planning which shards or byte ranges to fetch wants the union, not one
+    /// path's subset. Tensors the checkpoint carries but the port never reads
+    /// (the DSpark stages' `gate.bias_vl`, since drafts are text-only) are
+    /// deliberately absent.
+    ///
+    /// It is derived from the same predicates the builders use — `is_kv_source`,
+    /// `is_index_source`, the Engram placement — so it stays in step with them;
+    /// `builder_requests_match_the_manifest` pins that at toy scale.
+    pub fn expected_tensors(&self) -> Vec<TensorNeed> {
+        let mut n = Needs(Vec::new());
+        let d = self.dim;
+        n.plain("embed.weight".into(), &[self.vocab_size, d]);
+        n.plain("head.weight".into(), &[self.vocab_size, d]);
+        n.plain("norm.weight".into(), &[d]);
+        for il in 0..self.n_layers + self.n_mtp_layers {
+            self.push_layer(&mut n, il);
+        }
+        self.push_dspark(&mut n);
+        self.push_vision(&mut n);
+        n.0
+    }
+
+    /// One decoder layer: the hyper-connection mixes, attention, whatever CSA2
+    /// and Engram machinery this layer carries, and the MoE FFN.
+    fn push_layer(&self, n: &mut Needs, il: usize) {
+        let lp = self.layer_prefix(il);
+        // The DSpark draft stages reuse the layer layout but skip everything
+        // that only makes sense in the backbone: no compressor, no Indexer, no
+        // Engram, no VL routing bias.
+        let backbone = il < self.n_layers;
+        let (d, hc) = (self.dim, self.hc_mult);
+        let mix_hc = (2 + hc) * hc;
+        for side in ["attn", "ffn"] {
+            n.plain(format!("{lp}.hc_{side}_fn"), &[mix_hc, hc * d]);
+            n.plain(format!("{lp}.hc_{side}_base"), &[mix_hc]);
+            n.plain(format!("{lp}.hc_{side}_scale"), &[3]);
+        }
+        n.plain(format!("{lp}.attn_norm.weight"), &[d]);
+        n.plain(format!("{lp}.ffn_norm.weight"), &[d]);
+        self.push_attn(n, &lp);
+        if backbone {
+            self.push_csa2(n, &lp, il);
+            self.push_engram(n, &lp, il);
+        }
+        self.push_moe(n, &lp, il, backbone);
+    }
+
+    /// The attention weights every layer has: the Q LoRA pair, the single MQA
+    /// `kv` latent that serves as both key and value, the per-head sink, and the
+    /// grouped output LoRA.
+    fn push_attn(&self, n: &mut Needs, lp: &str) {
+        let (d, nh, hd, ql) = (self.dim, self.n_heads, self.head_dim, self.q_lora_rank);
+        n.quant(format!("{lp}.attn.wq_a.weight"), &[ql, d]);
+        n.plain(format!("{lp}.attn.q_norm.weight"), &[ql]);
+        n.quant(format!("{lp}.attn.wq_b.weight"), &[nh * hd, ql]);
+        n.quant(format!("{lp}.attn.wkv.weight"), &[hd, d]);
+        n.plain(format!("{lp}.attn.kv_norm.weight"), &[hd]);
+        n.plain(format!("{lp}.attn.attn_sink"), &[nh]);
+        let og = self.n_groups * self.o_lora_rank;
+        n.quant(
+            format!("{lp}.attn.wo_a.weight"),
+            &[og, self.dim_per_group()],
+        );
+        n.quant(format!("{lp}.attn.wo_b.weight"), &[d, og]);
+    }
+
+    /// CSA2, which splits across two *different* layer sets: a kv source carries
+    /// the compressor and the Indexer's key half, an index source carries the
+    /// Indexer's query half.
+    fn push_csa2(&self, n: &mut Needs, lp: &str, il: usize) {
+        let (d, hd, ihd) = (self.dim, self.head_dim, self.index_head_dim);
+        if self.is_kv_source(il) {
+            n.plain(format!("{lp}.attn.compressor.wkv.weight"), &[hd, d]);
+            n.plain(format!("{lp}.attn.compressor.norm.weight"), &[hd]);
+            // ratio 1 compresses nothing, so there is no group to weight
+            if self.ratio(il) > 1 {
+                n.plain(format!("{lp}.attn.compressor.wgate.weight"), &[hd, d]);
+            }
+            if ihd > 0 {
+                n.plain(format!("{lp}.attn.indexer.wk.weight"), &[ihd, hd]);
+                n.plain(format!("{lp}.attn.indexer.k_norm.weight"), &[ihd]);
+            }
+        }
+        if self.is_index_source(il) && ihd > 0 {
+            let inh = self.index_n_heads;
+            n.quant(
+                format!("{lp}.attn.indexer.wq_b.weight"),
+                &[inh * ihd, self.q_lora_rank],
+            );
+            n.plain(format!("{lp}.attn.indexer.weights_proj.weight"), &[inh, d]);
+        }
+    }
+
+    /// The n-gram hash memory, on the two layers that carry one.
+    fn push_engram(&self, n: &mut Needs, lp: &str, il: usize) {
+        let Some(e) = &self.engram else { return };
+        let Some(k) = e.layer_hash_index(il) else {
+            return;
+        };
+        let (d, hc) = (self.dim, self.hc_mult);
+        n.quant(
+            format!("{lp}.engram.embed.weight"),
+            &[e.num_embeddings[k], e.head_dim],
+        );
+        n.quant(
+            format!("{lp}.engram.wkv.weight"),
+            &[d * (hc + 1), e.n_hash_cols() * e.head_dim],
+        );
+        n.plain(format!("{lp}.engram.q_weight"), &[hc, d]);
+        n.plain(format!("{lp}.engram.k_weight"), &[hc, d]);
+    }
+
+    /// The MoE FFN: the router, the shared expert, and the routed expert bank.
+    /// The bank size comes from [`Self::moe_dims`], since a DSpark stage routes
+    /// over its own smaller set.
+    fn push_moe(&self, n: &mut Needs, lp: &str, il: usize, backbone: bool) {
+        let (d, inter) = (self.dim, self.moe_intermediate_size);
+        let (n_e, _) = self.moe_dims(il);
+        n.plain(format!("{lp}.ffn.gate.weight"), &[n_e, d]);
+        n.plain(format!("{lp}.ffn.gate.bias"), &[n_e]);
+        // the VL routing bias only exists — and is only read — on a
+        // vision-enabled checkpoint, and DSpark drafts are text
+        if self.vision.is_some() && backbone {
+            n.plain(format!("{lp}.ffn.gate.bias_vl"), &[n_e]);
+        }
+        let se = self.n_shared_experts.max(1) * inter;
+        n.quant(format!("{lp}.ffn.shared_experts.w1.weight"), &[se, d]);
+        n.quant(format!("{lp}.ffn.shared_experts.w3.weight"), &[se, d]);
+        n.quant(format!("{lp}.ffn.shared_experts.w2.weight"), &[d, se]);
+        for e in 0..n_e {
+            let p4 = self.expert_fp4;
+            n.fp4(format!("{lp}.ffn.experts.{e}.w1.weight"), &[inter, d], p4);
+            n.fp4(format!("{lp}.ffn.experts.{e}.w3.weight"), &[inter, d], p4);
+            n.fp4(format!("{lp}.ffn.experts.{e}.w2.weight"), &[d, inter], p4);
+        }
+    }
+
+    /// The DSpark pieces that sit outside the draft stages' layer loop: the
+    /// projection folding the main model's target hidden states into the first
+    /// stage, and the last stage's Markov and confidence heads.
+    fn push_dspark(&self, n: &mut Needs) {
+        if self.n_mtp_layers == 0 {
+            return;
+        }
+        let d = self.dim;
+        let first = self.layer_prefix(self.n_layers);
+        n.quant(
+            format!("{first}.main_proj.weight"),
+            &[d, d * self.dspark_target_layer_ids.len()],
+        );
+        n.plain(format!("{first}.main_norm.weight"), &[d]);
+        let last = self.layer_prefix(self.n_layers + self.n_mtp_layers - 1);
+        let r = self.dspark_markov_rank;
+        n.plain(format!("{last}.norm.weight"), &[d]);
+        n.plain(
+            format!("{last}.markov_head.embed.weight"),
+            &[self.vocab_size, r],
+        );
+        n.plain(
+            format!("{last}.markov_head.head.weight"),
+            &[self.vocab_size, r],
+        );
+        n.plain(format!("{last}.confidence_head.proj.weight"), &[1, d + r]);
+    }
+
+    /// The ViT, the aligner, and the three learned span delimiters.
+    fn push_vision(&self, n: &mut Needs) {
+        let Some(vs) = &self.vision else { return };
+        let (d, vd, vi) = (self.dim, vs.dim, vs.inter_dim);
+        n.plain(
+            "vision.patch_embed.proj.weight".into(),
+            &[vd, 3 * vs.patch_size * vs.patch_size],
+        );
+        n.plain("vision.patch_embed.proj.bias".into(), &[vd]);
+        for b in 0..vs.n_layers {
+            let bp = format!("vision.blocks.{b}");
+            n.plain(format!("{bp}.norm1.weight"), &[vd]);
+            n.plain(format!("{bp}.attn.wqkv.weight"), &[3 * vd, vd]);
+            n.plain(format!("{bp}.attn.wqkv.bias"), &[3 * vd]);
+            n.plain(format!("{bp}.attn.wo.weight"), &[vd, vd]);
+            n.plain(format!("{bp}.attn.wo.bias"), &[vd]);
+            n.plain(format!("{bp}.norm2.weight"), &[vd]);
+            // w1 is the fused SwiGLU gate+up pair, hence 2·inter
+            n.plain(format!("{bp}.mlp.w1.weight"), &[2 * vi, vd]);
+            n.plain(format!("{bp}.mlp.w2.weight"), &[vd, vi]);
+        }
+        n.plain("vision.norm.weight".into(), &[vd]);
+        let r = vs.downsample_ratio.max(1);
+        n.plain("aligner.w1.weight".into(), &[d, vd * r * r]);
+        n.plain("aligner.w1.bias".into(), &[d]);
+        n.plain("aligner.w2.weight".into(), &[d, d]);
+        n.plain("aligner.w2.bias".into(), &[d]);
+        for t in ["image_start", "image_end", "image_newline"] {
+            n.plain(t.into(), &[d]);
+        }
     }
 }
 
@@ -598,7 +985,10 @@ mod tests {
         assert_eq!(s.compress_ratios.len(), 43);
         assert_eq!(s.kv_source_layers, vec![2, 8, 14, 20]);
         assert_eq!(s.index_source_layers, vec![2, 8, 14, 20, 24, 28, 32, 36]);
-        assert_eq!((s.index_n_heads, s.index_head_dim, s.index_topk), (32, 128, 512));
+        assert_eq!(
+            (s.index_n_heads, s.index_head_dim, s.index_topk),
+            (32, 128, 512)
+        );
         assert_eq!(s.candidate_source_layer, Some(20));
         assert_eq!((s.candidate_topk_blocks, s.candidate_block_size), (2048, 8));
         assert_eq!((s.hc_mult, s.hc_mult_sinkhorn_iters), (4, 20));
@@ -617,7 +1007,10 @@ mod tests {
         assert_eq!(e.n_hash_cols(), 24); // wkv in = 24·256 = 6144 ✓
         let v = s.vision.as_ref().unwrap();
         assert_eq!((v.n_layers, v.dim, v.n_heads), (32, 1024, 16));
-        assert_eq!((v.inter_dim, v.patch_size, v.downsample_ratio), (2816, 14, 3));
+        assert_eq!(
+            (v.inter_dim, v.patch_size, v.downsample_ratio),
+            (2816, 14, 3)
+        );
         assert_eq!(v.max_wh_ratio, None);
     }
 
@@ -725,11 +1118,17 @@ mod tests {
         // monotone decreasing, and every value between the two limbs
         for i in 0..32 {
             let v = f(i);
-            assert!(v <= plain(i) + 1e-18 && v >= plain(i) / 16.0 - 1e-18, "i={i}");
+            assert!(
+                v <= plain(i) + 1e-18 && v >= plain(i) / 16.0 - 1e-18,
+                "i={i}"
+            );
         }
         // YaRN off reproduces the plain table exactly
         for i in 0..32 {
-            assert_eq!(yarn_inv_freq(i, 64, 10000.0, 0, 16.0, 32.0, 1.0), plain_base(i, 10000.0));
+            assert_eq!(
+                yarn_inv_freq(i, 64, 10000.0, 0, 16.0, 32.0, 1.0),
+                plain_base(i, 10000.0)
+            );
         }
         fn plain_base(i: usize, base: f64) -> f64 {
             1.0 / base.powf(2.0 * i as f64 / 64.0)

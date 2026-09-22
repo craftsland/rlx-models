@@ -40,6 +40,7 @@
 //! unit-tested against a tiny synthesized GGUF.
 
 use crate::config::Qwen35Config;
+use crate::prism_hadamard::{FoldCtx, HadamardFold};
 use anyhow::{Context, Result, anyhow};
 use rlx_core::weight_loader::{GgufLoader, WeightLoader};
 use rlx_ir::quant::QuantScheme;
@@ -155,6 +156,24 @@ pub struct PestleFactor {
 pub enum Proj {
     Dense(MatWeight),
     Pestle(Box<PestleFactor>),
+    /// A dense weight stored in a Hadamard-rotated basis (PrismML
+    /// Ternary Bonsai 2). The matrix is used exactly like
+    /// [`Self::Dense`], but the *activation* must first get the
+    /// matching `prism.hadamard` transform — see [`crate::prism_hadamard`].
+    ///
+    /// This is a distinct variant rather than a flag on `Dense`
+    /// specifically so that [`Self::dense`] can refuse it: the fusion
+    /// fast-paths take the raw `[out, in]` buffer and would otherwise
+    /// multiply against rotated weights with unrotated activations,
+    /// which produces fluent nonsense instead of an error.
+    Folded(Box<FoldedProj>),
+}
+
+/// A dense weight plus the activation transform it requires.
+#[derive(Debug, Clone)]
+pub struct FoldedProj {
+    pub weight: MatWeight,
+    pub fold: HadamardFold,
 }
 
 impl Proj {
@@ -165,6 +184,7 @@ impl Proj {
     pub fn mats(&self) -> impl Iterator<Item = &MatWeight> {
         let (a, b) = match self {
             Proj::Dense(m) => (m, None),
+            Proj::Folded(f) => (&f.weight, None),
             Proj::Pestle(f) => (&f.v, Some(&f.u)),
         };
         std::iter::once(a).chain(b)
@@ -174,6 +194,7 @@ impl Proj {
     pub fn mats_mut(&mut self) -> impl Iterator<Item = &mut MatWeight> {
         let (a, b) = match self {
             Proj::Dense(m) => (m, None),
+            Proj::Folded(f) => (&mut f.weight, None),
             Proj::Pestle(f) => (&mut f.v, Some(&mut f.u)),
         };
         std::iter::once(a).chain(b)
@@ -185,7 +206,8 @@ impl Proj {
     pub fn dense(&self) -> Option<&MatWeight> {
         match self {
             Proj::Dense(m) => Some(m),
-            Proj::Pestle(_) => None,
+            // Deliberately None: see `Proj::Folded`.
+            Proj::Folded(_) | Proj::Pestle(_) => None,
         }
     }
 
@@ -309,12 +331,26 @@ pub struct Qwen35Weights {
     /// `[n_vocab, n_embd]`. Shared via `Arc` so graph-build clones are
     /// cheap — Bonsai-27B's table is ~4.7 GiB; deep-copying it on every
     /// `weights.clone()` dominated packed CUDA compile wall time.
-    pub token_embd: std::sync::Arc<[f32]>,
+    ///
+    /// `pub(crate)` on purpose. When the table is left packed
+    /// ([`Self::token_embd_lazy`]) this is empty, and an empty slice read as
+    /// an embedding table is silent zeros — a model that runs and emits
+    /// plausible tokens from nothing. Going through [`Self::token_embd`]
+    /// turns that into a compile error for new call sites and a panic with a
+    /// name for old ones.
+    pub(crate) token_embd: std::sync::Arc<[f32]>,
+    /// Set when the F32 table was NOT materialized: gather rows on demand
+    /// from the packed bytes instead. See [`Self::embed_row_into`].
+    pub token_embd_lazy: Option<LazyEmbed>,
     /// `[n_embd]`
     pub output_norm: Vec<f32>,
     /// `[n_vocab, n_embd]` — optional; tied to `token_embd` if absent.
     /// May be packed when loaded via `from_loader_packed`.
     pub output: Option<MatWeight>,
+    /// Activation transform the LM head needs, when `output.weight` is
+    /// stored in a `prism.hadamard` rotated basis. `None` for every
+    /// other checkpoint.
+    pub output_fold: Option<HadamardFold>,
     /// Packed K-quant bytes for tied LM head (`token_embd.weight`) when
     /// the GGUF table is quantized. Gather still uses [`Self::token_embd`]
     /// (eager F32); this is only for `DequantMatMul` on the logits path.
@@ -323,10 +359,153 @@ pub struct Qwen35Weights {
     pub mtp_layers: Vec<Qwen35MtpLayer>,
 }
 
+/// Source for an embedding table left packed in the GGUF.
+///
+/// The 27B's table is `[248320, 5120]` — 278 MB packed, 4.74 GiB as F32 — and
+/// decode reads exactly one row per token, so materializing it is 4.7 GiB to
+/// serve ~20 KB of actual reads.
+#[derive(Debug, Clone)]
+pub struct LazyEmbed {
+    /// GGUF tensor key, resolved against the loader at gather time.
+    pub key: String,
+    pub dtype: rlx_gguf::GgmlType,
+    pub n_vocab: usize,
+    pub n_embd: usize,
+    /// Applied to each gathered row, for a table stored in a rotated basis.
+    pub fold: Option<HadamardFold>,
+}
+
+impl Qwen35Weights {
+    /// The materialized F32 embedding table.
+    ///
+    /// Panics under [`Self::token_embd_lazy`] rather than handing back an
+    /// empty slice: every caller here indexes it directly, and an empty table
+    /// reads as zeros, which is a silently wrong model rather than a failure.
+    pub fn token_embd(&self) -> &[f32] {
+        assert!(
+            self.token_embd_lazy.is_none(),
+            "qwen35: token_embd is held packed (lazy embed); gather rows with \
+             `embed_row_into` instead of reading the F32 table"
+        );
+        &self.token_embd
+    }
+
+    /// The table as an `Arc`, for callers that need to keep it alive.
+    pub fn token_embd_arc(&self) -> std::sync::Arc<[f32]> {
+        let _ = self.token_embd();
+        self.token_embd.clone()
+    }
+
+    /// Replace the materialized table (weight-sharing across runners).
+    ///
+    /// Clears any lazy source: the two are alternatives, and leaving a stale
+    /// one set would make [`Self::token_embd`] panic on a table that is now
+    /// perfectly real.
+    pub fn set_token_embd(&mut self, t: std::sync::Arc<[f32]>) {
+        self.token_embd = t;
+        self.token_embd_lazy = None;
+    }
+
+    /// Construct from fully materialized parts.
+    ///
+    /// For adapters that build a Qwen3.5 bundle outside the GGUF loader
+    /// (Gepard, FireRedAudio): those always have a dense `token_embd`, so the
+    /// lazy source is `None` and [`Self::token_embd`] is always safe on the
+    /// result. Exists because the field is `pub(crate)` — an external struct
+    /// literal would otherwise be the one way to set up a bundle that reads
+    /// as silent zeros.
+    pub fn from_dense_parts(
+        token_embd: std::sync::Arc<[f32]>,
+        output_norm: Vec<f32>,
+        output: Option<MatWeight>,
+        token_embd_lm: Option<MatWeight>,
+        trunk_layers: Vec<Qwen35TrunkLayer>,
+        mtp_layers: Vec<Qwen35MtpLayer>,
+    ) -> Self {
+        Self {
+            token_embd,
+            token_embd_lazy: None,
+            output_norm,
+            output,
+            output_fold: None,
+            token_embd_lm,
+            trunk_layers,
+            mtp_layers,
+        }
+    }
+
+    /// Element count of the embedding table, whether or not it is
+    /// materialized. For sizing and vocab queries — the callers that only
+    /// want `len()` must not trip the dense-only accessor.
+    pub fn embd_elems(&self) -> usize {
+        match self.token_embd_lazy.as_ref() {
+            Some(l) => l.n_vocab * l.n_embd,
+            None => self.token_embd.len(),
+        }
+    }
+
+    /// True when embeddings must be gathered via [`Self::embed_row_into`].
+    pub fn embed_is_lazy(&self) -> bool {
+        self.token_embd_lazy.is_some()
+    }
+
+    /// Gather one embedding row into `out` (`[n_embd]`), dequantizing from the
+    /// packed table and restoring the primal basis when the rows are rotated.
+    pub fn embed_row_into(
+        &self,
+        loader: Option<&dyn WeightLoader>,
+        id: u32,
+        out: &mut [f32],
+    ) -> Result<()> {
+        let lazy = self
+            .token_embd_lazy
+            .as_ref()
+            .ok_or_else(|| anyhow!("embed_row_into: table is not lazy"))?;
+        if out.len() != lazy.n_embd {
+            anyhow::bail!(
+                "embed_row_into: out len {} != n_embd {}",
+                out.len(),
+                lazy.n_embd
+            );
+        }
+        if (id as usize) >= lazy.n_vocab {
+            out.fill(0.0);
+            return Ok(());
+        }
+        let bytes = loader
+            .and_then(|l| l.tensor_bytes_borrowed(&lazy.key))
+            .ok_or_else(|| anyhow!("lazy embed: bytes unavailable for {}", lazy.key))?;
+        let row_bytes = rlx_gguf::bytes_for_public(lazy.dtype, lazy.n_embd)
+            .ok_or_else(|| anyhow!("lazy embed: no block size for {:?}", lazy.dtype))?;
+        let off = id as usize * row_bytes;
+        let end = off + row_bytes;
+        if end > bytes.len() {
+            anyhow::bail!(
+                "lazy embed: row {id} out of range ({end} > {})",
+                bytes.len()
+            );
+        }
+        let row = rlx_gguf::dequant_typed(lazy.dtype, &bytes[off..end], lazy.n_embd, &lazy.key)?;
+        out.copy_from_slice(&row);
+        if let Some(f) = lazy.fold.as_ref() {
+            let w = out.len();
+            crate::prism_hadamard::apply_inverse_transform(out, w, f);
+        }
+        Ok(())
+    }
+}
+
 impl Qwen35Weights {
     /// LM head width: tied embeddings use the full embedding table
     /// (often wider than `cfg.vocab_size` on Qwen3.5 checkpoints).
     pub fn lm_vocab_size(&self, cfg: &Qwen35Config) -> usize {
+        if let Some(l) = self.token_embd_lazy.as_ref() {
+            return if l.n_vocab == 0 {
+                cfg.vocab_size
+            } else {
+                l.n_vocab
+            };
+        }
         if self.token_embd.is_empty() || cfg.hidden_size == 0 {
             return cfg.vocab_size;
         }
@@ -593,34 +772,125 @@ impl Qwen35Weights {
         let n_main = n_layer - nextn;
         let interval = cfg.full_attention_interval.max(1);
 
+        // PrismML Ternary Bonsai 2 stores its weights in a rotated
+        // basis. Read straight off the loader so both the packed and
+        // the eager-F32 path see it — a missed rotation does not fail,
+        // it just makes the model wrong.
+        let hadamard = match loader.gguf_file() {
+            Some(raw) => crate::prism_hadamard::PrismHadamard::from_gguf(raw)?,
+            None => None,
+        };
+        if let (Some(h), Some(raw)) = (hadamard.as_ref(), loader.gguf_file()) {
+            // `ne[0]` is the input width; GGUF shapes are reversed
+            // relative to the `[out, in]` convention used here.
+            h.validate_widths(|name| raw.get(name).map(|t| t.shape[0]))?;
+        }
+        let fold = hadamard
+            .clone()
+            .map(|h| FoldCtx::new(h, cfg.ssm_time_step_rank, cfg.ssm_group_count));
+        let fold = fold.as_ref();
+
         let token_embd_lm = pack_via.and_then(|p| peek_gguf_packed_mat(p, "token_embd.weight"));
-        let token_embd = std::sync::Arc::<[f32]>::from(take_f32(loader, "token_embd.weight")?);
+
+        // Leave the embedding table packed when nothing needs it whole.
+        //
+        // The 27B's is [248320, 5120]: 278 MB packed, 4.74 GiB as F32, and
+        // decode reads ONE row per token.
+        //
+        // Requires the packed table to be readable (`token_embd_lm`) and the
+        // host-gather path to be on, so neither the embedding lookup nor the
+        // LM head needs the F32 copy. That covers TIED heads too: both the
+        // host head (`lm_head.rs`) and the graph head (`builder.rs`) reach for
+        // `token_embd_lm` first and only fall back to the F32 table when it is
+        // absent — which this gate rules out. If some path does still want it,
+        // `token_embd()` panics rather than handing back zeros.
+        let embd_f32_bytes = raw_embd_elems(loader).saturating_mul(4);
+        let lazy_embed = match (
+            loader.gguf_file().and_then(|f| f.get("token_embd.weight")),
+            token_embd_lm.as_ref(),
+        ) {
+            (Some(t), Some(MatWeight::Packed { key, .. }))
+                if crate::flow::host_embed_enabled_for_bytes(embd_f32_bytes)
+                    && !rlx_ir::env::flag("RLX_QWEN35_NO_LAZY_EMBED") =>
+            {
+                Some(LazyEmbed {
+                    key: key.clone(),
+                    dtype: t.dtype,
+                    n_vocab: *t.shape.get(1).unwrap_or(&0),
+                    n_embd: cfg.hidden_size,
+                    fold: None,
+                })
+            }
+            _ => None,
+        };
+
+        let mut token_embd_raw = if lazy_embed.is_some() {
+            Vec::new()
+        } else {
+            take_f32(loader, "token_embd.weight")?
+        };
+        // Lazy rows carry the inverse on the gather instead (same transform,
+        // applied per row rather than to all 248320 of them at load).
+        let mut lazy_embed = lazy_embed;
+        if let (Some(l), Some(f)) = (lazy_embed.as_mut(), fold)
+            && hadamard
+                .as_ref()
+                .is_some_and(|h| h.is_inverse("token_embd.weight"))
+        {
+            l.fold = Some(f.inverse_fold(cfg.hidden_size)?);
+        }
+        if lazy_embed.is_none()
+            && let Some(h) = hadamard.as_ref()
+            && h.is_inverse("token_embd.weight")
+        {
+            // The table's rows are stored rotated. Restore the primal
+            // basis once here rather than per lookup in the graph: the
+            // butterfly over 248320 rows at load is far cheaper than a
+            // [1024, 1024] matmul on every embedded token.
+            let f = fold
+                .expect("fold context exists whenever the rotation parsed")
+                .inverse_fold(cfg.hidden_size)?;
+            crate::prism_hadamard::apply_inverse_transform(
+                &mut token_embd_raw,
+                cfg.hidden_size,
+                &f,
+            );
+        }
+        let token_embd = std::sync::Arc::<[f32]>::from(token_embd_raw);
         let output_norm = take_f32(loader, "output_norm.weight")?;
         let output = take_mat(loader, "output.weight", pack_via).ok();
+        // The LM head is folded too (it consumes the final hidden state),
+        // but it is loaded outside `take_proj`, so resolve its fold here.
+        let output_fold = match (fold, output.as_ref()) {
+            (Some(f), Some(_)) => f.for_weight("output.weight", cfg.hidden_size)?,
+            _ => None,
+        };
 
         let mut trunk_layers = Vec::with_capacity(n_main);
         for il in 0..n_main {
             let is_full_attn = ((il + 1) % interval) == 0;
             if is_full_attn {
                 trunk_layers.push(Qwen35TrunkLayer::FullAttn(load_full_attn_layer(
-                    loader, il, cfg, pack_via,
+                    loader, il, cfg, pack_via, fold,
                 )?));
             } else {
                 trunk_layers.push(Qwen35TrunkLayer::Linear(load_linear_layer(
-                    loader, il, cfg, pack_via,
+                    loader, il, cfg, pack_via, fold,
                 )?));
             }
         }
 
         let mut mtp_layers = Vec::with_capacity(nextn);
         for il in n_main..n_layer {
-            mtp_layers.push(load_mtp_layer(loader, il, cfg, pack_via)?);
+            mtp_layers.push(load_mtp_layer(loader, il, cfg, pack_via, fold)?);
         }
 
         Ok(Self {
             token_embd,
+            token_embd_lazy: lazy_embed,
             output_norm,
             output,
+            output_fold,
             token_embd_lm,
             trunk_layers,
             mtp_layers,
@@ -640,6 +910,13 @@ fn peek_gguf_packed_mat(loader: *mut GgufLoader, key: &str) -> Option<MatWeight>
         GgmlType::Q8K => QuantScheme::GgufQ8K,
         GgmlType::Q1_0 => QuantScheme::GgufQ1_0,
         GgmlType::Q2_0 => QuantScheme::GgufQ2_0,
+        // PrismML Ternary Bonsai 2. PQ2_0 is the same codec as Q2_0 at a
+        // distinct type id; PTQ1_0 is base-3 ternary at group 128.
+        GgmlType::PQ2_0 => QuantScheme::GgufQ2_0,
+        GgmlType::PTQ1_0 => QuantScheme::GgufPtq1_0,
+        // Deliberately narrower than `rlx_core::weight_loader::
+        // ggml_type_to_quant_scheme`: only the schemes this crate's packed
+        // LM-head path is tested on. Widening it is a separate change.
         _ => return None,
     };
     let mut shape = t.shape.clone();
@@ -649,6 +926,15 @@ fn peek_gguf_packed_mat(loader: *mut GgufLoader, key: &str) -> Option<MatWeight>
         scheme,
         shape,
     })
+}
+
+/// Element count of `token_embd.weight`, without reading it.
+fn raw_embd_elems(loader: &dyn WeightLoader) -> usize {
+    loader
+        .gguf_file()
+        .and_then(|f| f.get("token_embd.weight"))
+        .map(|t| t.n_elements())
+        .unwrap_or(0)
 }
 
 fn take_f32(loader: &mut dyn WeightLoader, key: &str) -> Result<Vec<f32>> {
@@ -841,22 +1127,26 @@ fn take_proj(
     in_features: usize,
     out_features: usize,
     pack_via: Option<*mut GgufLoader>,
+    fold: Option<&FoldCtx>,
 ) -> Result<Proj> {
     if pestle {
-        Ok(Proj::Pestle(Box::new(take_pestle(
+        return Ok(Proj::Pestle(Box::new(take_pestle(
             loader,
             il,
             slot,
             in_features,
             out_features,
             pack_via,
-        )?)))
-    } else {
-        Ok(Proj::Dense(take_mat(
-            loader,
-            &format!("blk.{il}.{dense_suffix}"),
-            pack_via,
-        )?))
+        )?)));
+    }
+    let key = format!("blk.{il}.{dense_suffix}");
+    let weight = take_mat(loader, &key, pack_via)?;
+    // The GGUF name built here is the same string `prism.hadamard.
+    // weight_names` lists, so the fold lookup cannot drift from the
+    // tensor it belongs to.
+    match fold.map(|f| f.for_weight(&key, in_features)).transpose()? {
+        Some(Some(fold)) => Ok(Proj::Folded(Box::new(FoldedProj { weight, fold }))),
+        _ => Ok(Proj::Dense(weight)),
     }
 }
 
@@ -874,12 +1164,14 @@ fn permute_ggml_expert_to_grouped(data: &[f32], d0: usize, d1: usize, n_expert: 
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_layer_ffn(
     loader: &mut dyn WeightLoader,
     il: usize,
     cfg: &Qwen35Config,
     pestle: bool,
     pack_via: Option<*mut GgufLoader>,
+    fold: Option<&FoldCtx>,
 ) -> Result<Qwen35LayerFfn> {
     if cfg.is_moe() {
         // No Pestle MoE checkpoint exists yet; MoE files are dense-slot.
@@ -899,6 +1191,7 @@ fn load_layer_ffn(
             n_embd,
             n_ff,
             pack_via,
+            fold,
         )?,
         up: take_proj(
             loader,
@@ -909,6 +1202,7 @@ fn load_layer_ffn(
             n_embd,
             n_ff,
             pack_via,
+            fold,
         )?,
         down: take_proj(
             loader,
@@ -919,6 +1213,7 @@ fn load_layer_ffn(
             n_ff,
             n_embd,
             pack_via,
+            fold,
         )?,
     })
 }
@@ -991,6 +1286,7 @@ fn load_linear_layer(
     il: usize,
     cfg: &Qwen35Config,
     pack_via: Option<*mut GgufLoader>,
+    fold: Option<&FoldCtx>,
 ) -> Result<Qwen35LinearLayer> {
     let p = |suffix: &str| format!("blk.{il}.{suffix}");
     let pestle = layer_is_pestle(loader, il);
@@ -1011,6 +1307,7 @@ fn load_linear_layer(
             n_embd,
             conv_channels,
             pack_via,
+            fold,
         )?,
         attn_gate: take_proj(
             loader,
@@ -1021,6 +1318,7 @@ fn load_linear_layer(
             n_embd,
             value_dim,
             pack_via,
+            fold,
         )?,
         ssm_conv1d: take_f32(loader, &p("ssm_conv1d.weight"))?,
         ssm_dt_bias: take_f32(loader, &p("ssm_dt.bias"))?,
@@ -1034,6 +1332,7 @@ fn load_linear_layer(
             n_embd,
             n_v_heads,
             pack_via,
+            fold,
         )?,
         ssm_alpha: take_proj(
             loader,
@@ -1044,6 +1343,7 @@ fn load_linear_layer(
             n_embd,
             n_v_heads,
             pack_via,
+            fold,
         )?,
         ssm_norm: take_f32(loader, &p("ssm_norm.weight"))?,
         ssm_out: take_proj(
@@ -1055,8 +1355,9 @@ fn load_linear_layer(
             value_dim,
             n_embd,
             pack_via,
+            fold,
         )?,
-        ffn: load_layer_ffn(loader, il, cfg, pestle, pack_via)?,
+        ffn: load_layer_ffn(loader, il, cfg, pestle, pack_via, fold)?,
     })
 }
 
@@ -1065,6 +1366,7 @@ fn load_full_attn_layer(
     il: usize,
     cfg: &Qwen35Config,
     pack_via: Option<*mut GgufLoader>,
+    fold: Option<&FoldCtx>,
 ) -> Result<Qwen35FullAttnLayer> {
     let p = |suffix: &str| format!("blk.{il}.{suffix}");
     let pestle = layer_is_pestle(loader, il);
@@ -1085,6 +1387,7 @@ fn load_full_attn_layer(
             n_embd,
             q_dim * 2,
             pack_via,
+            fold,
         )?,
         attn_k: take_proj(
             loader,
@@ -1095,6 +1398,7 @@ fn load_full_attn_layer(
             n_embd,
             kv_dim,
             pack_via,
+            fold,
         )?,
         attn_v: take_proj(
             loader,
@@ -1105,6 +1409,7 @@ fn load_full_attn_layer(
             n_embd,
             cfg.value_length * cfg.num_key_value_heads,
             pack_via,
+            fold,
         )?,
         attn_output: take_proj(
             loader,
@@ -1115,10 +1420,11 @@ fn load_full_attn_layer(
             q_dim,
             n_embd,
             pack_via,
+            fold,
         )?,
         attn_q_norm: take_f32(loader, &p("attn_q_norm.weight"))?,
         attn_k_norm: take_f32(loader, &p("attn_k_norm.weight"))?,
-        ffn: load_layer_ffn(loader, il, cfg, pestle, pack_via)?,
+        ffn: load_layer_ffn(loader, il, cfg, pestle, pack_via, fold)?,
     })
 }
 
@@ -1127,6 +1433,7 @@ fn load_mtp_layer(
     il: usize,
     cfg: &Qwen35Config,
     pack_via: Option<*mut GgufLoader>,
+    fold: Option<&FoldCtx>,
 ) -> Result<Qwen35MtpLayer> {
     // Keep the MTP layer PACKED like every other layer (dequant-at-load to F32
     // here loads ~1.2 GB of vocab-sized embed/head tensors on EVERY run even when
@@ -1136,7 +1443,7 @@ fn load_mtp_layer(
     // wired for real use, and the normal / verify / prefix-cache paths never build
     // the MTP head, so packed is the right default. (To use MTP, dequant just its
     // matmul weights on demand rather than at load.)
-    let base = load_full_attn_layer(loader, il, cfg, pack_via)?;
+    let base = load_full_attn_layer(loader, il, cfg, pack_via, fold)?;
     let p = |suffix: &str| format!("blk.{il}.nextn.{suffix}");
     let eh_proj = take_mat(loader, &p("eh_proj.weight"), pack_via)?;
     let enorm = take_f32(loader, &p("enorm.weight"))?;

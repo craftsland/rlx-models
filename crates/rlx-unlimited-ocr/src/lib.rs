@@ -61,6 +61,7 @@ pub mod projector;
 pub mod rswa;
 pub mod runner;
 pub mod sam_tower;
+pub mod speculative;
 pub mod weights;
 
 #[cfg(feature = "hf-download")]

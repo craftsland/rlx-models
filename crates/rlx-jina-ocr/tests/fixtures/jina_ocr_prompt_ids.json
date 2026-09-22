@@ -1,0 +1,82 @@
+{
+ "_comment": "Reference token ids from jinaai/jina-ocr-v1's own tokenizer.json (tokenizers 0.22). `rendered` is what apply_chat_template must produce; pre/post are tokenizer.encode(chunk, add_special_tokens=False) either side of the <image> marker, exactly as processing_deepseek_ocr.py's preprocess_prompt_and_image splits it. Note pre_ids[0] != 0: the processor calls text_encode(bos=False).",
+ "model_id": "jinaai/jina-ocr-v1",
+ "image_token_id": 128815,
+ "cases": [
+  {
+   "name": "default_ocr_prompt",
+   "note": "prepare_ocr_inputs() with the card's DEFAULT_OCR_PROMPT",
+   "rendered": "<|User|>:\n<image>\nTranscribe the provided document image into a clean Markdown format, preserving the natural reading order.\n<|Assistant|>:\n",
+   "pre_ids": [
+    128825,
+    1137
+   ],
+   "post_ids": [
+    201,
+    9205,
+    17682,
+    270,
+    4496,
+    4940,
+    4609,
+    1055,
+    260,
+    6219,
+    5101,
+    7919,
+    8786,
+    14,
+    36506,
+    270,
+    4095,
+    5081,
+    2496,
+    603,
+    128826,
+    1137
+   ]
+  },
+  {
+   "name": "custom_prompt",
+   "note": "a user-supplied instruction",
+   "rendered": "<|User|>:\n<image>\nExtract every table as HTML.\n<|Assistant|>:\n",
+   "pre_ids": [
+    128825,
+    1137
+   ],
+   "post_ids": [
+    201,
+    17965,
+    1259,
+    1750,
+    4184,
+    412,
+    18570,
+    603,
+    128826,
+    1137
+   ]
+  },
+  {
+   "name": "with_system",
+   "note": "leading system message, emitted bare with no role prefix",
+   "rendered": "Be terse.\n<|User|>:\n<image>\nOCR this.\n<|Assistant|>:\n",
+   "pre_ids": [
+    7153,
+    259,
+    10935,
+    603,
+    128825,
+    1137
+   ],
+   "post_ids": [
+    201,
+    119316,
+    566,
+    603,
+    128826,
+    1137
+   ]
+  }
+ ]
+}

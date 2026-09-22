@@ -13,14 +13,6 @@ use rlx_ir::{DType, Shape};
 use rlx_runtime::Device;
 use std::collections::HashMap;
 
-fn dev() -> Device {
-    std::env::var("RLX_TEST_DEVICE")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(|s| rlx_cli::parse_device(&s).expect("bad RLX_TEST_DEVICE"))
-        .unwrap_or(Device::Cpu)
-}
-
 fn fill(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
     (0..n)
@@ -33,8 +25,7 @@ fn fill(n: usize, seed: u64) -> Vec<f32> {
         .collect()
 }
 
-#[test]
-fn moe_compiles_and_runs() {
+fn run_moe(device: Device) -> Vec<f32> {
     let d = DeepseekMoeDims {
         hidden: 8,
         moe_inter: 16,
@@ -78,17 +69,28 @@ fn moe_compiles_and_runs() {
         .output("out")
         .build_with(&mut WeightMapSource(&mut wm), None)
         .expect("build moe");
-    let mut compiled = compile_built(built, dev()).expect("compile moe");
+    let mut compiled = compile_built(built, device).expect("compile moe");
 
     let hidden = fill(d.seq * h, 42);
-    let out = compiled
+    compiled
         .run(&[("hidden", hidden.as_slice())])
         .into_iter()
         .next()
-        .expect("moe forward returned output");
-    assert_eq!(out.len(), d.seq * h);
-    assert!(
-        out.iter().all(|v| v.is_finite()),
-        "moe output must be finite"
-    );
+        .expect("moe forward returned output")
+}
+
+/// Every backend must agree with CPU, not merely produce finite numbers.
+///
+/// A top-k MoE has a router, a grouped expert matmul and a shared expert. A
+/// router that reads another token's probability sends the whole token to the
+/// wrong expert, and the result is still finite and in range — which is exactly
+/// how such a bug survived in the compiled decoder this crate shares.
+#[test]
+fn moe_matches_cpu_on_every_backend() {
+    let seq_h = 3 * 8;
+    rlx_core::backend_matrix::assert_matches_cpu_on_all("deepseek MoE", 2e-3, |device| {
+        let out = run_moe(device);
+        assert_eq!(out.len(), seq_h, "unexpected output length");
+        out
+    });
 }

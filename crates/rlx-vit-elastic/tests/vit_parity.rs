@@ -98,6 +98,15 @@ fn cpu_metal_forward_parity_and_local_scores() {
 
 #[cfg(any(feature = "mlx", feature = "gpu", feature = "vulkan", feature = "cuda"))]
 fn forward_parity_on(dev: Device) {
+    // `#[cfg(feature = ...)]` on each caller says the backend was compiled in,
+    // not that this machine has one — building with `--features all-backends`
+    // on a Mac ran the CUDA cases and failed for want of a device. Announce the
+    // skip rather than pass silently.
+    if !rlx_runtime::is_available(dev) {
+        eprintln!("skip forward_parity_on({dev:?}): backend not available");
+        return;
+    }
+
     for cfg in [VitConfig::synthetic(), VitConfig::synthetic_uni2()] {
         let lc = prepare_from_weightmap(synthetic_checkpoint(&cfg, 5), &cfg).unwrap();
         let ld = prepare_from_weightmap(synthetic_checkpoint(&cfg, 5), &cfg).unwrap();
@@ -159,6 +168,15 @@ fn forward_parity_vulkan() {
     feature = "metal"
 ))]
 fn backward_probe_on(dev: Device, tag: &str) {
+    // `#[cfg(feature = ...)]` on each caller says the backend was compiled in,
+    // not that this machine has one — building with `--features all-backends`
+    // on a Mac ran the CUDA cases and failed for want of a device. Announce the
+    // skip rather than pass silently.
+    if !rlx_runtime::is_available(dev) {
+        eprintln!("skip backward_probe_on({dev:?}): backend not available");
+        return;
+    }
+
     use rlx_ir::NodeId;
     use rlx_ir::infer::GraphExt;
     use rlx_runtime::{CompileOptions, Session};
@@ -268,6 +286,15 @@ fn cuda_backward_probe() {
     feature = "metal"
 ))]
 fn snapvit_native_on(dev: Device) {
+    // `#[cfg(feature = ...)]` on each caller says the backend was compiled in,
+    // not that this machine has one — building with `--features all-backends`
+    // on a Mac ran the CUDA cases and failed for want of a device. Announce the
+    // skip rather than pass silently.
+    if !rlx_runtime::is_available(dev) {
+        eprintln!("skip snapvit_native_on({dev:?}): backend not available");
+        return;
+    }
+
     use rlx_vit_elastic::snapvit::{self, CalibImage, SnapVitParams};
     let cfg = VitConfig::synthetic();
     let l = prepare_from_weightmap(synthetic_checkpoint(&cfg, 5), &cfg).unwrap();

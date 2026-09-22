@@ -2,7 +2,7 @@
 
 Every model family in this workspace, one crate per architecture. This catalog is generated from each crate's `Cargo.toml` (`description` + backend feature set).
 
-**176 model families** across 16 categories, plus 4 training crates and 1 interpretability crate. Shared infrastructure, servers, and benchmark crates are not listed here.
+**182 model families** across 16 categories, plus 4 training crates and 1 interpretability crate. Shared infrastructure, servers, and benchmark crates are not listed here.
 
 ## Backends
 
@@ -19,23 +19,23 @@ Enable GPU backends at build time with matching features, e.g. `cargo build -p r
 
 | Category | Count |
 |---|--:|
-| [Language models (text LLMs & reasoning)](#language-models-text-llms--reasoning) | 36 |
+| [Language models (text LLMs & reasoning)](#language-models-text-llms--reasoning) | 38 |
 | [Vision-language & multimodal (VLM / omni)](#vision-language--multimodal-vlm--omni) | 12 |
 | [Vision encoders, detection & segmentation](#vision-encoders-detection--segmentation) | 10 |
 | [Biomedical & scientific](#biomedical--scientific) | 5 |
 | [Time series & forecasting](#time-series--forecasting) | 2 |
 | [Text & vision embeddings](#text--vision-embeddings) | 3 |
-| [Image, video & 3D generation](#image-video--3d-generation) | 4 |
-| [OCR & document understanding](#ocr--document-understanding) | 5 |
+| [Image, video & 3D generation](#image-video--3d-generation) | 5 |
+| [OCR & document understanding](#ocr--document-understanding) | 6 |
 | [Speech recognition (ASR)](#speech-recognition-asr) | 15 |
-| [Text-to-speech & speech LMs](#text-to-speech--speech-lms) | 45 |
+| [Text-to-speech & speech LMs](#text-to-speech--speech-lms) | 46 |
 | [Voice conversion](#voice-conversion) | 3 |
 | [Music & audio generation](#music--audio-generation) | 3 |
 | [Audio source separation](#audio-source-separation) | 2 |
 | [Neural audio codecs](#neural-audio-codecs) | 11 |
-| [Speech front-end, wake-word & DSP](#speech-front-end-wake-word--dsp) | 19 |
+| [Speech front-end, wake-word & DSP](#speech-front-end-wake-word--dsp) | 20 |
 | [Robotics (vision-language-action)](#robotics-vision-language-action) | 1 |
-| **Total** | **176** |
+| **Total** | **182** |
 
 ## Language models (text LLMs & reasoning)
 
@@ -48,6 +48,7 @@ Decoder LMs, MoE, hybrid SSM/attention, ternary, diffusion LMs, and speculative 
 | `rlx-deepseek` | DeepSeek-V3 / V3.1 (MLA + fine-grained MoE), incl. Kimi-K2, for RLX | **All 7** (+CoreML) |
 | `rlx-dflash` | DFlash speculative-decoding drafter for RLX (Eagle-style multi-layer-tap draft head) | **All 7** |
 | `rlx-diffusiongemma` | DiffusionGemma 26B-A4B (Google) — block-diffusion Gemma 4 MoE encoder/decoder, vision tower, image processor, chat template, entropy-bounded sampler | CPU (torch parity, text + vision) |
+| `rlx-dsv41` | DeepSeek-V4.1-Flash — CSA2 attention, Engram n-gram memory, hyper-connections, paged MoE | CPU, Metal, MLX, CUDA, ROCm, wgpu |
 | `rlx-eagle3` | EAGLE3 speculative-decoding draft + scheduler primitives for RLX | CPU, Metal, MLX, CUDA |
 | `rlx-gemma` | Gemma / Gemma 2 causal LMs for RLX | **All 7** (+CoreML) |
 | `rlx-glm` | GLM 5.1 runner (delegates to rlx-llama32; GLM-specific RoPE/RMSNorm pending) | CPU |
@@ -55,30 +56,31 @@ Decoder LMs, MoE, hybrid SSM/attention, ternary, diffusion LMs, and speculative 
 | `rlx-glm5next` | GLM-5.3-Flash (glm5next: hybrid KDA + NoPE-MLA/DSA, mHC residual streams, 288-expert clamped-SwiGLU MoE) | CPU (prefill + decode; real-weight block tests) |
 | `rlx-gpt-oss` | gpt-oss-20b runner (delegates to rlx-llama32) | CPU |
 | `rlx-granite` | Granite (IBM) Llama-shaped runner — STUB (PLAN.md M4) | **All 7** |
+| `rlx-hy-mt` | Tencent HY-MT1.5 on-device translation (Hunyuan dense / Qwen3-shaped) | **All 7** (+CoreML) |
 | `rlx-jamba` | Jamba (Mamba-1 + attention + MoE hybrid) for RLX | **All 7** (+CoreML) |
 | `rlx-laguna` | Laguna MoE (poolside Laguna S/XS) for RLX — packed GGUF generate + synth reference | CPU, Metal, MLX, CUDA, wgpu, Vulkan (+CoreML) |
 | `rlx-lfm` | LiquidAI LFM2.5 runner (text) — LFM SSM LM (decode-step + state wiring) | **All 7** |
 | `rlx-ling` | Ling 3.0 / BailingMoeV3 (inclusionAI) — hybrid KDA + MLA attention, fine-grained MoE, MXFP4 — for RLX | **All 7** (CPU/Metal/MLX/CoreML/wgpu/CUDA/ROCm parity-checked); real weights on CPU/Metal/MLX/CUDA. `--mxfp4` on all but CoreML |
 | `rlx-llada2` | LLaDA2 MoE diffusion LM + TIDE offload for RLX | **All 7** |
 | `rlx-llama32` | LLaMA 3.2 for RLX | **All 7** (+CoreML) |
-| `rlx-mamba` | Mamba1 selective-SSM block and multi-backend driver; SSM core via rlx-ssm flow (SelectiveScan / mamba1_step) | CPU, Metal, MLX, CUDA, ROCm, wgpu |
+| `rlx-mamba` | Mamba1 selective-SSM block and multi-backend driver; SSM core via rlx-ssm flow (SelectiveScan / mamba1_step) | CPU, Metal, MLX, CUDA, ROCm |
 | `rlx-minicpm5` | MiniCPM5 causal LM runner (Llama-shaped; openbmb/MiniCPM5-1B) | **All 7** (+CoreML) |
 | `rlx-minimax` | MiniMax runners for RLX — M2.5/M2.7 Lightning Attention LM, and M3 (MSA block-sparse MoE + vision tower) | **All 7** |
-| `rlx-minimax-h3` | MiniMax-H3 (Hailuo 3.0) omni-modal video+audio generation — joint 33B flow-matching DiT, 3D video VAE, BigVGAN audio VAE | CPU, Metal, MLX, wgpu |
+| `rlx-minimax-h3` | MiniMax-H3 (Hailuo 3.0) omni-modal video+audio generation — joint 33B flow-matching DiT, 3D video VAE, BigVGAN audio VAE | **All 7** |
 | `rlx-mistral` | Mistral 3+ / Ministral runner — STUB (PLAN.md M4) | **All 7** (+CoreML) |
 | `rlx-motif` | Motif-3 (Motif Technologies) — GDLA differential latent attention, MHC hyper-connections, PolyNorm MoE — for RLX | **All 7** (+CoreML) — parity-checked on every one; Linux wgpu needs `RLX_ARENA_NO_REUSE=1` (rlx-wgpu slot-reuse bug) |
 | `rlx-nanbeige` | Nanbeige4.2 Looped Transformer LM (Nanbeige/Nanbeige4.2-3B) | **All 7** (+CoreML) |
 | `rlx-nemotron` | NVIDIA Nemotron 3 Nano runner — text + hybrid Mamba2/attention LM | **All 7** |
 | `rlx-neutrino` | Neutrino-8B (Fermion Research) — Qwen3 topology with FV5 ternary weights for RLX | **All 7** (+CoreML) |
+| `rlx-nllb` | Meta NLLB-200 / M2M100 encoder–decoder MT (safetensors, FLORES-200) | **All 7** (+CoreML) |
 | `rlx-omnicoder` | OmniCoder Qwen3-coder-shaped runner — STUB (PLAN.md M4) | **All 7** |
 | `rlx-phi` | Phi 3 / Phi 4 runner on rlx-llama32 (partial RoPE, NeoX GGUF) | **All 7** (+CoreML) |
 | `rlx-qwen3` | Qwen3 decoder LM for RLX | **All 7** (+CoreML) |
-| `rlx-hy-mt` | Tencent HY-MT1.5 on-device translation (Hunyuan dense / Qwen3-shaped) | **All 7** (+CoreML) |
-| `rlx-translategemma` | Google TranslateGemma (Gemma 3 MT-tuned) for RLX | **All 7** (+CoreML) |
-| `rlx-nllb` | Meta NLLB-200 / M2M100 encoder–decoder MT (safetensors, FLORES-200) | **All 7** (+CoreML) |
-| `rlx-qwen35` | Qwen3.5 / Qwen3.6 / Qwen3.8 hybrid trunk for RLX (+ Pestle-27B-Ternary factorized ternary GGUF) | **All 7** (+CoreML) |
+| `rlx-qwen35` | Qwen3.5 / Qwen3.6 / Qwen3.8 hybrid trunk for RLX (+ Pestle-27B-Ternary factorized ternary GGUF, + Ternary-Bonsai-2-27B `PTQ1_0`/`PQ2_0` in a `prism.hadamard` rotated basis) | **All 7** (+CoreML) |
 | `rlx-s1` | S1-mini by Superwhisper — ASR transcript text normalization (Qwen3-0.6B topology) for RLX | **All 7** (+CoreML) |
 | `rlx-tinyllama` | TinyLlama-1.1B causal LM runner (Llama-shaped; TinyLlama/TinyLlama-1.1B-Chat-v1.0) | **All 7** (+CoreML) |
+| `rlx-translate` | On-device system machine translation — Quasar pipeline: SentencePiece + Espresso NMT | CPU |
+| `rlx-translategemma` | Google TranslateGemma (Gemma 3 MT-tuned) for RLX | **All 7** (+CoreML) |
 
 ## Vision-language & multimodal (VLM / omni)
 
@@ -157,6 +159,7 @@ Rectified-flow / diffusion image and image-to-3D, plus flow reward alignment.
 | `rlx-diamond` | Diamond Maps reward alignment — flow matching value functions and GLASS sampling (arXiv:2602.05993) | CPU |
 | `rlx-flux2` | FLUX.2 rectified-flow image model for RLX | **All 7** |
 | `rlx-trellis2` | Microsoft TRELLIS.2-4B image-to-3D (flow-matching DiTs + sparse-3D-conv VAEs + dual-grid mesh extraction) native port for RLX | **All 7** |
+| `rlx-upscale` | Single-image super-resolution — ESRGAN / Compact / SPAN / SPANV2 / PLKSR / RealPLKSR / SAFMN / RealCUGAN efficient CNNs and OmniSR / SwinIR / Swin2SR / HAT / DRCT / DAT / MambaIRv2 transformers, with tiled low-memory inference | **All 7** (+CoreML) |
 
 ## OCR & document understanding
 
@@ -164,6 +167,7 @@ Text detection + recognition, VLM OCR, and terminal-screen extraction.
 
 | Crate | Description | Backends |
 |---|---|---|
+| `rlx-jina-ocr` | jinaai/jina-ocr-v1 — DeepSeek-OCR DeepEncoder + MoE LM + FastMTP | **All 7** |
 | `rlx-ocr` | OCR engine for RLX — text detection + recognition | **All 7** |
 | `rlx-ocr2` | Native RLX OCR: CRAFT-style text detector + CRNN/CTC recognizer + n-gram/lexicon correction | CPU, Metal, MLX, CUDA, wgpu, Vulkan (+CoreML) |
 | `rlx-ppocrv6` | PP-OCRv6 tiny/small OCR — native RLX HIR + safetensors (no runtime ONNX) | **All 7** (+CoreML) |
@@ -299,24 +303,25 @@ VAD, echo cancellation, diarization, forced alignment, wake-word, learned FFT.
 | Crate | Description | Backends |
 |---|---|---|
 | `rlx-aec` | Acoustic echo cancellation (FDAF-NLMS + RLX residual suppression) at 16 kHz | **All 7** |
+| `rlx-diarize` | Native RLX speaker diarization (embedding + clustering) | CPU, Metal, MLX, CUDA, wgpu (+CoreML) |
 | `rlx-f0` | Autocorrelation F0 / pitch estimate (no neural weights; iOS voice gender) | CPU |
-| `rlx-ten-vad-mcu` | TEN-VAD as bare-metal RISC-V firmware over rlx-ten-vad-core | *(bare metal)* |
-| `rlx-voice-gender` | Speech gender: ACF F0 bands + optional ECAPA ONNX via TinyModel | **All 7** (+ONNX) |
-| `rlx-diarize` | Native RLX speaker diarization (embedding + clustering) | CPU |
 | `rlx-fft` | Learned FFT via butterfly networks — train for reference precision, run compiled on RLX backends | **All 7** (+CoreML) |
 | `rlx-nanowakeword` | Native nanowakeword CNN wake-word detection on RLX (ONNX parity optional) | **All 7** (+ONNX) |
 | `rlx-openwakeword` | Native openWakeWord wake-word pipeline on RLX (ONNX parity optional) | **All 7** (+ONNX) |
 | `rlx-porcupine` | Porcupine-style wake-word CNN on RLX | **All 7** |
 | `rlx-qwen3-aligner` | Qwen3 forced aligner on RLX — config + monotonic Viterbi forced alignment | CPU |
-| `rlx-vad` | Voice activity detection (Earshot + Silero) on RLX | **All 7** |
-| `rlx-ten-vad` | TEN-VAD (TEN Framework) voice activity detection on RLX | **All 7** |
+| `rlx-ten-vad` | TEN-VAD (TEN Framework) voice activity detection on RLX | **All 7** (+CoreML) |
 | `rlx-ten-vad-core` | TEN-VAD `no_std` core — f32 scalar and integer-only nets for MCUs | *(bare metal)* |
 | `rlx-ten-vad-fpga` | TEN-VAD as SystemVerilog, exported from the rlx-ir graph | *(FPGA)* |
+| `rlx-ten-vad-mcu` | TEN-VAD as bare-metal RISC-V firmware over rlx-ten-vad-core | *(bare metal)* |
+| `rlx-vad` | Voice activity detection (Earshot + Silero) on RLX | **All 7** |
+| `rlx-voice-gender` | Speech gender: ACF F0 bands + optional ECAPA ONNX via TinyModel | **All 7** (+CoreML, ONNX) |
 | `rlx-voxrt` | VoxRT-style wake-word CNN on RLX | **All 7** |
 | `rlx-wake` | Shared wake-word streaming API, mel frontend, and CNN primitives for RLX | **All 7** |
 | `rlx-wakeword` | First-party RLX wakeword: event session, multi-phrase train/pack, ternary, optional VAD/speaker-id | **All 7** |
 | `rlx-wakeword-core` | no_std-ready mel + WakeCnn for RLX wakeword (f32 + optional ternary fused kernels) | CPU |
 | `rlx-wakeword-wasm` | WASM wakeword for Node, browser, and Web Workers (wasm-bindgen) | CPU |
+| `rlx-wespeaker` | WeSpeaker ResNet34-LM speaker embeddings (fbank + native graph) | **All 7** (+CoreML) |
 
 Measured performance and accuracy for every TEN-VAD deployment target — MCU,
 FPGA, and what each costs in precision — is in

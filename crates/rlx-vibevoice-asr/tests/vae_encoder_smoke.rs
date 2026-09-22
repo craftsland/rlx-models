@@ -6,21 +6,8 @@
 //! Set `RLX_TEST_DEVICE=metal|mlx|gpu|coreml|cuda|vulkan` (default CPU) and build
 //! the matching cargo feature to exercise a backend.
 
-use rlx_runtime::Device;
 use rlx_vibevoice_asr::vae::VaeEncoderGraph;
 use rlx_vibevoice_asr::weights::{BlockW, ConnectorW, ConvW, VaeEncoderWeights};
-
-fn dev() -> Device {
-    match std::env::var("RLX_TEST_DEVICE").ok().as_deref() {
-        Some("metal") | Some("mtl") => Device::Metal,
-        Some("mlx") => Device::Mlx,
-        Some("gpu") | Some("wgpu") => Device::Gpu,
-        Some("coreml") | Some("ane") => Device::Ane,
-        Some("cuda") => Device::Cuda,
-        Some("vulkan") | Some("vk") => Device::Vulkan,
-        _ => Device::Cpu,
-    }
-}
 
 fn fill(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -69,41 +56,48 @@ fn block(dim: usize, seed: u64) -> BlockW {
     }
 }
 
+/// Every backend must agree with CPU, not merely produce finite features.
+///
+/// This compiled for whatever `RLX_TEST_DEVICE` named — CPU unless someone
+/// set it — and asked only for finite output of the right length.
 #[test]
-fn vae_encoder_compiles_and_runs() {
-    // Minimal 2-downsample encoder (strides [1, 2] from DOWNSAMPLE_STRIDES),
-    // one ConvNeXt block per stage, small channel widths.
-    let (c0, c1, vae_dim, connector_dim) = (4usize, 8usize, 6usize, 10usize);
-    let w = VaeEncoderWeights {
-        downsamples: vec![
-            conv(c0, 1, 3, 1),   // stem  (stride 1): audio 1ch -> c0
-            conv(c1, c0, 3, 10), // ds #1 (stride 2): c0 -> c1
-        ],
-        stages: vec![vec![block(c0, 100)], vec![block(c1, 200)]],
-        head: conv(vae_dim, c1, 3, 30), // c1 -> vae_dim
-        connector: ConnectorW {
-            fc1_w: fill(connector_dim * vae_dim, 40), // [out, in]
-            fc1_b: fill(connector_dim, 41),
-            norm_w: fill(connector_dim, 42),
-            fc2_w: fill(connector_dim * connector_dim, 43),
-            fc2_b: fill(connector_dim, 44),
-            in_dim: vae_dim,
-            out_dim: connector_dim,
-        },
-        vae_dim,
-        connector_dim,
-    };
+fn vae_encoder_matches_cpu_on_every_backend() {
+    rlx_core::backend_matrix::assert_matches_cpu_on_all("vibevoice VAE encoder", 2e-3, |device| {
+        // Minimal 2-downsample encoder (strides [1, 2] from DOWNSAMPLE_STRIDES),
+        // one ConvNeXt block per stage, small channel widths.
+        let (c0, c1, vae_dim, connector_dim) = (4usize, 8usize, 6usize, 10usize);
+        let w = VaeEncoderWeights {
+            downsamples: vec![
+                conv(c0, 1, 3, 1),   // stem  (stride 1): audio 1ch -> c0
+                conv(c1, c0, 3, 10), // ds #1 (stride 2): c0 -> c1
+            ],
+            stages: vec![vec![block(c0, 100)], vec![block(c1, 200)]],
+            head: conv(vae_dim, c1, 3, 30), // c1 -> vae_dim
+            connector: ConnectorW {
+                fc1_w: fill(connector_dim * vae_dim, 40), // [out, in]
+                fc1_b: fill(connector_dim, 41),
+                norm_w: fill(connector_dim, 42),
+                fc2_w: fill(connector_dim * connector_dim, 43),
+                fc2_b: fill(connector_dim, 44),
+                in_dim: vae_dim,
+                out_dim: connector_dim,
+            },
+            vae_dim,
+            connector_dim,
+        };
 
-    // padded_len must be divisible by the stride product (2 here).
-    let padded_len = 16usize;
-    let mut graph =
-        VaeEncoderGraph::compile_for(dev(), &w, padded_len).expect("compile VAE encoder");
-    let audio = fill(padded_len, 7);
-    let feats = graph.run(&audio).expect("run VAE encoder");
+        // padded_len must be divisible by the stride product (2 here).
+        let padded_len = 16usize;
+        let mut graph =
+            VaeEncoderGraph::compile_for(device, &w, padded_len).expect("compile VAE encoder");
+        let audio = fill(padded_len, 7);
+        let feats = graph.run(&audio).expect("run VAE encoder");
 
-    assert_eq!(feats.len(), graph.n_frames * connector_dim);
-    assert!(
-        feats.iter().all(|v| v.is_finite()),
-        "VAE features must be finite"
-    );
+        assert_eq!(feats.len(), graph.n_frames * connector_dim);
+        assert!(
+            feats.iter().all(|v| v.is_finite()),
+            "VAE features must be finite"
+        );
+        feats
+    });
 }

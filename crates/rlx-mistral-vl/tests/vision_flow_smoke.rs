@@ -12,14 +12,6 @@ use rlx_mistral_vl::encoder::{PixtralLayerWeights, PixtralWeights};
 use rlx_mistral_vl::flow::build_pixtral_vision;
 use rlx_runtime::Device;
 
-fn dev() -> Device {
-    std::env::var("RLX_TEST_DEVICE")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(|s| rlx_cli::parse_device(&s).expect("bad RLX_TEST_DEVICE"))
-        .unwrap_or(Device::Cpu)
-}
-
 fn fill(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
     (0..n)
@@ -48,8 +40,7 @@ fn layer(h: usize, n_ff: usize, seed: u64) -> PixtralLayerWeights {
     }
 }
 
-#[test]
-fn pixtral_vision_flow_compiles_and_runs() {
+fn run_case(device: Device) -> Vec<f32> {
     // Tiny config; spatial_merge_size = 1 so no patch-merger is required.
     let cfg = PixtralVisionConfig {
         hidden_size: 8,
@@ -87,7 +78,7 @@ fn pixtral_vision_flow_compiles_and_runs() {
 
     let built = build_pixtral_vision(&cfg, &weights, grid_x, grid_y).expect("build pixtral vision");
     let n_merged = built.n_merged;
-    let mut compiled = compile_built(built.model, dev()).expect("compile pixtral vision flow");
+    let mut compiled = compile_built(built.model, device).expect("compile pixtral vision flow");
 
     let hidden = fill(n_pos * h, 21);
     let cos = fill(n_pos * half, 22);
@@ -102,9 +93,16 @@ fn pixtral_vision_flow_compiles_and_runs() {
         .next()
         .expect("pixtral vision forward returned output");
 
-    assert_eq!(out.len(), n_merged * proj);
-    assert!(
-        out.iter().all(|v| v.is_finite()),
-        "vision embeds must be finite"
-    );
+    assert_eq!(out.len(), n_merged * proj, "unexpected output length");
+    out
+}
+
+/// Every backend must agree with CPU, not merely produce finite numbers.
+///
+/// This test previously ran on one device and asserted only that the
+/// output was finite — a bar that an all-zero result, or a tensor with
+/// one head's worth of real values and the rest zero, still clears.
+#[test]
+fn pixtral_vision_flow_compiles_and_runs_matches_cpu_on_every_backend() {
+    rlx_core::backend_matrix::assert_matches_cpu_on_all("mistral-vl vision flow", 2e-3, run_case);
 }

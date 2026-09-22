@@ -79,6 +79,13 @@ fn mla_decode_kv_cache_matches_prefill() {
     let seq = 4;
     let cfg = dims(1);
     let (hidden, hq) = (cfg.hidden, cfg.num_heads * cfg.qk());
+    // The V cache is narrower than the K cache on the vdim path (the default):
+    // `num_heads * v_head_dim`, not `num_heads * qk()`.
+    let hv = if rlx_kimi_k3::mla::mla_vdim() {
+        cfg.num_heads * cfg.v_head_dim
+    } else {
+        hq
+    };
     let w = weights(cfg);
     let h_full = fill(seq * hidden, 7);
 
@@ -103,7 +110,7 @@ fn mla_decode_kv_cache_matches_prefill() {
         let mut g = HirMut::new(&mut hir);
         let h_node = g.input("h", Shape::new(&[1, 1, hidden], DType::F32));
         let ck = g.input("ck", Shape::new(&[1, s_past, hq], DType::F32));
-        let cv = g.input("cv", Shape::new(&[1, s_past, hq], DType::F32));
+        let cv = g.input("cv", Shape::new(&[1, s_past, hv], DType::F32));
         let mut params = HashMap::new();
         let (out, nk, nv) =
             build_mla_decode_step(&mut g, &mut params, "mla", h_node, ck, cv, &w, dims(1))

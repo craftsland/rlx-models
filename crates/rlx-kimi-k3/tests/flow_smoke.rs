@@ -17,17 +17,6 @@ use rlx_kimi_k3::mla::{MlaDims, MlaWeights};
 use rlx_kimi_k3::moe::{DenseMlpWeights, MoeDims, MoeWeights};
 use rlx_runtime::Device;
 
-fn dev() -> Device {
-    match std::env::var("RLX_TEST_DEVICE").ok().as_deref() {
-        Some("metal") | Some("mtl") => Device::Metal,
-        Some("mlx") => Device::Mlx,
-        Some("gpu") | Some("wgpu") => Device::Gpu,
-        Some("coreml") | Some("ane") => Device::Ane,
-        Some("cuda") => Device::Cuda,
-        Some("vulkan") | Some("vk") => Device::Vulkan,
-        _ => Device::Cpu,
-    }
-}
 use std::collections::HashMap;
 
 fn fill(n: usize, seed: u64) -> Vec<f32> {
@@ -120,8 +109,7 @@ fn layer(hidden: usize, attn: AttnWeights, ffn: FfnWeights, sd: u64) -> LayerWei
     }
 }
 
-#[test]
-fn kimi_text_flow_compiles_and_runs() {
+fn run_case(device: Device) -> Vec<f32> {
     let (batch, seq, hidden, vocab) = (1usize, 3usize, 16usize, 20usize);
     let kda = KdaDims {
         hidden,
@@ -224,7 +212,7 @@ fn kimi_text_flow_compiles_and_runs() {
     g.set_outputs(vec![logits]);
 
     let built = built_from_hir(hir, params).expect("build model");
-    let mut compiled = compile_built(built, dev()).expect("compile flow");
+    let mut compiled = compile_built(built, device).expect("compile flow");
 
     let hin = fill(batch * seq * hidden, 7);
     let y = compiled
@@ -233,5 +221,27 @@ fn kimi_text_flow_compiles_and_runs() {
         .next()
         .expect("flow output");
     assert_eq!(y.len(), batch * seq * vocab);
-    assert!(y.iter().all(|v| v.is_finite()), "logits must be finite");
+    y
+}
+
+/// Every backend must agree with CPU, not merely produce finite numbers.
+///
+/// This ran on one device — whichever `RLX_TEST_DEVICE` named, CPU by
+/// default — and asked only for finite output. An all-zero result, or a
+/// tensor with one head's worth of real values and the rest zero, passes
+/// that; neither passes a comparison against CPU.
+#[test]
+fn kimi_text_flow_compiles_and_runs_matches_cpu_on_every_backend() {
+    rlx_core::backend_matrix::assert_matches_cpu_except(
+        "kimi-k3 text flow",
+        2e-3,
+        // Vulkan refuses MLA outright rather than computing it wrongly,
+        // which is the right behaviour — excused, not silenced. The
+        // helper still runs it, so this drops out if Vulkan gains MLA.
+        &[(
+            "vulkan",
+            "rlx-vulkan: asymmetric v_head_dim (MLA) not yet supported",
+        )],
+        run_case,
+    );
 }

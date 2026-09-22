@@ -52,7 +52,16 @@ fn bind(
     for (name, data) in &params {
         compiled.set_param(name, data);
     }
+    // Mirrors `runner::bind`: `pread` into one reused scratch rather than
+    // borrowing the mmap, because `set_param_typed` copies through the slice
+    // and a borrow would fault in the whole checkpoint for a second resident
+    // copy. Falls back to the borrow when there is no streaming backing.
+    let mut scratch: Vec<u8> = Vec::new();
     for name in packed.keys() {
+        if loader.read_tensor_bytes_into(name, &mut scratch)? {
+            compiled.set_param_typed(name, &scratch, DType::U8);
+            continue;
+        }
         let bytes = loader
             .tensor_bytes_borrowed(name)
             .with_context(|| format!("packed bytes for {name}"))?;

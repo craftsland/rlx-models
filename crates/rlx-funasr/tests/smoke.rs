@@ -37,18 +37,6 @@ use rlx_runtime::Device;
 
 type Tensors = HashMap<String, (Vec<f32>, Vec<usize>)>;
 
-fn devices() -> Vec<Device> {
-    #[allow(unused_mut)] // additional devices are pushed only under backend features
-    let mut d = vec![Device::Cpu];
-    #[cfg(feature = "metal")]
-    d.push(Device::Metal);
-    #[cfg(feature = "mlx")]
-    d.push(Device::Mlx);
-    #[cfg(feature = "gpu")]
-    d.push(Device::Gpu);
-    d
-}
-
 fn put(m: &mut Tensors, key: &str, shape: &[usize]) {
     let n: usize = shape.iter().product();
     let data: Vec<f32> = (0..n).map(|i| (((i % 17) as f32) - 8.0) * 0.02).collect();
@@ -147,15 +135,15 @@ fn sensevoice_runs_all_backends() {
     let feats: Vec<f32> = (0..t * cfg.encoder.input_size)
         .map(|i| ((i % 11) as f32 - 5.0) * 0.05)
         .collect();
-    for dev in devices() {
+    // Every backend must agree with CPU, not merely produce finite numbers of
+    // the right length: an all-zero result, or a tensor with one head's worth
+    // of real values and the rest zero, clears that bar on every device at once.
+    rlx_core::backend_matrix::assert_matches_cpu_on_all("funasr SenseVoice", 2e-3, |dev| {
         let model = SenseVoice::from_parts(cfg.clone(), WeightMap::from_tensors(m.clone()), dev);
         let logits = model.run_logits(&feats, t).expect("sensevoice run");
         assert_eq!(logits.len(), t * cfg.vocab_size, "device {dev:?}");
-        assert!(
-            logits.iter().all(|x| x.is_finite()),
-            "device {dev:?} non-finite"
-        );
-    }
+        logits
+    });
 }
 
 #[test]
@@ -190,24 +178,23 @@ fn paraformer_runs_all_backends() {
     let feats: Vec<f32> = (0..t * cfg.encoder.input_size)
         .map(|i| ((i % 13) as f32 - 6.0) * 0.05)
         .collect();
-    for dev in devices() {
+    // Encoder and decoder outputs concatenated, so one sweep catches a
+    // divergence in either stage.
+    rlx_core::backend_matrix::assert_matches_cpu_on_all("funasr Paraformer", 2e-3, |dev| {
         let model = Paraformer::from_parts(cfg.clone(), WeightMap::from_tensors(m.clone()), dev);
         let enc = model.encode(&feats, t).expect("encode");
-        assert_eq!(enc.len(), t * d);
-        assert!(
-            enc.iter().all(|x| x.is_finite()),
-            "device {dev:?} encoder non-finite"
-        );
+        assert_eq!(enc.len(), t * d, "device {dev:?} encoder length");
         // decode with a synthetic 3-token acoustic sequence
         let l = 3usize;
         let acoustic: Vec<f32> = (0..l * d).map(|i| ((i % 7) as f32 - 3.0) * 0.04).collect();
         let logits = model.decode_logits(&enc, t, &acoustic, l).expect("decode");
-        assert_eq!(logits.len(), l * cfg.vocab_size);
-        assert!(
-            logits.iter().all(|x| x.is_finite()),
-            "device {dev:?} decoder non-finite"
+        assert_eq!(
+            logits.len(),
+            l * cfg.vocab_size,
+            "device {dev:?} decoder length"
         );
-    }
+        enc.into_iter().chain(logits).collect()
+    });
 }
 
 fn decoder_keys(m: &mut Tensors, cfg: &ParaformerConfig) {
@@ -333,15 +320,12 @@ fn fsmn_vad_runs_all_backends() {
     let feats: Vec<f32> = (0..t * cfg.input_dim)
         .map(|i| ((i % 9) as f32 - 4.0) * 0.05)
         .collect();
-    for dev in devices() {
+    rlx_core::backend_matrix::assert_matches_cpu_on_all("funasr FSMN-VAD", 2e-3, |dev| {
         let model = FsmnVad::from_parts(cfg.clone(), WeightMap::from_tensors(m.clone()), dev);
         let out = model.run_logits(&feats, t).expect("vad run");
         assert_eq!(out.len(), t * cfg.output_dim, "device {dev:?}");
-        assert!(
-            out.iter().all(|x| x.is_finite()),
-            "device {dev:?} non-finite"
-        );
-    }
+        out
+    });
 }
 
 #[test]
@@ -372,7 +356,7 @@ fn ct_transformer_runs_cpu() {
 }
 
 #[test]
-fn campplus_runs_cpu() {
+fn campplus_runs_all_backends() {
     let mut cfg = CamPlusConfig::default();
     cfg.feat_dim = 8; // F: 8 -> 1 after /8
     cfg.growth_rate = 4;
@@ -450,10 +434,15 @@ fn campplus_runs_cpu() {
     let feats: Vec<f32> = (0..t * cfg.feat_dim)
         .map(|i| ((i % 5) as f32 - 2.0) * 0.05)
         .collect();
-    let model = CamPlus::from_parts(cfg.clone(), WeightMap::from_tensors(m), Device::Cpu);
-    let emb = model.run_embedding(&feats, t).expect("campplus run");
-    assert_eq!(emb.len(), cfg.embedding_size);
-    assert!(emb.iter().all(|x| x.is_finite()), "campplus non-finite");
+    // CAM++ is a 2-D conv/BatchNorm stack, so it exercises a different set of
+    // lowerings from the SAN-M models above — worth sweeping rather than
+    // pinning to CPU as the name used to.
+    rlx_core::backend_matrix::assert_matches_cpu_on_all("funasr CAM++", 2e-3, |dev| {
+        let model = CamPlus::from_parts(cfg.clone(), WeightMap::from_tensors(m.clone()), dev);
+        let emb = model.run_embedding(&feats, t).expect("campplus run");
+        assert_eq!(emb.len(), cfg.embedding_size, "device {dev:?}");
+        emb
+    });
 }
 
 fn res_block_keys(m: &mut Tensors, p: &str, in_c: usize, out_c: usize, downsample: bool) {

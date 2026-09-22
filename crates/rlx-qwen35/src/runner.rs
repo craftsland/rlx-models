@@ -1054,7 +1054,7 @@ fn finish_build(
         );
     }
     let host_embed =
-        force_host_embed || crate::flow::host_embed_enabled_for_bytes(weights.token_embd.len() * 4);
+        force_host_embed || crate::flow::host_embed_enabled_for_bytes(weights.embd_elems() * 4);
     let prefill_profile = prefill_profile_override.unwrap_or_else(|| {
         if weights_path.as_os_str().is_empty() {
             qwen35_profile_default(false)
@@ -1436,6 +1436,60 @@ fn finish_build(
     Ok(runner)
 }
 
+impl Qwen35Runner {
+    /// Decide how a decode step feeds embeddings.
+    ///
+    /// Returns `(dense table, pre-gathered rows)`. `decode_step_feeds` indexes
+    /// a materialized table, and under a lazy table there is none — so gather
+    /// this step's rows here and hand them over as `inputs_embeds` instead.
+    fn embed_feed_for(
+        &self,
+        tokens: &[u32],
+        custom: Option<&[f32]>,
+    ) -> Result<(Option<&[f32]>, Option<Vec<f32>>)> {
+        if !self.host_embed || custom.is_some() {
+            return Ok((None, None));
+        }
+        if self.weights.embed_is_lazy() {
+            let ids: Vec<f32> = tokens.iter().map(|&t| t as f32).collect();
+            return Ok((None, Some(self.gather_host_embeds(&ids)?)));
+        }
+        Ok((Some(self.weights.token_embd()), None))
+    }
+
+    /// Gather `[ids.len(), n_embd]` embeddings for `inputs_embeds`.
+    ///
+    /// Handles both the materialized table and the lazy packed one; the lazy
+    /// path decodes one row per id straight from the GGUF bytes (and restores
+    /// the primal basis when the rows are stored rotated), which is what lets
+    /// the 4.74 GiB F32 expansion of a 278 MB table stay unbuilt.
+    fn gather_host_embeds(&self, ids: &[f32]) -> Result<Vec<f32>> {
+        let n_embd = self.cfg.hidden_size;
+        let mut v = vec![0f32; ids.len() * n_embd];
+        if self.weights.embed_is_lazy() {
+            let loader = self
+                .lm_loader()
+                .map(|l| l as &dyn rlx_core::weight_loader::WeightLoader);
+            for (pos, &id_f) in ids.iter().enumerate() {
+                self.weights.embed_row_into(
+                    loader,
+                    id_f as u32,
+                    &mut v[pos * n_embd..(pos + 1) * n_embd],
+                )?;
+            }
+            return Ok(v);
+        }
+        let tbl = self.weights.token_embd();
+        for (pos, &id_f) in ids.iter().enumerate() {
+            let src = (id_f as usize) * n_embd;
+            if src + n_embd <= tbl.len() {
+                v[pos * n_embd..pos * n_embd + n_embd].copy_from_slice(&tbl[src..src + n_embd]);
+            }
+        }
+        Ok(v)
+    }
+}
+
 fn ensure_packed_cache(
     loader: &mut GgufLoader,
     packed: &PackedParams,
@@ -1465,12 +1519,28 @@ fn upload_packed_opt(
     let loader = loader
         .ok_or_else(|| anyhow!("packed params require a GGUF loader (missing weights path)"))?;
     let mut total = 0usize;
-    // (b) low-mem: stream each packed tensor straight from the (mmap'd)
-    // loader into the arena and never retain a 3.5 GB owned copy in
-    // `cache`. Decode-bucket re-uploads re-borrow from the same mmap
-    // (page-cache cheap). Default path keeps the cache for upload speed.
+    // (b) low-mem: feed each packed tensor straight into the arena without
+    // retaining a multi-GB owned copy in `cache`.
+    //
+    // `pread` into one reused scratch, NOT a borrow from the mmap. Borrowing
+    // is what the arena copy reads through, so it faults in every page of the
+    // checkpoint and leaves a second full-size copy resident — and on macOS
+    // that is unreclaimable short of `munmap` (`release_mapped_pages` is a
+    // no-op there). Streaming caps the resident cost at the largest single
+    // tensor instead of the whole file. rlx-llama32 measured the same trade
+    // at 5.93 GB vs 0.07 GB on a 6 GB checkpoint.
+    //
+    // Falls back to borrowing when the loader has no streaming backing.
+    // Revert with RLX_QWEN35_MMAP_UPLOAD=1.
     if rlx_core::gguf_support::low_mem_compile() {
+        let stream = !rlx_ir::env::flag("RLX_QWEN35_MMAP_UPLOAD");
+        let mut scratch: Vec<u8> = Vec::new();
         for (param_name, (loader_key, _scheme, _shape)) in packed {
+            if stream && loader.read_tensor_bytes_into(loader_key, &mut scratch)? {
+                total = total.saturating_add(scratch.len());
+                compiled.set_param_typed(param_name, &scratch, rlx_ir::DType::U8);
+                continue;
+            }
             let bytes = loader
                 .tensor_bytes_borrowed(loader_key)
                 .ok_or_else(|| anyhow!("packed upload: bytes missing for {loader_key}"))?;
@@ -1679,7 +1749,7 @@ impl Qwen35Runner {
                  reloaded (no weights path)"
             );
         }
-        let emb = std::sync::Arc::clone(&self.weights.token_embd);
+        let emb = self.weights.token_embd_arc();
         let t = Instant::now();
         if self.weights_path.is_file()
             && self
@@ -1695,7 +1765,7 @@ impl Qwen35Runner {
             )?;
             loader.include_mtp(true);
             let mut fresh = Qwen35Weights::from_loader_packed(&mut loader, &self.cfg)?;
-            fresh.token_embd = emb;
+            fresh.set_token_embd(emb);
             self.weights = std::sync::Arc::new(fresh);
             // Keep the live GGUF loader in sync for packed byte uploads.
             self.gguf_loader = Some(loader);
@@ -1716,7 +1786,7 @@ impl Qwen35Runner {
         let mut loader = rlx_core::HfTranslatingLoader::new(mmap_loader);
         let mut fresh = Qwen35Weights::from_loader(&mut loader, &self.cfg)?;
         // Keep the live embedding table (host-embed / multimodal splice).
-        fresh.token_embd = emb;
+        fresh.set_token_embd(emb);
         self.weights = std::sync::Arc::new(fresh);
         eprintln!(
             "[qwen35] reloaded host F32 projections from {} in {:.2?}",
@@ -2118,6 +2188,16 @@ impl Qwen35Runner {
                 custom_embed,
             )
         } else {
+            // Lazy table: decode one row per batch entry here and hand it
+            // over as `inputs_embeds`, since `decode_step_feeds` gathers from
+            // a materialized slice and there is none.
+            let lazy_embed_rows: Option<Vec<f32>> =
+                if self.host_embed && self.weights.embed_is_lazy() && custom_embed.is_none() {
+                    let ids: Vec<f32> = tokens.iter().map(|&t| t as f32).collect();
+                    Some(self.gather_host_embeds(&ids)?)
+                } else {
+                    None
+                };
             let feeds_owned = decode_step_feeds(
                 &self.cfg,
                 cache,
@@ -2126,8 +2206,9 @@ impl Qwen35Runner {
                 &sin,
                 None,
                 generated_per_row,
-                self.host_embed.then(|| self.weights.token_embd.as_ref()),
-                custom_embed,
+                (self.host_embed && !self.weights.embed_is_lazy())
+                    .then(|| self.weights.token_embd()),
+                custom_embed.or(lazy_embed_rows.as_deref()),
             )?;
             let feeds: Vec<(&str, &[f32])> = feeds_owned
                 .iter()
@@ -2216,6 +2297,7 @@ impl Qwen35Runner {
     ) -> Result<(Vec<f32>, Option<Vec<f32>>)> {
         let past_seq = cache.past_seq;
         let (cos, sin) = self.mrope_decode_rope_at_past(cache.abs_pos);
+        let (embed_tbl, lazy_rows) = self.embed_feed_for(tokens, custom_embed)?;
         let feeds_owned = decode_step_feeds(
             &self.cfg,
             cache,
@@ -2224,8 +2306,8 @@ impl Qwen35Runner {
             &sin,
             None,
             generated_per_row,
-            self.host_embed.then(|| self.weights.token_embd.as_ref()),
-            custom_embed,
+            embed_tbl,
+            custom_embed.or(lazy_rows.as_deref()),
         )?;
         let feeds: Vec<(&str, &[f32])> = feeds_owned
             .iter()
@@ -2694,17 +2776,8 @@ impl Qwen35Runner {
         // Match decode/prefill: when the predict graph uses host embed
         // (Fara BF16 / large vocab), gather rows here — do not leave
         // `inputs_embeds` unset (that yields all-zero logits).
-        let n_embd = self.cfg.hidden_size;
-        let host_embeds: Vec<f32> = if self.host_embed && !self.weights.token_embd.is_empty() {
-            let tbl = &self.weights.token_embd;
-            let mut v = vec![0f32; padded.len() * n_embd];
-            for (pos, &id_f) in padded.iter().enumerate() {
-                let src = (id_f as usize) * n_embd;
-                if src + n_embd <= tbl.len() {
-                    v[pos * n_embd..pos * n_embd + n_embd].copy_from_slice(&tbl[src..src + n_embd]);
-                }
-            }
-            v
+        let host_embeds: Vec<f32> = if self.host_embed && self.weights.embd_elems() != 0 {
+            self.gather_host_embeds(&padded)?
         } else {
             Vec::new()
         };
@@ -2870,7 +2943,18 @@ impl Qwen35Runner {
         };
         let mut per_batch = Vec::with_capacity(self.batch);
         for b in 0..self.batch {
-            let start = b * vocab_size;
+            // `last_logits_only` graphs already gathered the final position,
+            // so their output is [batch, vocab]. Otherwise it is
+            // [batch, max_seq, vocab] and the caller wants the row for the
+            // last *prompt* token — indexing at `b * vocab` would return
+            // position 0 for every prompt, which reads as a model that
+            // ignores everything after its first token.
+            let start = if self.last_logits_only {
+                b * vocab_size
+            } else {
+                let last = prompt_lens[b].saturating_sub(1);
+                (b * self.max_seq + last) * vocab_size
+            };
             let mut row = outs[logits_idx][start..start + vocab_size].to_vec();
             row.truncate(sample_vocab);
             per_batch.push(Qwen35PrefillOutput {
@@ -2987,7 +3071,7 @@ impl Qwen35Runner {
         crate::trace::log_generate_header(
             self.device,
             self.fast_greedy_lm_head,
-            crate::flow::host_embed_enabled_for_bytes(self.weights.token_embd.len() * 4),
+            crate::flow::host_embed_enabled_for_bytes(self.weights.embd_elems() * 4),
             self.gguf_loader.is_some(),
             self.max_seq,
             self.lm_vocab_size(),
@@ -3342,7 +3426,7 @@ impl Qwen35Runner {
             self.vision_encoder = None;
             eprintln!("[qwen35] dropped vision encoder after encode (low-mem)");
         }
-        if self.weights.token_embd.is_empty() {
+        if self.weights.token_embd().is_empty() {
             bail!("qwen35: multimodal prefill requires token_embd weights");
         }
         let weights_path = self.weights_path.as_path();
@@ -3356,7 +3440,7 @@ impl Qwen35Runner {
         };
         let prefill = mm.assemble(
             |text| encode_prompt_auto(weights_path, tokenizer, text),
-            &self.weights.token_embd,
+            self.weights.token_embd(),
             n_embd,
             0,
         )?;
@@ -3549,20 +3633,10 @@ impl Qwen35Runner {
         // rows (token 0) match bit-for-bit. Keeps the 4.7 GiB Bonsai table off
         // the accelerator.
         let host_embeds: Vec<f32> =
-            if crate::flow::host_embed_enabled_for_bytes(self.weights.token_embd.len() * 4)
-                && !self.weights.token_embd.is_empty()
+            if crate::flow::host_embed_enabled_for_bytes(self.weights.embd_elems() * 4)
+                && self.weights.embd_elems() != 0
             {
-                let n_embd = self.cfg.hidden_size;
-                let tbl = &self.weights.token_embd;
-                let mut v = vec![0f32; input_ids.len() * n_embd];
-                for (pos, &id_f) in input_ids.iter().enumerate() {
-                    let src = (id_f as usize) * n_embd;
-                    if src + n_embd <= tbl.len() {
-                        v[pos * n_embd..pos * n_embd + n_embd]
-                            .copy_from_slice(&tbl[src..src + n_embd]);
-                    }
-                }
-                v
+                self.gather_host_embeds(&input_ids)?
             } else {
                 Vec::new()
             };
@@ -3575,6 +3649,20 @@ impl Qwen35Runner {
         let zero_in = zero_recurrent_inputs(&self.cfg, self.batch);
         for (name, data) in &zero_in {
             feeds.push((name, data.as_slice()));
+        }
+        // Tell the GDN scan which trailing positions are padding, or its
+        // exported state describes the prompt plus a run of pad tokens.
+        //
+        // The extent is the COMPILED one, which is `max_seq` — not `seq`,
+        // the prompt length. The prefill-cache graph is built once at the
+        // full extent and every shorter prompt is padded up to it, so
+        // `seq` here would report "nothing is padded" for exactly the
+        // prompts that are.
+        let padded_seq = input_ids.len() / self.batch.max(1);
+        let pad_owned =
+            crate::cache::prompt_pad_mask_feeds(&self.cfg, self.batch, padded_seq, &prompt_lens);
+        for (name, data) in &pad_owned {
+            feeds.push((name.as_str(), data.as_slice()));
         }
         let rope_owned = self.mrope_prefill_rope_feeds(seq);
         for (name, data) in &rope_owned {
@@ -3899,6 +3987,16 @@ impl Qwen35Runner {
         if let Some(ref ids) = input_ids {
             feeds.push(("input_ids", ids.as_slice()));
         }
+        // The GDN scan needs to know which trailing positions are padding —
+        // the hidden is padded from `seq` up to `bucket` above. The text
+        // prefill path feeds these; this multimodal one did not, so MLX (which
+        // does not default unbound inputs) refused the graph outright with
+        // `missing input 'gdn_pad_l0'`, and every other backend silently
+        // scanned the zero-padded tail as if it were prompt.
+        let pad_owned = crate::cache::prompt_pad_mask_feeds(&self.cfg, self.batch, bucket, &[seq]);
+        for (name, data) in &pad_owned {
+            feeds.push((name.as_str(), data.as_slice()));
+        }
         let rope_owned = self.mrope_prefill_rope_feeds(bucket);
         for (name, data) in &rope_owned {
             feeds.push((name.as_str(), data.as_slice()));
@@ -4121,7 +4219,7 @@ impl Qwen35Runner {
                 &sin,
                 None,
                 generated_per_row,
-                self.host_embed.then(|| self.weights.token_embd.as_ref()),
+                self.host_embed.then(|| self.weights.token_embd()),
                 None,
             )?;
             let feeds: Vec<(&str, &[f32])> = feeds_owned
@@ -4267,7 +4365,7 @@ impl Qwen35Runner {
         ];
         // Verify graphs are built with `force_host_embed` → always feed embeddings.
         {
-            let tbl = self.weights.token_embd.as_ref();
+            let tbl = self.weights.token_embd();
             let n_embd = self.cfg.hidden_size;
             let mut e = vec![0f32; n * n_embd];
             for (i, &t) in tokens.iter().enumerate() {
@@ -4497,7 +4595,7 @@ impl Qwen35Runner {
             ("rope_sin".into(), sin),
         ];
         if self.host_embed {
-            let tbl = self.weights.token_embd.as_ref();
+            let tbl = self.weights.token_embd();
             let n_embd = self.cfg.hidden_size;
             let mut e = vec![0f32; n * n_embd];
             for (i, &t) in tokens.iter().enumerate() {
@@ -4699,6 +4797,7 @@ impl Qwen35Runner {
         let bucket_key = self.decode_bucket_key(past_seq as u64);
         let upper = self.ensure_decode_bucket_compiled(past_seq as u64)?;
 
+        let (embed_tbl, lazy_rows) = self.embed_feed_for(tokens, custom_embed)?;
         let feeds_owned = decode_step_feeds(
             &self.cfg,
             cache,
@@ -4707,8 +4806,8 @@ impl Qwen35Runner {
             sin,
             Some(upper),
             generated_per_row,
-            self.host_embed.then(|| self.weights.token_embd.as_ref()),
-            custom_embed,
+            embed_tbl,
+            custom_embed.or(lazy_rows.as_deref()),
         )?;
         let feeds: Vec<(&str, &[f32])> = feeds_owned
             .iter()
@@ -4802,6 +4901,7 @@ impl Qwen35Runner {
         }
 
         // Feeds minus the resident handles (past_k_l*/past_v_l* live on-device).
+        let (embed_tbl, lazy_rows) = self.embed_feed_for(tokens, custom_embed)?;
         let feeds_owned = decode_step_feeds(
             &self.cfg,
             cache,
@@ -4810,8 +4910,8 @@ impl Qwen35Runner {
             sin,
             Some(upper),
             generated_per_row,
-            self.host_embed.then(|| self.weights.token_embd.as_ref()),
-            custom_embed,
+            embed_tbl,
+            custom_embed.or(lazy_rows.as_deref()),
         )?;
         let feeds_owned: Vec<(String, Vec<f32>)> = feeds_owned
             .into_iter()

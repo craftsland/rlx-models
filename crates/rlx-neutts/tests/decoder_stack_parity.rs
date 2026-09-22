@@ -33,13 +33,31 @@ fn decoder_stack_produces_finite_audio() {
     let codes: Vec<i32> = vec![0, 42, 128, 512, 1023];
     let audio = dec.decode(&codes).expect("decode");
 
-    assert!(!audio.is_empty());
-    assert!(audio.iter().all(|s| s.is_finite()));
-    assert!(
-        audio.len() == codes.len() * dec.hop_length(),
-        "expected {} samples, got {}",
+    assert!(!audio.is_empty(), "no audio produced");
+    assert!(audio.iter().all(|s| s.is_finite()), "non-finite sample");
+    assert_eq!(
+        audio.len(),
         codes.len() * dec.hop_length(),
-        audio.len()
+        "one hop of samples per code"
+    );
+    // Silence is finite and the right length, so the checks above pass on a
+    // decoder that emits nothing at all.
+    assert!(
+        audio.iter().any(|s| s.abs() > 1e-9),
+        "decoded audio is identically zero"
+    );
+    let first = audio[0];
+    assert!(
+        audio.iter().any(|s| (s - first).abs() > 1e-9),
+        "decoded audio is the constant {first}"
+    );
+    // Different codes must give different audio, or the codebook lookup is
+    // being ignored.
+    let other: Vec<i32> = codes.iter().map(|c| (c + 7) % 1024).collect();
+    let audio2 = dec.decode(&other).expect("decode second");
+    assert!(
+        audio.iter().zip(&audio2).any(|(a, b)| (a - b).abs() > 1e-9),
+        "two different code sequences decoded identically"
     );
     eprintln!("backend: {}", dec.backend_name());
 }

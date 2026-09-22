@@ -2,10 +2,13 @@
 resolver = "2"
 members = [
     "crates/rlx-models",
+    "crates/rlx-dsv41",
+    "crates/rlx-jina-ocr",
     "crates/rlx-denoise",
     "crates/rlx-cli",
     "crates/rlx-models-core",
     "crates/rlx-assets",
+    "crates/rlx-upscale",
     "crates/rlx-vision-bench",
     "crates/rlx-tada",
     "crates/rlx-tts-bench",
@@ -149,6 +152,7 @@ members = [
     "crates/rlx-asr",
     "crates/rlx-ppocrv6",
     "crates/rlx-neutts",
+    "crates/rlx-kev",
     "crates/rlx-kittentts",
     "crates/rlx-kokoro",
     "crates/rlx-supertonic",
@@ -296,7 +300,9 @@ ocrs = { version = "0.12.2", default-features = false }
 flate2 = "1"
 
 rlx-cli = { path = "crates/rlx-cli", version = "0.2.16" }
+rlx-upscale = { path = "crates/rlx-upscale", version = "0.2.16" }
 rlx-core = { path = "crates/rlx-models-core", package = "rlx-models-core", version = "0.2.16" }
+rlx-dsv41 = { path = "crates/rlx-dsv41", version = "0.2.16" }
 rlx-eval = { path = "crates/rlx-eval", version = "0.2.16" }
 rlx-mt-eval = { path = "crates/rlx-mt-eval", version = "0.2.16" }
 rlx-assets = { path = "crates/rlx-assets", version = "0.2.16" }
@@ -396,9 +402,11 @@ rlx-ocr = { path = "crates/rlx-ocr", version = "0.2.16" }
 rlx-ocr2 = { path = "crates/rlx-ocr2", version = "0.2.16" }
 rlx-asr = { path = "crates/rlx-asr", version = "0.2.16" }
 rlx-ppocrv6 = { path = "crates/rlx-ppocrv6", version = "0.2.16" }
+rlx-jina-ocr = { path = "crates/rlx-jina-ocr", version = "0.2.16" }
 rlx-unlimited-ocr = { path = "crates/rlx-unlimited-ocr", version = "0.2.16" }
 rlx-neutts = { path = "crates/rlx-neutts", version = "0.2.16" }
 rlx-florence2 = { path = "crates/rlx-florence2", version = "0.2.16" }
+rlx-kev = { path = "crates/rlx-kev", version = "0.2.16" }
 rlx-kittentts = { path = "crates/rlx-kittentts", version = "0.2.16" }
 rlx-tts = { path = "crates/rlx-tts", version = "0.2.16" }
 rlx-kokoro = { path = "crates/rlx-kokoro", version = "0.2.16" }
@@ -466,6 +474,9 @@ rlx-heartmula = { path = "crates/rlx-heartmula", version = "0.2.16" }
 rlx-citrinet = { path = "crates/rlx-citrinet", version = "0.2.16" }
 rlx-funasr = { path = "crates/rlx-funasr", version = "0.2.16" }
 rlx-nemo = { version = "^0.2.16" }
+# PyTorch `torch.save` checkpoint reader (.pt/.pth) — community upscaler
+# weights ship as bare `.pth` state dicts, not safetensors.
+rlx-torch-ckpt = { version = "^0.2.16" }
 rlx-inflect-nano = { path = "crates/rlx-inflect-nano", version = "0.2.16", default-features = false }
 rlx-sanotts = { path = "crates/rlx-sanotts", version = "0.2.16", default-features = false }
 rlx-tiny-tts = { path = "crates/rlx-tiny-tts", version = "0.2.16" }

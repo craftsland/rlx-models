@@ -31,3 +31,13 @@ jobs:
 
       - name: cargo clippy (-D warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # MODELS.md is hand-maintained but claims to be generated from each
+      # crate's Cargo.toml, and drifts every release (missing crates, stale
+      # backend cells, counts that no longer add up). Cheap: metadata only.
+      - name: MODELS.md catalog
+        run: python3 scripts/check-models-catalog.py
+      # Publish-blocking classes that no cargo command catches: includes that
+      # escape their package or are gitignored, versionless path deps, oversized
+      # crates, and publish.sh tier coverage/ordering.
+      - name: publish preflight
+        run: python3 scripts/check-publishable.py

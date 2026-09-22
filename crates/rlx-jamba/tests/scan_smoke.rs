@@ -14,14 +14,6 @@ use rlx_runtime::Device;
 use rlx_ssm::{MambaScanStage, MambaScanWeightKeys, register_ir_ops};
 use std::collections::HashMap;
 
-fn dev() -> Device {
-    std::env::var("RLX_TEST_DEVICE")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(|s| rlx_cli::parse_device(&s).expect("bad RLX_TEST_DEVICE"))
-        .unwrap_or(Device::Cpu)
-}
-
 fn fill(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
     (0..n)
@@ -34,8 +26,7 @@ fn fill(n: usize, seed: u64) -> Vec<f32> {
         .collect()
 }
 
-#[test]
-fn selective_scan_runs_in_flow() {
+fn run_case(device: Device) -> Vec<f32> {
     register_ir_ops();
     let (d_inner, state, seq) = (8usize, 4usize, 5usize);
     let f = DType::F32;
@@ -75,7 +66,7 @@ fn selective_scan_runs_in_flow() {
         .output("y")
         .build_with(&mut WeightMapSource(&mut wm), None)
         .expect("build scan flow");
-    let mut compiled = compile_built(built, dev()).expect("compile scan flow");
+    let mut compiled = compile_built(built, device).expect("compile scan flow");
 
     let x = fill(seq * d_inner, 10);
     let dt = fill(seq * d_inner, 11);
@@ -91,9 +82,16 @@ fn selective_scan_runs_in_flow() {
         .into_iter()
         .next()
         .expect("scan returned output");
-    assert_eq!(out.len(), seq * d_inner);
-    assert!(
-        out.iter().all(|v| v.is_finite()),
-        "scan output must be finite"
-    );
+    assert_eq!(out.len(), seq * d_inner, "unexpected output length");
+    out
+}
+
+/// Every backend must agree with CPU, not merely produce finite numbers.
+///
+/// This test previously ran on one device and asserted only that the
+/// output was finite — a bar that an all-zero result, or a tensor with
+/// one head's worth of real values and the rest zero, still clears.
+#[test]
+fn selective_scan_runs_in_flow_matches_cpu_on_every_backend() {
+    rlx_core::backend_matrix::assert_matches_cpu_on_all("jamba selective scan", 2e-3, run_case);
 }

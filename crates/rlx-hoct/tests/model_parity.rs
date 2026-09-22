@@ -92,13 +92,69 @@ fn load_ref_inputs() -> Option<(
 }
 
 #[test]
-fn geometry_line_to_line_is_finite() {
-    let node_pos =
-        Array3::from_shape_vec((1, 3, 3), vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 2.0, 0.0, 0.0])
-            .unwrap();
-    let edge_indices = Array3::from_shape_vec((1, 2, 2), vec![0, 1, 1, 2]).unwrap();
-    let d = line_to_line_distances(&node_pos, &edge_indices);
-    assert!(d.iter().all(|v| v.is_finite()));
+fn geometry_line_to_line_matches_closed_form() {
+    // `is_finite` was the whole assertion here, which a function returning
+    // zeros — or one returning the wrong distance — passes. Segment-to-segment
+    // distance has a closed form, so use it.
+    let dist = |pts: Vec<f32>, n: usize, edges: Vec<i64>, e: usize| {
+        let node_pos = Array3::from_shape_vec((1, n, 3), pts).unwrap();
+        let edge_indices = Array3::from_shape_vec((1, e, 2), edges).unwrap();
+        let d = line_to_line_distances(&node_pos, &edge_indices);
+        assert_eq!(d.shape(), &[1, e, e], "pairwise distance matrix shape");
+        assert!(d.iter().all(|v| v.is_finite()), "non-finite distance");
+        d
+    };
+
+    // Collinear and touching at (1,0,0): every pairwise distance is exactly 0.
+    // This is the degenerate parallel case, where the usual formula divides by
+    // a zero cross-product — which is what the old finiteness check was really
+    // guarding, without ever saying what the answer should be.
+    let d = dist(
+        vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 2.0, 0.0, 0.0],
+        3,
+        vec![0, 1, 1, 2],
+        2,
+    );
+    for v in d.iter() {
+        assert!(
+            v.abs() < 1e-6,
+            "touching collinear segments: expected 0, got {v}"
+        );
+    }
+
+    // Parallel, offset by 2 in y: distance 2 between the two, 0 to itself.
+    let d = dist(
+        vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 2.0, 0.0, 1.0, 2.0, 0.0],
+        4,
+        vec![0, 1, 2, 3],
+        2,
+    );
+    assert!(d[[0, 0, 0]].abs() < 1e-6, "self-distance must be 0");
+    assert!(
+        (d[[0, 0, 1]] - 2.0).abs() < 1e-5,
+        "parallel segments 2 apart: got {}",
+        d[[0, 0, 1]]
+    );
+    assert!(
+        (d[[0, 1, 0]] - 2.0).abs() < 1e-5,
+        "distance must be symmetric: got {}",
+        d[[0, 1, 0]]
+    );
+
+    // Skew: x-axis segment through the origin, and a y-axis segment lifted to
+    // z = 3 and pushed out to x = 5 so the closest approach is the endpoint
+    // (1,0,0) to (5,0,3) — sqrt(16 + 9) = 5.
+    let d = dist(
+        vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 5.0, 0.0, 3.0, 5.0, 1.0, 3.0],
+        4,
+        vec![0, 1, 2, 3],
+        2,
+    );
+    assert!(
+        (d[[0, 0, 1]] - 5.0).abs() < 1e-4,
+        "skew segments: expected 5, got {}",
+        d[[0, 0, 1]]
+    );
 }
 
 #[test]

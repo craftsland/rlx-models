@@ -383,6 +383,8 @@ mod tests {
             });
         }
         Qwen35Weights {
+            output_fold: None,
+            token_embd_lazy: None,
             token_embd: std::sync::Arc::from(ramp(n_vocab * n_embd, 0.001)),
             output_norm: vec![1.0; n_embd],
             output: None,

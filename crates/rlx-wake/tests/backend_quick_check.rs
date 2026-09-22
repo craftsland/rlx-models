@@ -68,12 +68,20 @@ fn cpu_streaming_path() {
     assert!(steps.iter().all(|s| s.score.is_finite()));
 }
 
+/// Every backend must produce the *same* scores as CPU, not merely finite ones.
+///
+/// This swept the devices already but only asked each for finite numbers, which
+/// a backend returning zeros — or one silently falling back to a different
+/// execution path — passes just as easily. The scores are deterministic for a
+/// fixed stub and a fixed PCM buffer, so they should agree exactly up to f32
+/// reassociation.
 #[test]
-fn all_available_backends_accept_stub() {
+fn all_available_backends_score_like_cpu() {
     let pcm = vec![0.0f32; 1280 * 4];
     let devices = available_devices();
     assert!(!devices.is_empty(), "expected at least cpu");
-    for device in devices {
+
+    let scores_for = |device: Device| -> (&'static str, Vec<f32>) {
         let (exec, label) = bind_streaming_device(device).unwrap();
         assert_eq!(exec, device);
         assert_eq!(label, bench_device_label(device));
@@ -81,9 +89,44 @@ fn all_available_backends_accept_stub() {
         assert_eq!(eng.device_label, label);
         let steps = score_wav(&mut eng, &pcm).unwrap();
         assert!(!steps.is_empty(), "device={label}");
-        assert!(
-            steps.iter().all(|s| s.score.is_finite()),
-            "non-finite score on {label}"
-        );
+        (label, steps.iter().map(|s| s.score).collect())
+    };
+
+    let (_, cpu) = scores_for(Device::Cpu);
+    assert!(
+        cpu.iter().all(|v| v.is_finite()),
+        "CPU reference scores are not finite"
+    );
+    let scale = cpu.iter().fold(0f32, |a, v| a.max(v.abs())).max(1e-6);
+
+    let mut bad = Vec::new();
+    for device in devices {
+        if device == Device::Cpu {
+            continue;
+        }
+        let (label, got) = scores_for(device);
+        if got.len() != cpu.len() {
+            bad.push(format!(
+                "  {label}: {} steps, CPU gave {}",
+                got.len(),
+                cpu.len()
+            ));
+            continue;
+        }
+        let rel = got
+            .iter()
+            .zip(&cpu)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max)
+            / scale;
+        if !rel.is_finite() || rel >= 1e-3 {
+            bad.push(format!("  {label}: scores differ from CPU by {rel:.6}"));
+        }
     }
+    assert!(
+        bad.is_empty(),
+        "wake scores differ from CPU on {} backend(s):\n{}",
+        bad.len(),
+        bad.join("\n")
+    );
 }

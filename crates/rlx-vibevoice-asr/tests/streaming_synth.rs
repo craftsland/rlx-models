@@ -3,7 +3,6 @@
 //! Synthetic Streaming VAE encode (GELU) + config checks.
 //! Real-weight presence: set `RLX_VIBEVOICE_ASR_STREAMING_DIR`.
 
-use rlx_runtime::Device;
 use rlx_vibevoice_asr::config::{VaeFfnAct, VibeAsrConfig};
 use rlx_vibevoice_asr::vae::VaeEncoderGraph;
 use rlx_vibevoice_asr::weights::{BlockW, ConnectorW, ConvW, VaeEncoderWeights};
@@ -61,34 +60,42 @@ fn streaming_config_defaults() {
     assert_eq!(c.streaming.chunk_samples(), 22 * 3200);
 }
 
+/// The streaming (GELU, no whole-clip normalize) encoder, on every backend.
 #[test]
-fn gelu_vae_encode_cpu() {
-    // Tiny 2-stage encoder (strides 1, 2) — same shape as vae_encoder_smoke,
-    // but compiled with GELU / no whole-clip normalize (Streaming path).
-    let (c0, c1, vae_dim, connector_dim) = (4usize, 8usize, 6usize, 10usize);
-    let w = VaeEncoderWeights {
-        downsamples: vec![conv(c0, 1, 3, 1), conv(c1, c0, 3, 10)],
-        stages: vec![vec![block(c0, 100)], vec![block(c1, 200)]],
-        head: conv(vae_dim, c1, 3, 30),
-        connector: ConnectorW {
-            fc1_w: fill(connector_dim * vae_dim, 40),
-            fc1_b: fill(connector_dim, 41),
-            norm_w: fill(connector_dim, 42),
-            fc2_w: fill(connector_dim * connector_dim, 43),
-            fc2_b: fill(connector_dim, 44),
-            in_dim: vae_dim,
-            out_dim: connector_dim,
+fn gelu_vae_encode_matches_cpu_on_every_backend() {
+    rlx_core::backend_matrix::assert_matches_cpu_on_all(
+        "vibevoice streaming VAE encoder (GELU)",
+        2e-3,
+        |device| {
+            // Tiny 2-stage encoder (strides 1, 2) — same shape as vae_encoder_smoke,
+            // but compiled with GELU / no whole-clip normalize (Streaming path).
+            let (c0, c1, vae_dim, connector_dim) = (4usize, 8usize, 6usize, 10usize);
+            let w = VaeEncoderWeights {
+                downsamples: vec![conv(c0, 1, 3, 1), conv(c1, c0, 3, 10)],
+                stages: vec![vec![block(c0, 100)], vec![block(c1, 200)]],
+                head: conv(vae_dim, c1, 3, 30),
+                connector: ConnectorW {
+                    fc1_w: fill(connector_dim * vae_dim, 40),
+                    fc1_b: fill(connector_dim, 41),
+                    norm_w: fill(connector_dim, 42),
+                    fc2_w: fill(connector_dim * connector_dim, 43),
+                    fc2_b: fill(connector_dim, 44),
+                    in_dim: vae_dim,
+                    out_dim: connector_dim,
+                },
+                vae_dim,
+                connector_dim,
+            };
+            let padded_len = 16usize;
+            let mut g =
+                VaeEncoderGraph::compile_for_streaming(device, &w, padded_len, VaeFfnAct::Gelu)
+                    .expect("compile");
+            let feats = g.run(&fill(padded_len, 7)).expect("run");
+            assert_eq!(feats.len(), g.n_frames * connector_dim);
+            assert!(feats.iter().all(|v| v.is_finite()));
+            feats
         },
-        vae_dim,
-        connector_dim,
-    };
-    let padded_len = 16usize;
-    let mut g =
-        VaeEncoderGraph::compile_for_streaming(Device::Cpu, &w, padded_len, VaeFfnAct::Gelu)
-            .expect("compile");
-    let feats = g.run(&fill(padded_len, 7)).expect("run");
-    assert_eq!(feats.len(), g.n_frames * connector_dim);
-    assert!(feats.iter().all(|v| v.is_finite()));
+    );
 }
 
 #[test]

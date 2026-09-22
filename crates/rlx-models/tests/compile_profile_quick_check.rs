@@ -21,16 +21,35 @@ use rlx_models::build_qwen35_graph_sized;
 use rlx_models::qwen35::synth;
 use rlx_runtime::Device;
 
-#[test]
-fn compile_support_qwen35_prefill_profile_runs() {
+fn run_case(device: Device) -> Vec<f32> {
     let cfg = synth::tiny_cfg();
     let weights = synth::synth_weights(&cfg);
     let (graph, params, _) =
         build_qwen35_graph_sized(&cfg, weights, 1, 4, true, true, false).expect("graph");
-    let mut compiled = compile_support::compile_qwen35_prefill(Device::Cpu, graph, params);
-    let outs = compiled.run(&[("input_ids", &[1.0, 2.0, 3.0, 4.0])]);
-    assert!(!outs.is_empty());
-    assert!(outs[0].iter().all(|v| v.is_finite()));
+    let mut compiled = compile_support::compile_qwen35_prefill(device, graph, params);
+    // The graph is built with `last_logits_only`, so it declares
+    // `last_token_idx`. Only `input_ids` was ever fed: CPU ran anyway with the
+    // input unbound, MLX refused. Feed it.
+    let outs = compiled.run(&[
+        ("input_ids", &[1.0, 2.0, 3.0, 4.0][..]),
+        ("last_token_idx", &[3.0][..]),
+    ]);
+    assert!(!outs.is_empty(), "profile compile produced no outputs");
+    outs[0].clone()
+}
+
+/// Every backend must agree with CPU, not merely produce finite numbers.
+///
+/// This test previously ran on CPU alone and asserted only that the output
+/// was finite — a bar that an all-zero result, or a tensor with one head's
+/// worth of real values and the rest zero, still clears.
+#[test]
+fn compile_support_qwen35_prefill_profile_runs_matches_cpu_on_every_backend() {
+    rlx_core::backend_matrix::assert_matches_cpu_on_all(
+        "qwen35 prefill compile profile",
+        2e-3,
+        run_case,
+    );
 }
 
 #[test]

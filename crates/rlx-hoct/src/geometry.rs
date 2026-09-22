@@ -103,8 +103,16 @@ fn segment_segment_dist(p0_i: [f32; 3], u_i: [f32; 3], p0_j: [f32; 3], u_j: [f32
     let big_d = a * c - b * b;
 
     let (sc, tc) = if big_d < PARALLEL_EPS {
+        // Parallel: `sc` is unconstrained by the cross term, so pin it at 0 and
+        // project onto `j`. Clamping `tc` to the segment can then leave `sc = 0`
+        // no longer optimal, so the same clamp-back the non-parallel branch does
+        // is needed here too — without it, two collinear segments that *touch*
+        // reported the distance between their start points (1.0 for a unit pair)
+        // instead of 0, and any parallel pair offset along its own direction was
+        // overstated the same way.
         let tc_p = (e / c.max(CLAMP_EPS)).clamp(0.0, 1.0);
-        (0.0, tc_p)
+        let sc_p = ((b * tc_p - d) / a.max(CLAMP_EPS)).clamp(0.0, 1.0);
+        (sc_p, tc_p)
     } else {
         let sc_np = ((b * e - c * d) / big_d.max(CLAMP_EPS)).clamp(0.0, 1.0);
         let tc_np = ((b * sc_np + e) / c.max(CLAMP_EPS)).clamp(0.0, 1.0);

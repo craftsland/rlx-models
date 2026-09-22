@@ -1,0 +1,48 @@
+[package]
+name = "rlx-kev"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Kev / Jev-style System One decision models (Qwen3.5 + LoRA + pointer head) for RLX"
+keywords.workspace = true
+categories.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+safetensors = { workspace = true }
+rlx-core = { workspace = true }
+rlx-ir = { workspace = true }
+rlx-runtime = { workspace = true }
+rlx-qwen35 = { workspace = true }
+rlx-torch-ckpt = { workspace = true }
+tokenizers = { workspace = true, optional = true }
+
+[features]
+default = ["tokenizer"]
+# Text in / text out. Without it the crate is ids-only: `Encoder` still runs
+# from a caller-supplied `TokenizerLike`, which is what the golden-vector
+# tests use (no tokenizer.json needed).
+tokenizer = ["dep:tokenizers"]
+metal = ["rlx-qwen35/metal", "rlx-runtime/metal"]
+mlx = ["rlx-qwen35/mlx", "rlx-runtime/mlx"]
+cuda = ["rlx-qwen35/cuda", "rlx-runtime/cuda"]
+rocm = ["rlx-qwen35/rocm", "rlx-runtime/rocm"]
+gpu = ["rlx-qwen35/gpu", "rlx-runtime/gpu"]
+vulkan = ["rlx-qwen35/vulkan", "rlx-runtime/vulkan"]
+all-backends = ["metal", "mlx", "cuda", "rocm", "gpu", "vulkan"]
+apple-silicon = ["metal", "mlx", "gpu"]
+nvidia-gpu = ["cuda"]
+amd-gpu = ["rocm"]
+portable-gpu = ["gpu"]
+
+[[bin]]
+name = "rlx-kev"
+path = "src/bin/rlx_kev.rs"
+
+[lints]
+workspace = true

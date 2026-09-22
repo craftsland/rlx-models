@@ -299,6 +299,11 @@ pub mod qwen3_tts {
 pub mod locateanything {
     pub use rlx_locateanything::*;
 }
+#[cfg(feature = "jina-ocr")]
+pub mod jina_ocr {
+    pub use rlx_jina_ocr::*;
+}
+
 #[cfg(feature = "unlimited-ocr")]
 pub mod unlimited_ocr {
     pub use rlx_unlimited_ocr::*;

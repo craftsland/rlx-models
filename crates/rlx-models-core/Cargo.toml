@@ -17,6 +17,11 @@ documentation.workspace = true
 rlx-ir = { workspace = true }
 rlx-flow = { workspace = true }
 rlx-runtime = { workspace = true }
+# For `pretrain::train_batches`: a multi-batch loop needs the backward pass. The
+# optimizer stays the CALLER's (passed as a closure) — this crate resolves
+# `rlx-optim` from the registry while the model crates patch it to a path, so a
+# shared `dyn Optimizer` would be two different traits.
+rlx-autodiff = { workspace = true }
 # Model-agnostic multi-node pipeline API (graph partition + ParamSource seam).
 rlx-distributed = { workspace = true }
 rlx-cpu = { workspace = true }
@@ -43,6 +48,7 @@ rlx-mlx = { workspace = true, optional = true }
 rlx-wgpu = { workspace = true, optional = true }
 rlx-cuda = { workspace = true, optional = true }
 rlx-rocm = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
 
 [features]
 # Opt-in execution backends, used by the audio_ops_ir cross-backend tests and
@@ -55,6 +61,9 @@ cuda = ["rlx-runtime/cuda", "dep:rlx-cuda"]
 rocm = ["rlx-runtime/rocm", "dep:rlx-rocm"]
 vulkan = ["rlx-runtime/vulkan", "dep:rlx-wgpu"]
 coreml = ["rlx-runtime/coreml"]
+# Text in / text out for the DeepSeek-V4.1 runner. Without it the runner still
+# generates, but on token ids and with a caller-supplied vocabulary.
+tokenizer = ["dep:tokenizers"]
 
 [dev-dependencies]
 tokenizers = { workspace = true }

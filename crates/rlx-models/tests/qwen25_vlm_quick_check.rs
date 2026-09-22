@@ -13,8 +13,7 @@ fn fake_tokenizer(text: &str) -> anyhow::Result<Vec<u32>> {
     Ok(text.bytes().map(|b| (b as u32 % 31 + 1).max(1)).collect())
 }
 
-#[test]
-fn qwen25_vlm_hidden_prefill_and_decode_quick_check() {
+fn run_case(device: Device) -> Vec<f32> {
     let mmcfg = synth::tiny_mmproj_cfg();
     let mmweights = MmProjWeights::synthetic(&mmcfg);
     let lmcfg = synth::tiny_lm_cfg();
@@ -24,7 +23,7 @@ fn qwen25_vlm_hidden_prefill_and_decode_quick_check() {
         .lm_config(lmcfg.clone())
         .inline_lm_weights(lmweights.clone())
         .inline_mmproj(mmcfg.clone(), mmweights.clone())
-        .device(Device::Cpu)
+        .device(device)
         .max_seq(64)
         .build()
         .expect("vlm runner");
@@ -55,9 +54,21 @@ fn qwen25_vlm_hidden_prefill_and_decode_quick_check() {
         .prefill_from_assembled(prefill)
         .expect("hidden prefill");
     assert_eq!(logits.len(), lmcfg.lm.vocab_size);
-    assert!(logits.iter().all(|v| v.is_finite()));
 
     let step = runner.decode_step(3).expect("decode step");
     assert_eq!(step.len(), lmcfg.lm.vocab_size);
-    assert!(step.iter().all(|v| v.is_finite()));
+    logits.into_iter().chain(step).collect()
+}
+
+/// Every backend must agree with CPU, not merely produce finite logits.
+///
+/// Prefill and decode logits are concatenated, so a divergence in
+/// either stage is caught.
+#[test]
+fn qwen25_vlm_hidden_prefill_and_decode_quick_check_matches_cpu_on_every_backend() {
+    rlx_core::backend_matrix::assert_matches_cpu_on_all(
+        "qwen2.5-VL prefill + decode",
+        2e-3,
+        run_case,
+    );
 }

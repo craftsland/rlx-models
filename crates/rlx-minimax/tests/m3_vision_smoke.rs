@@ -114,15 +114,14 @@ fn projector_weights(cfg: &M3VisionConfig) -> WeightMap {
     WeightMap::from_tensors(t)
 }
 
-#[test]
-fn m3_vision_tower_compiles_and_runs() {
+fn run_case(device: Device) -> Vec<f32> {
     let cfg = tiny_vcfg();
     // grid 1x4x4 = 16 patches.
     let (gt, gh, gw) = (1usize, 4usize, 4usize);
     let np = gt * gh * gw;
     let mut wm = vision_weights(&cfg);
     let built = build_m3_vision_flow(&cfg, &mut wm, np).expect("build vision flow");
-    let mut compiled = compile_built(built, Device::Cpu).expect("compile vision flow");
+    let mut compiled = compile_built(built, device).expect("compile vision flow");
 
     let px = fill(np * cfg.patch_dim(), 5);
     let (cos, sin) = vision_rope_tables(gt, gh, gw, cfg.axis_dim(), cfg.rope_theta);
@@ -136,30 +135,41 @@ fn m3_vision_tower_compiles_and_runs() {
         .next()
         .expect("vision forward returned output");
     assert_eq!(out.len(), np * cfg.hidden_size);
-    assert!(
-        out.iter().all(|v| v.is_finite()),
-        "vision hidden must be finite"
-    );
+    out
 }
 
+/// Every backend must agree with CPU, not merely produce finite numbers.
+///
+/// This test previously ran on CPU alone and asserted only that the output
+/// was finite — a bar that an all-zero result, or a tensor with one head's
+/// worth of real values and the rest zero, still clears.
 #[test]
-fn m3_projector_compiles_and_runs() {
-    let cfg = tiny_vcfg();
-    let np = 16usize; // divisible by merge²=4
-    let mut wm = projector_weights(&cfg);
-    let built = build_m3_projector_flow(&cfg, &mut wm, np).expect("build projector flow");
-    let mut compiled = compile_built(built, Device::Cpu).expect("compile projector flow");
+fn m3_vision_tower_compiles_and_runs_matches_cpu_on_every_backend() {
+    rlx_core::backend_matrix::assert_matches_cpu_on_all("minimax M3 vision tower", 2e-3, run_case);
+}
 
-    let vh = fill(np * cfg.hidden_size, 7);
-    let out = compiled
-        .run(&[("vision_hidden", vh.as_slice())])
-        .into_iter()
-        .next()
-        .expect("projector forward returned output");
-    let np_out = np / (cfg.spatial_merge_size * cfg.spatial_merge_size);
-    assert_eq!(out.len(), np_out * cfg.projection_dim);
-    assert!(
-        out.iter().all(|v| v.is_finite()),
-        "image features must be finite"
-    );
+/// Every backend must agree with CPU, not merely produce finite features.
+#[test]
+fn m3_projector_matches_cpu_on_every_backend() {
+    rlx_core::backend_matrix::assert_matches_cpu_on_all("minimax M3 projector", 2e-3, |device| {
+        let cfg = tiny_vcfg();
+        let np = 16usize; // divisible by merge²=4
+        let mut wm = projector_weights(&cfg);
+        let built = build_m3_projector_flow(&cfg, &mut wm, np).expect("build projector flow");
+        let mut compiled = compile_built(built, device).expect("compile projector flow");
+
+        let vh = fill(np * cfg.hidden_size, 7);
+        let out = compiled
+            .run(&[("vision_hidden", vh.as_slice())])
+            .into_iter()
+            .next()
+            .expect("projector forward returned output");
+        let np_out = np / (cfg.spatial_merge_size * cfg.spatial_merge_size);
+        assert_eq!(out.len(), np_out * cfg.projection_dim);
+        assert!(
+            out.iter().all(|v| v.is_finite()),
+            "image features must be finite"
+        );
+        out
+    });
 }

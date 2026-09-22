@@ -15,13 +15,15 @@
 //!
 //! Reference: `deepseek-ai/DeepSeek-V4.1-Flash` `inference/vision.py`.
 
-use crate::dsv41::VisionSpec;
-use crate::standard_decoder::{load_norm, load_p, synth_const, synth_zero};
+use crate::dsv41::{DeepseekV41Spec, VisionSpec};
+use crate::dsv41_block::Ctx;
+use crate::standard_decoder::synth_const;
 use crate::weight_loader::WeightLoader;
 use anyhow::{Result, anyhow};
 use rlx_ir::GraphExt;
 use rlx_ir::graph::{Graph, NodeId};
 use rlx_ir::op::MaskKind;
+use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Shape};
 use std::collections::HashMap;
 
@@ -98,35 +100,59 @@ fn vision_rope(
 
 /// A `[out, in]` weight + optional `[out]` bias applied to `[n, in]`.
 fn linear(
-    g: &mut Graph,
-    params: &mut HashMap<String, Vec<f32>>,
-    weights: &mut dyn WeightLoader,
+    ctx: &mut Ctx<'_>,
     key: &str,
     x: NodeId,
     n: usize,
     out: usize,
     bias: bool,
 ) -> Result<NodeId> {
-    let w = load_p(g, params, weights, &format!("{key}.weight"), true)?;
-    let mut y = g.mm(x, w);
+    let w = ctx.param(&format!("{key}.weight"), true)?;
+    let mut y = ctx.g.mm(x, w);
     if bias {
-        let b = load_p(g, params, weights, &format!("{key}.bias"), false)?;
-        let b2 = g.reshape_(b, vec![1, out as i64]);
-        y = g.add(y, b2);
+        let b = ctx.param(&format!("{key}.bias"), false)?;
+        let b2 = ctx.g.reshape_(b, vec![1, out as i64]);
+        y = ctx.g.add(y, b2);
     }
-    Ok(g.reshape_(y, vec![n as i64, out as i64]))
+    Ok(ctx.g.reshape_(y, vec![n as i64, out as i64]))
 }
 
-/// Encode one image: `patches [n_h·n_w, 3·patch·patch]` → language-model
-/// embeddings `[n_tokens, dim]`, where `n_tokens = ceil(n_h/r) · ceil(n_w/r)`.
+/// Build the vision tower as its own graph: one image's patches in, language-model
+/// embeddings out.
 ///
-/// `patches` must already be flattened per patch, in row-major grid order — the
-/// reference's `PatchEmbed` does `proj(x.flatten(1))` on an `[N, 3, p, p]` stack,
-/// which is the same memory.
+/// The single input is `patches [n_h·n_w, 3·patch·patch]`, flattened per patch in
+/// row-major grid order — the reference's `PatchEmbed` does `proj(x.flatten(1))`
+/// on an `[N, 3, p, p]` stack, which is the same memory. The output is
+/// `[n_tokens, dim]` with `n_tokens = ceil(n_h/r) · ceil(n_w/r)`, which the
+/// caller splices into the `IMAGE` slots of the prompt.
+///
+/// It is a separate graph from the text stack because it runs separately: one
+/// image at a time, whatever the prompt length.
 pub fn build_v41_vision(
-    g: &mut Graph,
-    params: &mut HashMap<String, Vec<f32>>,
+    spec: &DeepseekV41Spec,
     weights: &mut dyn WeightLoader,
+    n_h: usize,
+    n_w: usize,
+    packed: &mut HashMap<String, (Vec<u8>, QuantScheme, Vec<usize>)>,
+) -> Result<(Graph, HashMap<String, Vec<f32>>)> {
+    let vs = spec
+        .vision
+        .clone()
+        .ok_or_else(|| anyhow!("deepseek_v41: this checkpoint has no vision tower"))?;
+    let lm_dim = spec.dim;
+    let mut ctx = Ctx::new("deepseek_v41_vision", spec, weights, packed, n_h * n_w);
+    let patches = ctx.g.input(
+        "patches",
+        Shape::new(&[n_h * n_w, 3 * vs.patch_size * vs.patch_size], DType::F32),
+    );
+    let out = build_tower(&mut ctx, &vs, lm_dim, patches, n_h, n_w)?;
+    Ok(ctx.finish(vec![out]))
+}
+
+/// The tower proper, on a caller-supplied graph: `patches` in, aligned language
+/// embeddings out.
+fn build_tower(
+    ctx: &mut Ctx<'_>,
     spec: &VisionSpec,
     lm_dim: usize,
     patches: NodeId,
@@ -145,32 +171,30 @@ pub fn build_v41_vision(
     let head_dim = vd / spec.n_heads;
     let rope_dim = head_dim / 2;
     let eps = VISION_NORM_EPS;
-    let zb = synth_zero(g, params, "v41.vit.zb", vd);
+    let zb = ctx.zero_bias("v41.vit.zb", vd);
 
-    let mut x = linear(
-        g,
-        params,
-        weights,
-        "vision.patch_embed.proj",
-        patches,
-        n,
-        vd,
-        true,
-    )?;
-    let (cos, sin) = vision_rope_tables(g, params, n_h, n_w, rope_dim, spec.rope_theta);
+    let mut x = linear(ctx, "vision.patch_embed.proj", patches, n, vd, true)?;
+    let (cos, sin) = vision_rope_tables(
+        &mut ctx.g,
+        &mut ctx.params,
+        n_h,
+        n_w,
+        rope_dim,
+        spec.rope_theta,
+    );
 
     for il in 0..spec.n_layers {
         let bp = format!("vision.blocks.{il}");
-        let n1 = load_norm(g, params, weights, &format!("{bp}.norm1.weight"), 0.0)?;
-        let h = g.rms_norm(x, n1, zb, eps);
-        let qkv = linear(g, params, weights, &format!("{bp}.attn.wqkv"), h, n, 3 * vd, true)?;
-        let q = g.narrow_(qkv, 1, 0, vd);
-        let k = g.narrow_(qkv, 1, vd, vd);
-        let v = g.narrow_(qkv, 1, 2 * vd, vd);
-        let q = vision_rope(g, q, cos, sin, n, spec.n_heads, head_dim);
-        let k = vision_rope(g, k, cos, sin, n, spec.n_heads, head_dim);
+        let n1 = ctx.norm(&format!("{bp}.norm1.weight"))?;
+        let h = ctx.g.rms_norm(x, n1, zb, eps);
+        let qkv = linear(ctx, &format!("{bp}.attn.wqkv"), h, n, 3 * vd, true)?;
+        let q = ctx.g.narrow_(qkv, 1, 0, vd);
+        let k = ctx.g.narrow_(qkv, 1, vd, vd);
+        let v = ctx.g.narrow_(qkv, 1, 2 * vd, vd);
+        let q = vision_rope(&mut ctx.g, q, cos, sin, n, spec.n_heads, head_dim);
+        let k = vision_rope(&mut ctx.g, k, cos, sin, n, spec.n_heads, head_dim);
         // full bidirectional attention over the single image's patches
-        let attn = g.attention_kind(
+        let attn = ctx.g.attention_kind(
             q,
             k,
             v,
@@ -179,33 +203,31 @@ pub fn build_v41_vision(
             MaskKind::None,
             Shape::new(&[n, vd], DType::F32),
         );
-        let o = linear(g, params, weights, &format!("{bp}.attn.wo"), attn, n, vd, true)?;
-        x = g.add(x, o);
+        let o = linear(ctx, &format!("{bp}.attn.wo"), attn, n, vd, true)?;
+        x = ctx.g.add(x, o);
 
-        let n2 = load_norm(g, params, weights, &format!("{bp}.norm2.weight"), 0.0)?;
-        let h = g.rms_norm(x, n2, zb, eps);
+        let n2 = ctx.norm(&format!("{bp}.norm2.weight"))?;
+        let h = ctx.g.rms_norm(x, n2, zb, eps);
         // w1 emits gate and up fused: [2·inter, dim]
         let gu = linear(
-            g,
-            params,
-            weights,
+            ctx,
             &format!("{bp}.mlp.w1"),
             h,
             n,
             2 * spec.inter_dim,
             false,
         )?;
-        let gate = g.narrow_(gu, 1, 0, spec.inter_dim);
-        let up = g.narrow_(gu, 1, spec.inter_dim, spec.inter_dim);
-        let act = g.silu(gate);
-        let glu = g.mul(act, up);
-        let down = linear(g, params, weights, &format!("{bp}.mlp.w2"), glu, n, vd, false)?;
-        x = g.add(x, down);
+        let gate = ctx.g.narrow_(gu, 1, 0, spec.inter_dim);
+        let up = ctx.g.narrow_(gu, 1, spec.inter_dim, spec.inter_dim);
+        let act = ctx.g.silu(gate);
+        let glu = ctx.g.mul(act, up);
+        let down = linear(ctx, &format!("{bp}.mlp.w2"), glu, n, vd, false)?;
+        x = ctx.g.add(x, down);
     }
-    let nf = load_norm(g, params, weights, "vision.norm.weight", 0.0)?;
-    let x = g.rms_norm(x, nf, zb, eps);
+    let nf = ctx.norm("vision.norm.weight")?;
+    let x = ctx.g.rms_norm(x, nf, zb, eps);
 
-    build_v41_aligner(g, params, weights, spec, lm_dim, x, n_h, n_w)
+    build_v41_aligner(ctx, spec, lm_dim, x, n_h, n_w)
 }
 
 /// The aligner: fold each `r × r` patch neighbourhood into one token, then a
@@ -215,11 +237,8 @@ pub fn build_v41_vision(
 /// (`F.pad(x, (0, -n_w % r, 0, -n_h % r))`), and the unfold lays each block out
 /// **channel-major then row-major within the block**, which is what
 /// `F.unfold`'s `[C·r·r, L]` ordering means.
-#[allow(clippy::too_many_arguments)]
-pub fn build_v41_aligner(
-    g: &mut Graph,
-    params: &mut HashMap<String, Vec<f32>>,
-    weights: &mut dyn WeightLoader,
+fn build_v41_aligner(
+    ctx: &mut Ctx<'_>,
     spec: &VisionSpec,
     lm_dim: usize,
     x: NodeId, // [n_h·n_w, vision_dim]
@@ -237,18 +256,18 @@ pub fn build_v41_aligner(
     // (block, c·r·r + dy·r + dx) reads patch (by·r+dy, bx·r+dx), channel c.
     let padded = if ph != n_h || pw != n_w {
         // build a [ph·pw, vd] grid: real rows where inside, zero row otherwise
-        let zero = synth_const(g, params, "v41.aligner.zero", vec![0f32; vd], &[1, vd]);
+        let zero = ctx.konst("v41.aligner.zero", vec![0f32; vd], &[1, vd]);
         let mut rows: Vec<NodeId> = Vec::with_capacity(ph * pw);
         for y in 0..ph {
             for xx in 0..pw {
                 rows.push(if y < n_h && xx < n_w {
-                    g.narrow_(x, 0, y * n_w + xx, 1)
+                    ctx.g.narrow_(x, 0, y * n_w + xx, 1)
                 } else {
                     zero
                 });
             }
         }
-        g.concat_(rows, 0)
+        ctx.g.concat_(rows, 0)
     } else {
         x
     };
@@ -260,19 +279,21 @@ pub fn build_v41_aligner(
             for dy in 0..r {
                 for dx in 0..r {
                     let src = (by * r + dy) * pw + (bx * r + dx);
-                    picks.push(g.narrow_(padded, 0, src, 1));
+                    picks.push(ctx.g.narrow_(padded, 0, src, 1));
                 }
             }
         }
     }
-    let gathered = g.concat_(picks, 0); // [tokens·r·r, vd]
-    let g3 = g.reshape_(gathered, vec![tokens as i64, (r * r) as i64, vd as i64]);
-    let g3 = g.transpose_(g3, vec![0, 2, 1]); // [tokens, vd, r·r] — channel-major
-    let flat = g.reshape_(g3, vec![tokens as i64, in_dim as i64]);
+    let gathered = ctx.g.concat_(picks, 0); // [tokens·r·r, vd]
+    let g3 = ctx
+        .g
+        .reshape_(gathered, vec![tokens as i64, (r * r) as i64, vd as i64]);
+    let g3 = ctx.g.transpose_(g3, vec![0, 2, 1]); // [tokens, vd, r·r] — channel-major
+    let flat = ctx.g.reshape_(g3, vec![tokens as i64, in_dim as i64]);
 
-    let h = linear(g, params, weights, "aligner.w1", flat, tokens, lm_dim, true)?;
-    let h = g.gelu(h);
-    linear(g, params, weights, "aligner.w2", h, tokens, lm_dim, true)
+    let h = linear(ctx, "aligner.w1", flat, tokens, lm_dim, true)?;
+    let h = ctx.g.gelu(h);
+    linear(ctx, "aligner.w2", h, tokens, lm_dim, true)
 }
 
 #[cfg(test)]
@@ -300,4 +321,116 @@ mod tests {
         assert!((p10[0] - 1f32.cos()).abs() < 1e-5);
         assert!((p10[2] - 1.0).abs() < 1e-6 && (p10[3] - 1.0).abs() < 1e-6);
     }
+}
+
+/// What an image position is, within an image's span in the prompt.
+///
+/// Every one of these carries `image_token_id` in `input_ids` — only the type
+/// tells them apart, and only [`ImageTokenType::Image`] slots receive aligner
+/// rows. The other three take learned embeddings (`image_start`, `image_end`,
+/// `image_newline`), which is why splicing a flat run of aligner output across
+/// the span is wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageTokenType {
+    Start,
+    Image,
+    NewLine,
+    End,
+}
+
+/// The span layout for an `n_llm_h × n_llm_w` token grid:
+/// `START + (IMAGE × n_llm_w + NEWLINE) × n_llm_h + END`.
+pub fn image_token_types(n_llm_h: usize, n_llm_w: usize) -> Vec<ImageTokenType> {
+    let mut t = Vec::with_capacity(num_image_tokens(n_llm_h, n_llm_w));
+    t.push(ImageTokenType::Start);
+    for _ in 0..n_llm_h {
+        t.extend(std::iter::repeat_n(ImageTokenType::Image, n_llm_w));
+        t.push(ImageTokenType::NewLine);
+    }
+    t.push(ImageTokenType::End);
+    t
+}
+
+/// Prompt positions one image occupies — one per aligner token, plus a newline
+/// per row, plus the two delimiters.
+pub fn num_image_tokens(n_llm_h: usize, n_llm_w: usize) -> usize {
+    n_llm_h * (n_llm_w + 1) + 2
+}
+
+/// The token grid the aligner produces from a pixel size.
+fn llm_grid(best_h: usize, best_w: usize, patch: usize, ratio: usize) -> (usize, usize) {
+    (
+        (best_h / patch).div_ceil(ratio),
+        (best_w / patch).div_ceil(ratio),
+    )
+}
+
+/// The largest aspect-preserving pixel size whose token grid still fits in
+/// `max_n_token`.
+///
+/// The two degenerate branches matter: an image tall or wide enough that one
+/// side would round below a single cell collapses to one column or one row,
+/// rather than producing an empty grid.
+fn solve_resize_ratio(
+    height: f64,
+    width: f64,
+    patch: usize,
+    ratio: usize,
+    max_n_token: usize,
+) -> (usize, usize) {
+    let cell = patch * ratio;
+    let r = height / width;
+    let max_w = ((max_n_token as f64 - 2.0) / r + 0.25).sqrt() - 0.5;
+    let max_h = max_w * r;
+    if max_w < 1.0 {
+        return ((max_n_token - 2) / 2 * cell, cell);
+    }
+    if max_h < 1.0 {
+        return (cell, (max_n_token - 3) * cell);
+    }
+    let beta = (max_w.floor() * cell as f64 / width).min(max_h.floor() * cell as f64 / height);
+    (
+        (height * beta / patch as f64).floor() as usize * patch,
+        (width * beta / patch as f64).floor() as usize * patch,
+    )
+}
+
+/// The resize plan for an image of a given original size: `(n_llm_h, n_llm_w,
+/// best_height, best_width)`.
+///
+/// A pure function of the size and five config values, mirroring
+/// `image_processor.plan_image_grid`. The order of the adjustments is
+/// load-bearing: the aspect cap narrows the image *before* the `min_pixels`
+/// floor scales it back up, so swapping them changes the grid for any wide image
+/// below the floor.
+pub fn plan_image_grid(
+    spec: &VisionSpec,
+    width: usize,
+    height: usize,
+) -> (usize, usize, usize, usize) {
+    let p = spec.patch_size.max(1);
+    let ratio = spec.downsample_ratio.max(1);
+    let mut w = width as f64;
+    let mut h = height as f64;
+    if let Some(cap) = spec.max_wh_ratio
+        && w > h * cap
+    {
+        w = h * cap;
+    }
+    let area = w * h;
+    if area > 0.0 && area < spec.min_pixels as f64 {
+        let r = (spec.min_pixels as f64 / area).sqrt();
+        // the reference truncates here; rounding instead shifts the grid
+        w = (w * r).trunc();
+        h = (h * r).trunc();
+    }
+    let mut best_w = (w / p as f64).ceil() as usize * p;
+    let mut best_h = (h / p as f64).ceil() as usize * p;
+    let (mut n_h, mut n_w) = llm_grid(best_h, best_w, p, ratio);
+    if num_image_tokens(n_h, n_w) > spec.max_n_token {
+        let (bh, bw) = solve_resize_ratio(h, w, p, ratio, spec.max_n_token);
+        (best_h, best_w) = (bh, bw);
+        (n_h, n_w) = llm_grid(best_h, best_w, p, ratio);
+    }
+    (n_h, n_w, best_h, best_w)
 }

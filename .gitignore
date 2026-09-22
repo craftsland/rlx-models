@@ -21,6 +21,10 @@ context_bench_out/
 # disk (see `just fetch-*`). Belt-and-suspenders so a stray local copy in-tree
 # is never committed. (No .gguf fixtures are tracked.)
 *.gguf
+# ...except committed test fixtures. These are tiny, header-only GGUFs that
+# tests read at runtime; the `*.gguf` net above would drop them from a fresh
+# clone and the tests would fail with a missing file rather than a skip.
+!crates/*/tests/fixtures/*.gguf
 # Centralized TTS weights (downloaded + generated) — staged for a standalone
 # Hugging Face weights repo; never committed to the main repo.
 /weights/tts/
@@ -118,10 +122,28 @@ crates/rlx-whisper/fixtures/
 !crates/rlx-tada/tests/fixtures/*.json
 !crates/rlx-glm5next/tests/fixtures/*.json
 !crates/rlx-chatterbox/tests/fixtures/*.json
+
+# Same class, but excluded by a *directory* rule (`crates/*/weights/`,
+# `crates/rlx-whisper/fixtures/`) rather than a glob. Git never descends into an
+# excluded directory, so a bare file negation cannot re-include these — the
+# directory has to be re-included first, its contents re-excluded, then the one
+# baked asset allowed back. All three are compile-time `include_bytes!`/
+# `include_str!` inputs of a *library* (not just a test), so without them
+# rlx-ten-vad, rlx-ten-vad-core and the whisper DTW test do not build at all on a
+# fresh clone. 305 KB / 150 KB / 256 B — far under the 10 MiB .crate cap.
+!crates/rlx-ten-vad-core/weights/
+crates/rlx-ten-vad-core/weights/*
+!crates/rlx-ten-vad-core/weights/ten_vad.safetensors
+!crates/rlx-ten-vad-core/weights/ten_vad_q15.bin
+!crates/rlx-models/tests/fixtures/jfk_words_dtw.json
 # DeepSeek-V4.1 parity fixtures: the reference is a 510GB checkpoint and the
 # harness that produced these needs torch, so they are not regenerable from the
 # repo — `tests/dsv41_reference_parity.rs` does not run without them.
 !crates/rlx-models-core/tests/fixtures/dsv41_*.json
+# jina-ocr-v1 tensor inventory: read from the published safetensors headers over
+# HTTP range requests, so it is not regenerable offline and the 6.7 GB
+# checkpoint is never needed to check key names/shapes. Baked via include_str!.
+!crates/rlx-jina-ocr/tests/fixtures/*.json
 
 # 8 MB TADA end-to-end reference; regenerate locally rather than shipping it in
 # the published crate (the small per-stage fixtures next to it are tracked).

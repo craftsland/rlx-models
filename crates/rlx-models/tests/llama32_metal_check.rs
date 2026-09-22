@@ -49,6 +49,10 @@ mod metal_tests {
             rope_style: rlx_ir::RopeStyle::NeoX,
             gguf_arch: None,
             rope_dim: None,
+            // Plain full-causal attention, no Gemma-style softcap.
+            sliding_window: None,
+            sliding_window_pattern: None,
+            final_logit_softcap: None,
         }
     }
 
@@ -114,19 +118,30 @@ mod metal_tests {
         WeightMap::from_tensors(t)
     }
 
-    #[test]
-    fn llama32_tiny_graph_runs_on_metal() {
+    /// Build and run the tiny graph on `device`, returning last-token logits.
+    fn run(device: Device) -> Vec<f32> {
         let cfg = tiny_cfg();
         let mut wm = synthetic_weights(&cfg);
         let (graph, params) =
             build_llama32_graph_sized(&cfg, &mut wm, 1, 4, true, false).expect("build");
         let mut compiled =
-            super::compile_support::compile_llama32_prefill(Device::Metal, graph, params.clone());
+            super::compile_support::compile_llama32_prefill(device, graph, params.clone());
 
         let ids = vec![1.0f32, 2.0, 3.0, 4.0];
         let last_token_idx = vec![3.0f32];
         let outs = compiled.run(&[("input_ids", &ids), ("last_token_idx", &last_token_idx)]);
-        assert!(!outs.is_empty());
-        assert!(outs[0].iter().all(|v| v.is_finite()));
+        outs[0].clone()
+    }
+
+    /// The metal result must equal CPU's, not merely be finite.
+    ///
+    /// This test used to assert only that the logits were finite, which is a
+    /// bar that a lowering emitting almost all zeros still clears. Comparing
+    /// against CPU is what actually exercises the backend.
+    #[test]
+    fn llama32_tiny_graph_matches_cpu_on_metal() {
+        let cpu = run(Device::Cpu);
+        let dev = run(Device::Metal);
+        super::compile_support::assert_matches_cpu("metal", &cpu, &dev, 0.002);
     }
 }

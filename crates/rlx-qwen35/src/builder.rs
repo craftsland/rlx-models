@@ -46,6 +46,7 @@
 //! for large models (e.g. Qwen3.6-27B Q4_K_M: ~16 GB packed vs ~65 GB F32).
 
 use crate::config::{Qwen35Config, mtp_draft_vocab_size};
+use crate::prism_hadamard::HadamardFold;
 use crate::rope;
 use crate::weights::{
     MatWeight, Proj, Qwen35FullAttnLayer, Qwen35LayerFfn, Qwen35LinearLayer, Qwen35MoeFfn,
@@ -53,7 +54,7 @@ use crate::weights::{
 };
 use anyhow::{Result, anyhow};
 use rlx_ir::dynamic::sym;
-use rlx_ir::hir::{FusionPolicy, HirGraphExt, HirModule, HirMut, HirNodeId};
+use rlx_ir::hir::{FusionPolicy, HirGraphExt, HirModule, HirMut, HirNodeId, HirOp};
 use rlx_ir::op::{Activation, MaskKind};
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::shape::Dim;
@@ -183,6 +184,20 @@ impl BsLayout {
 pub(crate) struct LinearRecurrentIo {
     pub conv_state: NodeId,
     pub ssm_state: NodeId,
+    /// `[batch, seq]`, 1.0 at positions that are prompt padding.
+    ///
+    /// A GatedDeltaNet layer is a recurrent scan, so — unlike attention,
+    /// which masks padding out and reads its logits at the last real
+    /// position — every padded position still advances the state. The
+    /// exported state would then describe the prompt *plus* a run of pad
+    /// tokens, and decode would resume from a context prefill never saw.
+    /// `None` for graphs with nothing to pad (decode, `seq == 1`).
+    ///
+    /// Polarity is "pad", not "keep", on purpose: an unbound input reads
+    /// zeros, which here means "nothing is padding" — the previous
+    /// behaviour — rather than "everything is padding", which would
+    /// silently zero the whole scan.
+    pub pad_mask: Option<NodeId>,
 }
 
 /// KV cache wiring for full-attention layers.
@@ -977,10 +992,10 @@ fn build_qwen35_hir_fallback_assembled(
     prefill_from_hidden: bool,
 ) -> Result<(HirModule, HashMap<String, Vec<f32>>, PackedParams)> {
     let n_embd = cfg.hidden_size;
-    let n_vocab = if weights.token_embd.is_empty() {
+    let n_vocab = if weights.embd_elems() == 0 {
         cfg.vocab_size
     } else {
-        weights.token_embd.len() / n_embd
+        weights.embd_elems() / n_embd
     };
     if n_vocab == 0 {
         return Err(anyhow!("qwen35: vocab_size could not be inferred"));
@@ -1055,7 +1070,7 @@ fn build_qwen35_hir_fallback_assembled(
             &mut g,
             &mut params,
             "token_embd.weight",
-            weights.token_embd.to_vec(),
+            weights.token_embd().to_vec(),
             Shape::new(&[n_vocab, n_embd], DType::F32),
         );
 
@@ -1064,14 +1079,14 @@ fn build_qwen35_hir_fallback_assembled(
     };
 
     if prefill_from_hidden {
-        if weights.token_embd.is_empty() {
+        if weights.embd_elems() == 0 {
             return Err(anyhow!("qwen35: prefill_from_hidden requires token_embd"));
         }
         register_param(
             &mut g,
             &mut params,
             "token_embd.weight",
-            weights.token_embd.to_vec(),
+            weights.token_embd().to_vec(),
             Shape::new(&[n_vocab, n_embd], DType::F32),
         );
     }
@@ -1128,6 +1143,7 @@ fn build_qwen35_hir_fallback_assembled(
                     Some(LinearRecurrentIo {
                         conv_state,
                         ssm_state,
+                        pad_mask: None,
                     })
                 } else {
                     None
@@ -1266,6 +1282,12 @@ fn build_qwen35_hir_fallback_assembled(
         let logit_shape = Shape::new(&[batch, logit_rows, n_vocab], DType::F32);
         let logits = match &weights.output {
             Some(w) => {
+                // The LM head is a `prism.hadamard`-folded weight on
+                // Ternary Bonsai 2, so the final hidden is rotated here.
+                let h_in = match &weights.output_fold {
+                    Some(f) => emit_hadamard(&mut g, &mut params, h_logits_in, n_embd, f),
+                    None => h_logits_in,
+                };
                 let head = proj_mat(
                     &mut g,
                     &mut params,
@@ -1275,7 +1297,7 @@ fn build_qwen35_hir_fallback_assembled(
                     n_embd,
                     n_vocab,
                 );
-                emit_proj(&mut g, h_logits_in, head, w, logit_shape)
+                emit_proj(&mut g, h_in, head, w, logit_shape)
             }
             None => {
                 if let Some(w) = &weights.token_embd_lm {
@@ -1290,7 +1312,7 @@ fn build_qwen35_hir_fallback_assembled(
                     );
                     emit_proj(&mut g, h_logits_in, head, w, logit_shape)
                 } else {
-                    let embed_t = transpose_2d(&weights.token_embd, n_vocab, n_embd);
+                    let embed_t = transpose_2d(weights.token_embd(), n_vocab, n_embd);
                     let tied = register_param(
                         &mut g,
                         &mut params,
@@ -1323,7 +1345,7 @@ fn build_qwen35_hir_fallback_assembled(
             seq,
             input_ids.ok_or_else(|| anyhow!("qwen35: MTP head requires input_ids"))?,
             h_pre_norm,
-            &weights.token_embd,
+            weights.token_embd(),
             n_vocab,
             cos_id,
             sin_id,
@@ -1417,8 +1439,21 @@ pub(crate) fn emit_qwen35_gather_last_token(
 }
 
 fn gather_last_token(g: &mut HirMut, h: NodeId, batch: usize, last_token_idx: NodeId) -> NodeId {
+    let hidden = {
+        let dims = g.shape(h).dims();
+        dims[dims.len() - 1].unwrap_static()
+    };
     let idx_2d = g.reshape_(last_token_idx, vec![batch as i64, 1]);
-    g.gather_(h, idx_2d, 1)
+    let gathered = g.gather_(h, idx_2d, 1);
+    // ONNX `Gather` splices the index's own shape into the output, so a rank-2
+    // index on a rank-3 hidden yields rank 4: `[batch, 1, 1, hidden]`. Element
+    // count and values are right, so CPU reads it back correctly and this looks
+    // fine — but the LM head downstream declares `[batch, 1, vocab]`, and a
+    // backend that sizes its write from the declared rank fills only part of
+    // the buffer. On MLX that returned all-zero logits for every prompt whose
+    // last token was not at index 0. Squeeze the spurious unit axis so the
+    // node's real shape is the one the rest of the graph assumes.
+    g.reshape_(gathered, vec![batch as i64, 1, hidden as i64])
 }
 
 fn linear_conv_channels(cfg: &Qwen35Config) -> usize {
@@ -1587,6 +1622,21 @@ pub(crate) fn build_linear_layer(
     let alpha_softplus = softplus(g, alpha_biased);
     let gate_g = g.mul(ssm_a_p, alpha_softplus);
 
+    // Neutralize prompt padding before the scan: the recurrence is
+    // `S *= exp(g); S += k ⊗ ((v − Sᵀk)·β)`, so a step is an exact no-op
+    // when `g == 0` and `β == 0`. Multiplying both by `keep` gives that,
+    // which leaves the exported state equal to the state after the last
+    // real token — what decode has to resume from.
+    let (gate_g, beta) = match recurrent.and_then(|r| r.pad_mask) {
+        Some(pad) => {
+            let one = scalar_const(g, 1.0);
+            let keep = g.sub(one, pad);
+            let keep = bs.reshape_flat(g, keep, 1);
+            (g.mul(keep, gate_g), g.mul(keep, beta))
+        }
+        None => (gate_g, beta),
+    };
+
     // Reshape gate/beta to [batch, seq, n_v_heads] for the
     // GatedDeltaNet kernel signature.
     let gate_g_3d = bs.reshape_bsh(g, gate_g, n_v_heads);
@@ -1622,8 +1672,38 @@ pub(crate) fn build_linear_layer(
                 k_conv,
             )?
         };
-        // Template bakes max_seq; `sync_narrow_ops` reclamps after dim bind.
-        let new_conv = g.narrow_(padded, 1, seq, k_conv - 1);
+        // Export the short-conv window for the next decode step.
+        //
+        // The obvious `narrow(padded, 1, seq, k-1)` takes the LAST k-1
+        // positions, which is right only when the prompt fills the compiled
+        // extent. The prefill-cache graph is built once at `max_seq` and
+        // shorter prompts are padded up to it, so those last positions are
+        // padding and decode would resume its conv from tokens the prompt
+        // never contained. Gather the window ending at the last real token
+        // instead: `gdn_conv_shift_l{il}` carries `prompt_len - seq` (≤ 0),
+        // so an unbound input reads 0 and reproduces the old narrow exactly.
+        let new_conv = if seq > 1 {
+            let base: Vec<f32> = (0..k_conv - 1).map(|j| (seq + j) as f32).collect();
+            let base_id = register_param(
+                g,
+                params,
+                &name(il, "gdn_conv_window_base"),
+                base,
+                Shape::new(&[1, k_conv - 1], DType::F32),
+            );
+            let shift = g.input(
+                format!("gdn_conv_shift_l{il}"),
+                Shape::new(&[batch, 1], DType::F32),
+            );
+            let idx = g.add(base_id, shift);
+            let w = g.gather_(padded, idx, 1);
+            g.reshape_(
+                w,
+                vec![batch as i64, (k_conv - 1) as i64, conv_channels as i64],
+            )
+        } else {
+            g.narrow_(padded, 1, seq, k_conv - 1)
+        };
         recur_out.push(new_conv);
         // SSM state is exported after GatedDeltaNet below (must run after the
         // in-place carry update — see materialize there).
@@ -2570,7 +2650,19 @@ fn build_moe_ffn(
         vec![probs],
         Shape::new(&[rows, top_k], DType::F32),
     );
-    let top_probs_2d = g.gather_(probs, top_idx_2d, 1);
+    // Per-row gather of each token's own top-k probabilities. Not `gather_`,
+    // which is ONNX Gather and applies every row's index list to every row:
+    // `[rows, experts]` x `[rows, k]` comes back `[rows, rows, k]`. The
+    // `narrow` + `reshape([rows, 1])` below then reinterpreted a `rows*k`
+    // buffer as `rows`, so each token was scaled by some other token's routing
+    // probability. The expert *indices* were unaffected, so every MoE layer
+    // stayed finite and plausible — the same defect this workspace already
+    // fixed in `rlx-unlimited-ocr`'s router.
+    let top_probs_2d = g.add_node(
+        Op::GatherElements { axis: 1 },
+        vec![probs, top_idx_2d],
+        Shape::new(&[rows, top_k], DType::F32),
+    );
 
     let (gate_w, gate_src) = expert_mat_param(
         g,
@@ -3211,9 +3303,8 @@ fn per_head_rms(
     g.reshape_(n, bs.bsh(heads * head_dim).to_vec())
 }
 
-/// Repeat each head `factor` times along the head axis (axis = 2,
-/// for a [b, s, h, d] tensor). Concatenates `factor` narrows for
-/// each source head.
+/// Repeat the head block `factor` times along the head axis (axis = 2,
+/// for a `[b, s, h, d]` tensor).
 fn repeat_heads(
     g: &mut HirMut,
     x: NodeId,
@@ -3228,12 +3319,15 @@ fn repeat_heads(
     // kv-head `h % n_k_heads` — matching ggml/llama.cpp. (Interleave
     // `[h0,h0,h0,h1,…]` = `h / factor` is WRONG: it agrees only for v-heads 0 and
     // 47 by coincidence and flips the sign of every middle head's GDN output.)
-    let mut pieces = Vec::with_capacity(in_heads * factor);
-    for _ in 0..factor {
-        for h in 0..in_heads {
-            pieces.push(g.narrow_(x, 2, h, 1));
-        }
-    }
+    //
+    // Because the repeat tiles the WHOLE block, the inner run of per-head
+    // narrows just reconstructs `x`: the concat is `[x, x, x]`. Building it
+    // from `in_heads * factor` single-head slices instead made every GDN
+    // layer's q and k a 48-input concat — 96 of the decode graph's 144
+    // concats, and concat was 116 ms of the 857 ms summed GPU span. Same
+    // tensor, `factor` pieces instead of `in_heads * factor`.
+    let _ = in_heads;
+    let pieces = vec![x; factor];
     g.concat_(pieces, 2)
 }
 
@@ -3320,6 +3414,131 @@ fn emit_proj(
     }
 }
 
+/// Register `name` once per graph, returning the same node on repeat calls.
+///
+/// [`param`] mints a fresh leaf every call, and CSE only value-numbers
+/// *interior* nodes — two `Op::Param`s can share a name and shape yet
+/// denote different values, so they are deliberately never merged. The
+/// Hadamard rotation is one 4 MB matrix shared by all 401 folded
+/// weights of the 27B, and the transform chains hanging off it only
+/// collapse into one per activation if they are rooted at the *same*
+/// leaf. Hence this lookup.
+fn shared_param(
+    g: &mut HirMut,
+    params: &mut HashMap<String, Vec<f32>>,
+    name: &str,
+    data: impl FnOnce() -> Vec<f32>,
+    shape: &[usize],
+) -> NodeId {
+    if params.contains_key(name) {
+        let existing = g.0.nodes().iter().find_map(|n| match &n.op {
+            HirOp::Param { name: nm } if nm == name => Some(n.id),
+            _ => None,
+        });
+        if let Some(id) = existing {
+            // Reusing a node means the second caller's data is dropped.
+            // That is intended for the rotation and the per-width sign
+            // vectors, which really are shared — but if two callers ever
+            // disagree, silently keeping the first would apply the wrong
+            // transform to every later weight.
+            debug_assert_eq!(
+                params.get(name).map(Vec::as_slice),
+                Some(data().as_slice()),
+                "shared param `{name}` registered twice with different data"
+            );
+            return id;
+        }
+    }
+    register_param(g, params, name, data(), Shape::new(shape, DType::F32))
+}
+
+/// Emit the `prism.hadamard` activation transform for one folded weight.
+///
+/// `x` is `[rows, width]`; the result has the same shape. See
+/// [`crate::prism_hadamard`] for why this is mandatory rather than an
+/// optimization.
+///
+/// The rotation is emitted as a plain `[block, block]` matmul, which is
+/// what llama.cpp's own portable path does (its backends then pattern-
+/// match the hint into a fast Walsh-Hadamard kernel). That costs
+/// `block` MACs per element instead of `log2(block)`; a fused FWHT op
+/// would be the follow-up optimization, but this form is correct on
+/// every backend with no new kernels.
+fn emit_hadamard(
+    g: &mut HirMut,
+    params: &mut HashMap<String, Vec<f32>>,
+    x: NodeId,
+    width: usize,
+    fold: &HadamardFold,
+) -> NodeId {
+    let block = fold.block_size;
+    if rlx_ir::env::flag("RLX_PRISM_TRACE") {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        eprintln!(
+            "[prism.hadamard] #{n} width={width} block={block} signs={} perm={:?}",
+            fold.signs.is_some(),
+            fold.perm
+        );
+    }
+    // Restore the caller's exact rank at the end: this runs on 2-D
+    // `[rows, width]` projections inside a layer but also on the 3-D
+    // `[batch, seq, n_embd]` hidden feeding the LM head, and silently
+    // handing back a flattened tensor would reshape the logits.
+    let restore: Vec<i64> = g
+        .shape(x)
+        .dims()
+        .iter()
+        .map(|d| match d {
+            Dim::Static(n) => *n as i64,
+            Dim::Dynamic(_) => -1,
+        })
+        .collect();
+    let mut cur = x;
+
+    // Tiled -> grouped head order, for the GDN value path only.
+    if let Some(p) = fold.perm {
+        cur = g.reshape_(cur, vec![-1, p.rep as i64, p.nk as i64, p.hd as i64]);
+        cur = g.transpose_(cur, vec![0, 2, 1, 3]);
+        cur = g.reshape_(cur, vec![-1, width as i64]);
+    }
+
+    if let Some(signs) = fold.signs.as_ref() {
+        let s = shared_param(
+            g,
+            params,
+            &format!("prism.hadamard.signs.{width}"),
+            || signs.to_vec(),
+            &[width],
+        );
+        cur = g.mul(s, cur);
+    }
+
+    // Blockwise rotation: fold the feature axis into `[-1, block]` so
+    // each block is one contiguous row, rotate, then restore.
+    //
+    // MEASURED, don't retry: the Sylvester construction factors
+    // (`H_1024 = H_32 ⊗ H_32`), so this can be two 32×32 matmuls over a
+    // `[-1, 32, 32]` view reading 4 KB instead of one 1024×1024 reading
+    // 4 MB. It is exactly equal and it is **slower** — 266 ms/token vs
+    // 231 ms on Bonsai-2 / M4 Pro. The 4 MB rotation stays cached, so the
+    // ~13% this costs is dispatch and small-matmul overhead, which doubling
+    // the dispatch count makes worse. A fused FWHT kernel would help; a
+    // cheaper algebraic rewrite will not.
+    let rot = shared_param(
+        g,
+        params,
+        &format!("prism.hadamard.rot.{block}"),
+        || fold.matrix.to_vec(),
+        &[block, block],
+    );
+    cur = g.reshape_(cur, vec![-1, block as i64]);
+    // H is symmetric, so `x · H` is `(H · xᵀ)ᵀ` and no transpose of the
+    // rotation is needed here.
+    cur = g.mm(cur, rot);
+    g.reshape_(cur, restore)
+}
+
 /// Emit one linear projection, dense or Pestle-factorized, and return
 /// the `[rows, out_dim]` result.
 ///
@@ -3354,6 +3573,11 @@ fn emit_linear(
         Proj::Dense(w) => {
             let node = proj_mat(g, params, packed, name, w, in_dim, out_dim);
             emit_proj(g, input, node, w, bs.flat2_shape(out_dim, DType::F32))
+        }
+        Proj::Folded(f) => {
+            let x = emit_hadamard(g, params, input, in_dim, &f.fold);
+            let node = proj_mat(g, params, packed, name, &f.weight, in_dim, out_dim);
+            emit_proj(g, x, node, &f.weight, bs.flat2_shape(out_dim, DType::F32))
         }
         Proj::Pestle(f) => {
             let pre = param(
@@ -3411,7 +3635,7 @@ fn emit_linear(
 /// a second factorized path that nothing exercises.
 fn dense_only<'a>(proj: &'a Proj, what: &str) -> &'a MatWeight {
     proj.dense().unwrap_or_else(|| {
-        panic!("{what}: Pestle-factorized projections are not supported on this path")
+        panic!("{what}: Pestle-factorized and Hadamard-folded projections are not supported on this path")
     })
 }
 
@@ -3554,6 +3778,7 @@ pub fn emit_qwen35_decode_trunk_layer(
             let recurrent = LinearRecurrentIo {
                 conv_state,
                 ssm_state,
+                pad_mask: None,
             };
             build_linear_layer(
                 g,
@@ -3662,9 +3887,17 @@ pub fn emit_qwen35_prefill_cache_trunk_layer(
                 format!("ssm_state_l{il}"),
                 Shape::new(&[batch, n_v_heads, n_state, n_state], DType::F32),
             );
+            // Only prefill can carry padding; a 1-token step cannot.
+            let pad_mask = (bs.seq > 1).then(|| {
+                g.input(
+                    format!("gdn_pad_l{il}"),
+                    Shape::new(&[batch, bs.seq], DType::F32),
+                )
+            });
             let recurrent = LinearRecurrentIo {
                 conv_state,
                 ssm_state,
+                pad_mask,
             };
             build_linear_layer(
                 g,
@@ -3818,10 +4051,10 @@ pub fn emit_qwen35_prefill_tail(
     last_token_idx: Option<HirNodeId>,
 ) -> Result<(Option<HirNodeId>, Option<HirNodeId>, Option<HirNodeId>)> {
     let n_embd = cfg.hidden_size;
-    let n_vocab = if weights.token_embd.is_empty() {
+    let n_vocab = if weights.embd_elems() == 0 {
         cfg.vocab_size
     } else {
-        weights.token_embd.len() / n_embd
+        weights.embd_elems() / n_embd
     };
     let head_dim = cfg.key_length;
     let n_rot = cfg.rope_dim_count;
@@ -3842,15 +4075,19 @@ pub fn emit_qwen35_prefill_tail(
         let logit_shape = Shape::new(&[batch, logit_rows, n_vocab], DType::F32);
         let lm = match &weights.output {
             Some(w) => {
+                let h_in = match &weights.output_fold {
+                    Some(f) => emit_hadamard(g, params, h_norm, n_embd, f),
+                    None => h_norm,
+                };
                 let head = proj_mat(g, params, packed, "output.weight", w, n_embd, n_vocab);
-                emit_proj(g, h_norm, head, w, logit_shape)
+                emit_proj(g, h_in, head, w, logit_shape)
             }
             None => {
                 if let Some(w) = &weights.token_embd_lm {
                     let head = proj_mat(g, params, packed, "lm_head.tied_t", w, n_embd, n_vocab);
                     emit_proj(g, h_norm, head, w, logit_shape)
                 } else {
-                    let embed_t = transpose_2d(&weights.token_embd, n_vocab, n_embd);
+                    let embed_t = transpose_2d(weights.token_embd(), n_vocab, n_embd);
                     let tied = register_param(
                         g,
                         params,
@@ -3862,10 +4099,27 @@ pub fn emit_qwen35_prefill_tail(
                 }
             }
         };
-        logits = Some(if let Some(idx) = last_token_idx {
-            gather_last_token(g, lm, batch, idx)
-        } else {
-            lm
+        logits = Some(match last_token_idx {
+            // Only gather if the projection really has a row per token.
+            //
+            // `logit_rows` above already assumes the caller narrowed the hidden
+            // whenever `last_token_idx` is present, and every caller does — the
+            // flow runs `gather_last_token_dynamic` before reaching this tail.
+            // So `lm` is normally `[batch, 1, vocab]` and a second gather here
+            // is not merely redundant: it asks for index `seq - 1` along an
+            // axis of length 1. CPU clamps out-of-range indices and returned
+            // the right row by luck; MLX returns zeros. That is why *every*
+            // qwen35 prefill on MLX produced all-zero logits unless the last
+            // token happened to sit at index 0.
+            Some(idx)
+                if g.shape(lm)
+                    .dims()
+                    .get(1)
+                    .is_some_and(|d| d.unwrap_static() > 1) =>
+            {
+                gather_last_token(g, lm, batch, idx)
+            }
+            _ => lm,
         });
     }
 
@@ -3887,7 +4141,7 @@ pub fn emit_qwen35_prefill_tail(
             seq,
             input_ids,
             h_pre_norm,
-            &weights.token_embd,
+            weights.token_embd(),
             n_vocab,
             cos_id,
             sin_id,

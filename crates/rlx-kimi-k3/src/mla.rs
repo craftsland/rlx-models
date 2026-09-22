@@ -43,7 +43,13 @@ impl MlaDims {
 /// to the pad path (for backends whose attention kernel doesn't yet implement
 /// `v_head_dim != head_dim`). The vdim path also shrinks the V KV-cache
 /// (`v_head_dim` vs `qk_head_dim`).
-pub(crate) fn mla_vdim() -> bool {
+/// Whether the V cache is stored at `v_head_dim` rather than `qk` width.
+///
+/// Public because it changes an externally visible shape: a caller threading
+/// its own KV cache has to allocate `num_heads * v_head_dim` for V when this is
+/// on and `num_heads * qk()` when it is off. `decode_full`'s harness sized both
+/// caches at `qk` width and so could not build its decode graph at all.
+pub fn mla_vdim() -> bool {
     std::env::var("RLX_MLA_VDIM")
         .map(|v| v != "0")
         .unwrap_or(true)
