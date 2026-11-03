@@ -1,8 +1,8 @@
-# Local RLX development — patch crates.io 0.2.19 with a sibling checkout.
+# Local RLX development — patch crates.io 0.2.20 with a sibling checkout.
 #
 # Layout (recommended):
 #   rlx-workspace/
-#     rlx/           ← upstream RLX repo (v0.2.19+)
+#     rlx/           ← upstream RLX repo (v0.2.20+)
 #     rlx-models/    ← this repo
 #
 # Enable local RLX:
@@ -12,7 +12,7 @@
 #   rm .cargo/config.toml
 #
 # Rules:
-# - Root Cargo.toml `[workspace.dependencies]` pins `rlx*` at ^0.2.19.
+# - Root Cargo.toml `[workspace.dependencies]` pins `rlx*` at ^0.2.20.
 # - `rlx-distributed` requires rlx-driver 0.2.19+ (`ProcessGroup`, `TcpTransport`, …).
 # - Every crate uses `{ workspace = true }` — no path deps to ../rlx in committed files.
 # - Patches apply only when `.cargo/config.toml` exists (gitignored).
@@ -37,6 +37,7 @@ rlx-gguf = { path = "../rlx/crates/io/rlx-gguf" }
 rlx-pkg = { path = "../rlx/crates/io/rlx-pkg" }
 rlx-nemo = { path = "../rlx/crates/io/rlx-nemo" }
 rlx-torch-ckpt = { path = "../rlx/crates/io/rlx-torch-ckpt" }
+rlx-mcu = { path = "../rlx/crates/backends/rlx-mcu" }
 rlx-text = { path = "../rlx/crates/io/rlx-text" }
 rlx-program = { path = "../rlx/crates/io/rlx-program" }
 rlx-onnx-import = { path = "../rlx/crates/io/rlx-onnx-import" }

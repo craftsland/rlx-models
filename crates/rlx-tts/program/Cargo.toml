@@ -5,7 +5,7 @@
 # outside the workspace.
 [package]
 name = "rlx-tts-program"
-version = "0.2.19"
+version = "0.2.20"
 edition = "2024"
 publish = false
 
@@ -13,9 +13,9 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-rlx-program = "0.2.19"
+rlx-program = "0.2.20"
 # `BnnsAesCtr128`, the stream the runner's `WaveRnnRng::Bnns` draws.
-rlx-ir = "0.2.19"
+rlx-ir = "0.2.20"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"

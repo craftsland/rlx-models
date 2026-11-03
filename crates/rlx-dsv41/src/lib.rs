@@ -8,5 +8,8 @@
 //! ```sh
 //! rlx-dsv41 --model /path/to/DeepSeek-V4.1-Flash --prompt "hello" --paged
 //! ```
+//!
+//! `DeepSeek-V4.1-Flash-1017` (a weights-only update with the same config and
+//! tensor layout) takes the same command with its own directory.
 
 pub mod cli;

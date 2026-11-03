@@ -1,0 +1,63 @@
+# XcodeGen spec for the LFM3-Audio iOS app.
+#
+#   ./run.sh device <device-id>      # Rust library, app, install, self-test
+#   ./run.sh sim                     # the same on the booted simulator
+#
+# run.sh sets LFM3A_TEAM (signing team) and LFM3A_BUNDLE_ID. Weights are
+# not bundled: copy the LM + mmproj GGUFs into the app's Documents folder
+# (Files app, Finder, or `xcrun devicectl device copy to`).
+name: Lfm3Audio
+options:
+  deploymentTarget:
+    iOS: "17.0"
+settings:
+  base:
+    SWIFT_OBJC_BRIDGING_HEADER: Sources/Lfm3Audio-Bridging-Header.h
+    HEADER_SEARCH_PATHS:
+      - $(inherited)
+      - $(SRCROOT)/../include
+    LIBRARY_SEARCH_PATHS:
+      - $(inherited)
+      - $(SRCROOT)/build
+    # A static archive carries no link directives: name what the Rust code
+    # needs (Accelerate for rlx-cpu, Metal / MPS / MPSGraph for rlx-metal).
+    OTHER_LDFLAGS:
+      - $(inherited)
+      - -lrlx_lfm3_audio_ffi
+      - -framework
+      - Accelerate
+      - -framework
+      - Metal
+      - -framework
+      - MetalPerformanceShaders
+      - -framework
+      - MetalPerformanceShadersGraph
+      - -lresolv
+      - -lc++
+    DEAD_CODE_STRIPPING: YES
+    ENABLE_BITCODE: NO
+    CODE_SIGN_STYLE: Automatic
+    DEVELOPMENT_TEAM: ${LFM3A_TEAM}
+targets:
+  Lfm3Audio:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+      # The JFK clip the self-test transcribes.
+      - path: ../../../assets/harness/jfk_16k.wav
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ${LFM3A_BUNDLE_ID}
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ARCHS: arm64
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: LFM3 Audio
+        UILaunchScreen: {}
+        # Weights go into Documents through the Files app / Finder.
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        NSMicrophoneUsageDescription: Transcribes what you say.

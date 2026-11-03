@@ -12,6 +12,7 @@ categories.workspace = true
 readme = "README.md"
 
 [dependencies]
+serde_json = { workspace = true }
 anyhow = { workspace = true }
 rlx-serve = { workspace = true }
 rlx-core = { workspace = true }

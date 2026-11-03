@@ -29,7 +29,7 @@ cuda = ["rlx-models/cuda"]
 
 [dependencies]
 rlx-ir = { workspace = true }
-rlx-models  = { path = "../rlx-models", version = "0.2.19", default-features = false }
+rlx-models  = { path = "../rlx-models", version = "0.2.20", default-features = false }
 rlx-core    = { workspace = true }
 rlx-cli     = { workspace = true }
 rlx-runtime = { workspace = true }

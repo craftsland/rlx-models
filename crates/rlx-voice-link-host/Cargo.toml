@@ -1,0 +1,39 @@
+[package]
+name = "rlx-voice-link-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Mac/Linux receiver for rlx-voice-link: BLE (btleplug) → ADPCM → int8 Conformer-CTC ASR → optional local LM over an OpenAI-compatible endpoint"
+keywords.workspace = true
+categories.workspace = true
+repository.workspace = true
+readme = "README.md"
+publish = false
+
+[features]
+default = ["ble"]
+# The radio. Without it the crate still builds the pipeline and `simulate`.
+ble = ["dep:btleplug", "dep:tokio", "dep:futures", "dep:uuid"]
+
+[dependencies]
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+rlx-voice-link = { workspace = true }
+rlx-conformer-ctc-core = { workspace = true, features = ["std"] }
+rlx-conformer-ctc = { workspace = true }
+# Phone-side voice detector that confirms or rejects what the device gate sent.
+rlx-ten-vad-core = { workspace = true, features = ["std"] }
+ureq = { version = "2.12", features = ["json"] }
+btleplug = { version = "0.13", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"], optional = true }
+futures = { version = "0.3", optional = true }
+uuid = { version = "1", optional = true }
+
+[[bin]]
+name = "rlx-voice-link"
+path = "src/bin/rlx_voice_link.rs"
+
+[lints]
+workspace = true

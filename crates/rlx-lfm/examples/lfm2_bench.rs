@@ -76,7 +76,7 @@ fn main() -> Result<()> {
     let dev = parse_standard_device("lfm", &device)?;
 
     let runner = Lfm2GgufRunner::open(&gguf, dev)?;
-    let ids = rlx_qwen35::encode_prompt_from_gguf(&gguf, &prompt)?;
+    let ids = rlx_core::tokenizer::encode_prompt_from_gguf(&gguf, &prompt)?;
 
     // Warm: build the cached decode graph + warm the dequant cache.
     let _ = runner.generate(&ids, 8, |_| true)?;

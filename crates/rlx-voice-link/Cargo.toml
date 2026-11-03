@@ -1,0 +1,17 @@
+[package]
+name = "rlx-voice-link"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "no_std BLE voice link: IMA-ADPCM, packet framing and loss-tolerant reassembly between a microphone MCU (nRF52) and a phone or Mac"
+keywords.workspace = true
+categories.workspace = true
+repository.workspace = true
+readme = "README.md"
+
+[dependencies]
+
+[lints]
+workspace = true

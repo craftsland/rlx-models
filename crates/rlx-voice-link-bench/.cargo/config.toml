@@ -1,0 +1,9 @@
+[build]
+# nRF52840's core (Cortex-M4F). QEMU runs it on the MPS2 AN505's Cortex-M33,
+# which executes ARMv7E-M code unchanged, so the instruction counts are the
+# M4F's.
+target = "thumbv7em-none-eabihf"
+
+[target.thumbv7em-none-eabihf]
+rustflags = ["-C", "target-cpu=cortex-m4", "-C", "link-arg=-Tlink.x"]
+runner = "qemu-system-arm -machine mps2-an505 -nographic -semihosting-config enable=on,target=native -kernel"

@@ -34,6 +34,10 @@ rlx-opscope = { workspace = true }
 default = ["metal", "download"]
 metal = ["rlx-tensor/eval-metal"]
 cuda = ["rlx-tensor/eval-cuda"]
+# AMD: Radeon iGPU (ROCm), native Vulkan, Ryzen AI NPU (XDNA).
+rocm = ["rlx-tensor/eval-rocm"]
+vulkan = ["rlx-tensor/eval-vulkan"]
+xdna = ["rlx-tensor/eval-xdna"]
 download = ["dep:hf-hub"]
 
 [[bin]]

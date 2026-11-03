@@ -34,7 +34,7 @@ rlx-core = { workspace = true, optional = true }
 rlx-runtime = { workspace = true, optional = true }
 rlx-ir = { workspace = true }
 # The package's codec graphs (`export`).
-rlx-snac = { path = "../rlx-snac", version = "0.2.19", optional = true }
+rlx-snac = { path = "../rlx-snac", version = "0.2.20", optional = true }
 
 [dependencies.hf-hub]
 workspace = true

@@ -4,6 +4,24 @@
 
 ### Added
 
+- DeepSeek-V4.1-Flash-1017 (`deepseek-ai/DeepSeek-V4.1-Flash-1017`) runs
+  through the existing `dsv41` port and `rlx-dsv41`: it is a weights-only
+  update, with `config.json`, `inference/` code, tokenizer and all 96,085
+  tensor names, dtypes, shapes and byte offsets identical to the original
+  (checked against every shard header). Its own real-weight parity fixtures
+  live in `rlx-models-core/tests/fixtures/dsv41_1017/`; on range-fetched 1017
+  bytes the attention of layers 0 and 2, all three quantization layouts, the
+  Engram token map and the routed MoE match the released reference. The
+  `scripts/dsv41_ref` harness takes `DSV41_REPO` and stamps each subset
+  directory with its release, so the tests compare against the matching
+  digests. The reference code both repos ship now differs from the September
+  copy (index-key owners publish every step; an FP8 rounding before `wo_a`);
+  the port already behaved as the first, the second is precision simulation,
+  and the regenerated toy fixtures match the committed ones to 2e-8.
+
+- `WeightMap::from_bytes` / `from_bytes_excluding`: load safetensors already
+  in memory (`from_file` reads the file and calls them). exgb's MontageFlow
+  releases load this way from a browser's mounted files.
 - rlx-whisper's log-mel and rlx-wav2vec2-bert's feature extractor run on
   rlx-spectral (no `rustfft`). The whisper front-end stays within 2.6e-5 of
   CTranslate2's features with identical tokens; w2v-BERT's extractor now
@@ -41,9 +59,35 @@
   symbolic in the cache (fitted at three sizes and checked at the third).
   In a decode step of several rows every row is real, so the Gated DeltaNet
   conv window needs no `gdn_conv_shift_l*` input there.
+- rlx-lfm3-audio: LiquidAI LFM3-Audio-2B from its GGUF release — ASR, TTS
+  and interleaved spoken chat (`rlx-lfm3-audio asr|tts|chat`, facade feature
+  `lfm3-audio`). One LFM2 / LFM3 trunk builder serves the LM, the speech
+  encoder, the MaskGIT depth decoder and the Liquid codec. Every stage
+  matches a torch port of the released modeling code
+  (`scripts/lfm3_audio_reference.py`, `just test-lfm3-audio-parity`) on CPU
+  (arm64, x86), Metal, MLX, ROCm, CUDA, Vulkan, wgpu, CoreML and WebGL: on
+  the F16 LM greedy ASR is token-identical and 18 / 18 greedy TTS frames are
+  identical; TPU builds but has not run. `--low-memory --mmproj-prefer Q8_0`
+  peaks at 2.0 / 2.2 GiB footprint for ASR / TTS on Metal (6.6 / 7.0 before):
+  one LM graph, the tied head and the depth input projection uploaded in
+  row slices, the speech stacks kept packed. Whisper large-v3 transcribes
+  all 32 test clips (8 sentences × 2 voices × F16 and low-memory Q4_K_M)
+  as the input text, apart from writing "river bank" as one word.
+  `Lfm3Audio::transcribe` /
+  `speak` are the one-call ASR and TTS (the C ABI goes through them).
+- `rlx_core::tokenizer` (feature `tokenizer`): the `tokenizer.json` and
+  GGUF-embedded byte-level BPE tokenizers, moved out of rlx-qwen35, which
+  re-exports them unchanged. rlx-lfm (LFM2) and rlx-lfm3-audio no longer
+  depend on rlx-qwen35 for text.
+- rlx-lfm3-audio-ffi (not published): a C ABI over it and a SwiftUI iOS app
+  with a self-test (`just lfm3-audio-ios-sim`, `just lfm3-audio-ios DEVICE
+  TEAM`; `BUNDLE_ID` sets the app identifier). On the simulator ASR and TTS
+  round-trip at ≤ 1.7 GiB; not yet run on a device.
 
 ### Fixed
 
+- The GGUF tokenizer reads the header only; it used to load the whole
+  checkpoint (~1 GB for LFM3-Audio) just to get the vocabulary.
 - rlx-qwen35 MTP head, five faults that kept it from drafting:
   - it embedded the token just processed instead of the next one, and so
     re-predicted the trunk's own next token (Qwen3.5-0.8B: 55% equal to it,

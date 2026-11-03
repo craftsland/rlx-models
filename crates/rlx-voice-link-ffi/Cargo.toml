@@ -1,0 +1,23 @@
+[package]
+name = "rlx-voice-link-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "C API for rlx-voice-link reassembly and int8 Conformer-CTC ASR, for the iOS/macOS Swift package"
+keywords.workspace = true
+categories.workspace = true
+repository.workspace = true
+readme = "README.md"
+publish = false
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+rlx-voice-link = { workspace = true }
+rlx-conformer-ctc-core = { workspace = true }
+
+[lints]
+workspace = true

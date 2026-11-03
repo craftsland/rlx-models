@@ -93,6 +93,90 @@ fn fixture() -> Value {
     serde_json::from_str(&raw).expect("fixture parses")
 }
 
+/// The original release. Later releases of the same model
+/// (`DeepSeek-V4.1-Flash-1017`) are weights-only updates: same config, code and
+/// tensor layout, different bytes, so each keeps its own real-weight digests.
+const DSV41_REPO: &str = "deepseek-ai/DeepSeek-V4.1-Flash";
+
+/// Committed real-weight fixtures for the release a weight subset came from.
+///
+/// `scripts/dsv41_ref/fetch_subset.py` stamps every output directory with
+/// `dsv41_repo.txt`; no stamp means a directory fetched before releases were
+/// told apart, i.e. the original. The original's fixtures sit directly under
+/// `tests/fixtures`, `DeepSeek-V4.1-Flash-<rev>` under `tests/fixtures/dsv41_<rev>`
+/// — the same mapping as `fixture_dir()` on the Python side. Comparing one
+/// release's bytes against another's digests fails at the first sample, so an
+/// unknown stamp is an error rather than a fallback.
+fn real_fixture_dir(weights: &std::path::Path) -> std::path::PathBuf {
+    let base = std::path::PathBuf::from(format!("{}/tests/fixtures", env!("CARGO_MANIFEST_DIR")));
+    let repo = match std::fs::read_to_string(weights.join("dsv41_repo.txt")) {
+        Ok(s) => s.trim().to_string(),
+        Err(_) => return base,
+    };
+    if repo == DSV41_REPO {
+        return base;
+    }
+    let rev = repo
+        .strip_prefix(DSV41_REPO)
+        .and_then(|r| r.strip_prefix('-'))
+        .unwrap_or_else(|| panic!("{weights:?} holds `{repo}`, not a {DSV41_REPO} release"));
+    let dir = base.join(format!("dsv41_{rev}"));
+    assert!(
+        dir.is_dir(),
+        "no committed fixtures for `{repo}` (expected {dir:?}); see scripts/dsv41_ref"
+    );
+    dir
+}
+
+/// Every release's real-weight fixture directory, for the checks that run
+/// without weights.
+fn all_real_fixture_dirs() -> Vec<std::path::PathBuf> {
+    let base = std::path::PathBuf::from(format!("{}/tests/fixtures", env!("CARGO_MANIFEST_DIR")));
+    let mut dirs: Vec<_> = std::fs::read_dir(&base)
+        .unwrap()
+        .filter_map(|e| {
+            let p = e.ok()?.path();
+            (p.is_dir() && p.file_name()?.to_str()?.starts_with("dsv41_")).then_some(p)
+        })
+        .collect();
+    dirs.sort();
+    dirs.insert(0, base);
+    dirs
+}
+
+/// The `dsv41_real_layer{N}_digest.json` files in `dir`, by layer.
+fn real_layer_digests(dir: &std::path::Path) -> Vec<(usize, Value)> {
+    let mut digests: Vec<(usize, Value)> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| {
+            let p = e.ok()?.path();
+            let name = p.file_name()?.to_str()?.to_string();
+            let n: usize = name
+                .strip_prefix("dsv41_real_layer")?
+                .strip_suffix("_digest.json")?
+                .parse()
+                .ok()?;
+            Some((
+                n,
+                serde_json::from_str(&std::fs::read_to_string(&p).ok()?).ok()?,
+            ))
+        })
+        .collect();
+    digests.sort_by_key(|(n, _)| *n);
+    assert!(
+        !digests.is_empty(),
+        "no real-layer digests committed in {dir:?}"
+    );
+    // a sliding-window-only layer AND a compressed source layer, or this covers
+    // none of what V4.1 changed
+    assert!(
+        digests.iter().any(|(_, d)| d["compress_ratio"] == 0)
+            && digests.iter().any(|(_, d)| d["compress_ratio"] != 0),
+        "{dir:?}: real-weight coverage must include both a plain and a compressed layer"
+    );
+    digests
+}
+
 fn floats(v: &Value) -> Vec<f32> {
     v.as_array()
         .expect("float array")
@@ -865,52 +949,36 @@ fn real_layer_attention_matches_reference() {
     use rlx_models_core::weight_loader::WeightLoader;
 
     let fixtures = format!("{}/tests/fixtures", env!("CARGO_MANIFEST_DIR"));
-    let mut digests: Vec<(usize, Value)> = std::fs::read_dir(&fixtures)
-        .unwrap()
-        .filter_map(|e| {
-            let p = e.ok()?.path();
-            let name = p.file_name()?.to_str()?.to_string();
-            let n: usize = name
-                .strip_prefix("dsv41_real_layer")?
-                .strip_suffix("_digest.json")?
-                .parse()
-                .ok()?;
-            Some((
-                n,
-                serde_json::from_str(&std::fs::read_to_string(&p).ok()?).ok()?,
-            ))
-        })
-        .collect();
-    digests.sort_by_key(|(n, _)| *n);
-    assert!(!digests.is_empty(), "no real-layer digests committed");
-    // a sliding-window-only layer AND a compressed source layer, or this covers
-    // none of what V4.1 changed
-    assert!(
-        digests.iter().any(|(_, d)| d["compress_ratio"] == 0)
-            && digests.iter().any(|(_, d)| d["compress_ratio"] != 0),
-        "real-weight coverage must include both a plain and a compressed layer"
-    );
-
     let cfg_path = format!("{fixtures}/dsv41_config.json");
     let cfg: Value = serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
     let spec = DeepseekV41Spec::from_config(&cfg).unwrap();
 
     let Some(dir) = rlx_ir::env::var_os("RLX_DSV41_WEIGHTS") else {
-        for (n, dg) in &digests {
-            // the digests still have to be self-consistent without the weights
-            let seq = dg["seq"].as_u64().unwrap() as usize;
-            let a = &dg["attn_out"];
-            assert_eq!(
-                a["shape"].as_array().unwrap()[0].as_u64().unwrap() as usize,
-                seq
-            );
-            assert_eq!(a["row_norms"].as_array().unwrap().len(), seq, "layer {n}");
-            assert!(a["absmean"].as_f64().unwrap() > 0.0, "layer {n}");
+        // every release's digests still have to be self-consistent without the
+        // weights
+        for fdir in all_real_fixture_dirs() {
+            for (n, dg) in &real_layer_digests(&fdir) {
+                let seq = dg["seq"].as_u64().unwrap() as usize;
+                let a = &dg["attn_out"];
+                assert_eq!(
+                    a["shape"].as_array().unwrap()[0].as_u64().unwrap() as usize,
+                    seq
+                );
+                assert_eq!(
+                    a["row_norms"].as_array().unwrap().len(),
+                    seq,
+                    "{fdir:?} layer {n}"
+                );
+                assert!(a["absmean"].as_f64().unwrap() > 0.0, "{fdir:?} layer {n}");
+            }
         }
         eprintln!("skipping real-weight run: set RLX_DSV41_WEIGHTS (see scripts/dsv41_ref)");
         return;
     };
     let dir = std::path::PathBuf::from(dir);
+    let fdir = real_fixture_dir(&dir);
+    eprintln!("real-weight digests from {fdir:?}");
+    let digests = real_layer_digests(&fdir);
     let opts = rlx_models_core::flow_bridge::compile_options_for_packed_gguf_prefill_with_profile(
         &rlx_flow::CompileProfile::qwen3_prefill(),
         Device::Cpu,
@@ -1201,30 +1269,38 @@ fn dequant_matches_reference_on_real_bytes() {
     use rlx_models_core::dsv41_quant::{DEFAULT_BLOCK, DsV41Loader};
     use rlx_models_core::weight_loader::WeightLoader;
 
-    let dpath = format!(
-        "{}/tests/fixtures/dsv41_real_quant_digest.json",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    let dg: Value = serde_json::from_str(&std::fs::read_to_string(&dpath).unwrap()).unwrap();
-    let entries = dg.as_object().unwrap();
-    // the fixture itself must cover all three layouts, with or without weights
-    let layouts: std::collections::BTreeSet<&str> = entries
-        .values()
-        .map(|v| v["layout"].as_str().unwrap())
-        .collect();
-    assert!(layouts.contains("tile") && layouts.contains("row_groups"));
-    assert!(
-        entries
+    let read_digest = |fdir: &std::path::Path| -> Value {
+        let dpath = fdir.join("dsv41_real_quant_digest.json");
+        let dg: Value = serde_json::from_str(&std::fs::read_to_string(&dpath).unwrap()).unwrap();
+        let entries = dg.as_object().unwrap();
+        // the fixture itself must cover all three layouts, with or without weights
+        let layouts: std::collections::BTreeSet<&str> = entries
             .values()
-            .any(|v| v["stored_dtype"].as_str() == Some("int8")),
-        "no FP4 tensor in the digest"
-    );
+            .map(|v| v["layout"].as_str().unwrap())
+            .collect();
+        assert!(
+            layouts.contains("tile") && layouts.contains("row_groups"),
+            "{dpath:?}"
+        );
+        assert!(
+            entries
+                .values()
+                .any(|v| v["stored_dtype"].as_str() == Some("int8")),
+            "no FP4 tensor in {dpath:?}"
+        );
+        dg
+    };
 
     let Some(dir) = rlx_ir::env::var_os("RLX_DSV41_WEIGHTS") else {
+        for fdir in all_real_fixture_dirs() {
+            read_digest(&fdir);
+        }
         eprintln!("skipping: set RLX_DSV41_WEIGHTS (see scripts/dsv41_ref, --what quant)");
         return;
     };
     let dir = std::path::PathBuf::from(dir);
+    let dg = read_digest(&real_fixture_dir(&dir));
+    let entries = dg.as_object().unwrap();
     let mut loader = match DsV41Loader::open(&dir, DEFAULT_BLOCK) {
         Ok(l) => l,
         Err(e) => {
@@ -1683,10 +1759,7 @@ fn real_moe_matches_reference_on_routed_experts() {
         return;
     };
     let dir = std::path::PathBuf::from(dir);
-    let path = format!(
-        "{}/tests/fixtures/dsv41_real_moe_ref.json",
-        env!("CARGO_MANIFEST_DIR")
-    );
+    let path = real_fixture_dir(&dir).join("dsv41_real_moe_ref.json");
     let fx: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     let cfg: Value = serde_json::from_str(
         &std::fs::read_to_string(format!(

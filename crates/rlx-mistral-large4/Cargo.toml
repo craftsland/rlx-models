@@ -1,0 +1,48 @@
+[package]
+name = "rlx-mistral-large4"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Mistral Large 4 (mistral-large4) — MLA with DSA sparse attention, KV sharing, NoPE layers, LeRoPE and a 128-expert MoE — for RLX"
+keywords.workspace = true
+categories.workspace = true
+repository.workspace = true
+readme = "README.md"
+
+[dependencies]
+rlx-core = { workspace = true }
+rlx-distributed = { workspace = true, features = ["gguf"] }
+rlx-flow = { workspace = true }
+rlx-glm5next = { workspace = true }
+rlx-gguf = { workspace = true }
+rlx-ir = { workspace = true }
+rlx-runtime = { workspace = true }
+anyhow = { workspace = true }
+rlx-cli = { workspace = true }
+tokenizers = { workspace = true, features = ["onig"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[[bin]]
+name = "rlx-mistral-large4"
+path = "src/bin/rlx_mistral_large4.rs"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+metal = ["rlx-runtime/metal", "rlx-glm5next/metal"]
+mlx = ["rlx-runtime/mlx", "rlx-glm5next/mlx"]
+cuda = ["rlx-runtime/cuda", "rlx-glm5next/cuda"]
+rocm = ["rlx-runtime/rocm", "rlx-glm5next/rocm"]
+gpu = ["rlx-runtime/gpu", "rlx-glm5next/gpu"]
+vulkan = ["rlx-runtime/vulkan", "rlx-glm5next/vulkan"]
+coreml = ["rlx-runtime/coreml", "rlx-core/coreml", "rlx-glm5next/coreml"]
+all-backends = ["metal", "mlx", "cuda", "rocm", "gpu", "vulkan", "coreml"]
+macos-gpu = ["metal", "mlx", "gpu", "coreml"]
+nvidia-gpu = ["cuda"]
+amd-gpu = ["rocm"]
+portable-gpu = ["gpu"]

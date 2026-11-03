@@ -5744,7 +5744,7 @@ impl Qwen35Runner {
 
     /// [`Self::run_decode_job`] for the browser, where a WebGPU readback
     /// cannot block.
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     async fn run_decode_job_async(&mut self, job: &DecodeJob) -> Result<Vec<Vec<f32>>> {
         let feeds = job.feed_refs();
         let compiled = self.decode_bucket_graph(job.bucket_key);
@@ -5913,7 +5913,7 @@ impl Qwen35Runner {
 
     /// [`Self::generate_stepwise`] for the browser, where a WebGPU readback
     /// cannot block: every graph run is awaited.
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     pub async fn generate_async(
         &mut self,
         prompt: &[u32],
@@ -6151,7 +6151,7 @@ impl Qwen35Runner {
     }
 
     /// [`Self::stage_rows`] for the browser, where a WebGPU readback cannot block.
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     pub async fn stage_rows_async(
         &mut self,
         input: StageInput<'_>,
@@ -6184,7 +6184,7 @@ impl Qwen35Runner {
     }
 
     /// [`Self::stage_rows_undo`] for the browser.
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     pub async fn stage_rows_undo_async(&mut self, keep: usize) -> Result<()> {
         let Some(input) = self.rows_undo_begin(keep)? else {
             return Ok(());
@@ -6491,7 +6491,7 @@ impl Qwen35Runner {
 
     /// [`Self::stage_prefill`] for the browser, where a WebGPU readback cannot
     /// block.
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     pub async fn stage_prefill_async(&mut self, input: StageInput<'_>) -> Result<StageOutput> {
         let job = self.stage_prefill_prepare(input)?;
         let outs = {
@@ -6506,7 +6506,7 @@ impl Qwen35Runner {
     }
 
     /// [`Self::stage_decode`] for the browser.
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     pub async fn stage_decode_async(&mut self, input: StageInput<'_>) -> Result<StageOutput> {
         let (job, cache) = self.stage_decode_prepare(input)?;
         match self.run_decode_job_async(&job).await {

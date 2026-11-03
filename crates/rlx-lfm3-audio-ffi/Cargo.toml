@@ -1,0 +1,28 @@
+[package]
+name = "rlx-lfm3-audio-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "C ABI over rlx-lfm3-audio (LFM3-Audio-2B speech recognition and synthesis) for Swift / iOS apps"
+keywords.workspace = true
+categories.workspace = true
+publish = false
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+rlx-lfm3-audio = { workspace = true }
+rlx-cli = { workspace = true }
+anyhow = { workspace = true }
+
+[features]
+default = []
+metal = ["rlx-lfm3-audio/metal"]
+coreml = ["rlx-lfm3-audio/coreml"]
+
+[lints]
+workspace = true

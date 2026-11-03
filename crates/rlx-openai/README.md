@@ -34,6 +34,12 @@ just features=macos-gpu,laguna openai-serve -- \
 Shared: `--host`, `--port`, `--max-tokens`. Per-engine flags apply until the
 next `--engine`.
 
+Chat template and stop tokens come from the checkpoint. For GGUF the server
+reads its metadata. For a Hugging Face directory it uses
+`tokenizer_config.json`'s `chat_template` (or `chat_template.jinja`) and the
+`eos_token_id`s in `config.json` / `generation_config.json`. `--eos IDS`
+overrides the stop tokens.
+
 ## Curl
 
 ```bash

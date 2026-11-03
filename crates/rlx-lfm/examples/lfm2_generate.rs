@@ -102,11 +102,11 @@ fn main() -> Result<()> {
         c.vocab_size,
     );
 
-    let ids = rlx_qwen35::encode_prompt_from_gguf(&gguf, &prompt)?;
+    let ids = rlx_core::tokenizer::encode_prompt_from_gguf(&gguf, &prompt)?;
     let t_gen = std::time::Instant::now();
     let generated = runner.generate(&ids, max_tokens, |_| true)?;
     let dt = t_gen.elapsed();
-    let text = rlx_qwen35::decode_ids_from_gguf(&gguf, &generated, true)?;
+    let text = rlx_core::tokenizer::decode_ids_from_gguf(&gguf, &generated, true)?;
 
     println!("[lfm2_generate] prompt      : {prompt}");
     println!("[lfm2_generate] continuation: {text}");

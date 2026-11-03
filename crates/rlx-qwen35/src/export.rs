@@ -283,7 +283,7 @@ pub fn export_rlxp(gguf: &Path, out: &Path, opts: &ExportOptions) -> Result<Expo
         .collect();
 
     // The tokenizer and chat template the GGUF carries.
-    let tokenizer = crate::tokenizer::build_gguf_tokenizer(gguf)?;
+    let tokenizer = rlx_core::tokenizer::build_gguf_tokenizer(gguf)?;
     let tokenizer_json = tokenizer
         .to_string(false)
         .map_err(|e| anyhow::anyhow!("serialize tokenizer: {e}"))?;

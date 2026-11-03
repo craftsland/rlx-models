@@ -719,10 +719,24 @@ fn decode_bucket_floor() -> u64 {
 /// keeps `BF16` tensors packed (`QuantScheme::GgufBF16`), so with
 /// `RLX_PACKED_LM_HEAD` a tied BF16 embedding serves as the LM head without
 /// an f32 `[hidden, vocab]` copy. Needs a bf16 `DequantMatMul` (CPU, wgpu).
-fn open_packed_gguf(path: &str) -> Result<rlx_core::weight_loader::GgufLoader> {
+///
+/// Any other checkpoint goes through the format registry: an HF FP8
+/// safetensors checkpoint packs its FP8 linears as block-FP8, its bf16
+/// matrices as `GgufBF16` under the same `RLX_QWEN3_KEEP_BF16`, and the rest
+/// (and any non-FP8 checkpoint) loads as f32.
+fn open_packed_gguf(path: &str) -> Result<Box<dyn WeightLoader>> {
+    if !path.ends_with(".gguf") {
+        if let Some(mut st) =
+            rlx_core::weight_registry::open_safetensors_mmap(std::path::Path::new(path))?
+        {
+            st.keep_bf16(rlx_ir::env::flag("RLX_QWEN3_KEEP_BF16"));
+            return Ok(Box::new(st));
+        }
+        return rlx_core::weight_loader::load_from_path(path);
+    }
     let mut loader = rlx_core::weight_loader::GgufLoader::from_file(path)?;
     loader.keep_bf16(rlx_ir::env::flag("RLX_QWEN3_KEEP_BF16"));
-    Ok(loader)
+    Ok(Box::new(loader))
 }
 
 fn decode_key(past_seq: usize) -> u64 {
@@ -730,7 +744,7 @@ fn decode_key(past_seq: usize) -> u64 {
 }
 
 /// The native packed CPU path's host-side embedding, when opted in with
-/// `RLX_QWEN3_HOST_EMBED` and the GGUF's `token_embd` can be sliced by row.
+/// `RLX_QWEN3_HOST_EMBED` and the checkpoint's embedding table can be sliced by row.
 fn host_embed_for(
     cfg: &Qwen3Config,
     gguf: Option<&str>,
@@ -805,10 +819,9 @@ impl Qwen3Generator {
         gguf_path: &str,
         device: Device,
     ) -> Result<Self> {
-        use rlx_core::weight_loader::GgufLoader;
         validate_device(&cfg, device, /*packed*/ true)?;
-        GgufLoader::from_file(gguf_path)
-            .with_context(|| format!("open GGUF for native packed generator: {gguf_path}"))?;
+        open_packed_gguf(gguf_path)
+            .with_context(|| format!("open weights for native packed generator: {gguf_path}"))?;
         Ok(Self::assemble(
             cfg,
             HashMap::new(),
@@ -835,6 +848,22 @@ impl Qwen3Generator {
         let sliding = cfg.use_sliding_window && cfg.sliding_window.is_some_and(|w| w > 0);
         let host_embed = host_embed_for(&cfg, native_packed_gguf.as_deref(), device);
         let prefill_capacity = if native_packed_gguf.is_some() { 2 } else { 8 };
+        // Native packed graphs all load from one checkpoint, so the prefill
+        // graph and every decode rung can hold one copy of each weight where the
+        // backend shares by scope (Metal).
+        let mut prefill_compile_cache = CompileCache::new(device, prefill_capacity);
+        prefill_compile_cache.set_param_sharing_scope(native_packed_gguf.clone());
+        let mut decode_compile_cache = BucketedCompileCache::power_of_two_ladder(
+            device,
+            // Clamped to the ladder's own ceiling: `power_of_two_ladder`
+            // asserts `max >= min`, and a model whose whole context is
+            // shorter than the floor (tiny test configs,
+            // max_position_embeddings=16) would otherwise panic at
+            // construction rather than simply having one bucket.
+            decode_bucket_floor().min(max_past as u64).max(1),
+            max_past as u64,
+        );
+        decode_compile_cache.set_param_sharing_scope(native_packed_gguf.clone());
         Self {
             cfg,
             weights_cache: Arc::new(weights_cache),
@@ -847,19 +876,10 @@ impl Qwen3Generator {
             cache: None,
             // A native packed entry holds its own copy of the weights (and an
             // F32 tied head), so keep two buckets rather than eight.
-            prefill_compile_cache: Some(CompileCache::new(device, prefill_capacity)),
+            prefill_compile_cache: Some(prefill_compile_cache),
             prefill_bucket: None,
             prefill_bucket_disabled: false,
-            decode_compile_cache: Some(BucketedCompileCache::power_of_two_ladder(
-                device,
-                // Clamped to the ladder's own ceiling: `power_of_two_ladder`
-                // asserts `max >= min`, and a model whose whole context is
-                // shorter than the floor (tiny test configs,
-                // max_position_embeddings=16) would otherwise panic at
-                // construction rather than simply having one bucket.
-                decode_bucket_floor().min(max_past as u64).max(1),
-                max_past as u64,
-            )),
+            decode_compile_cache: Some(decode_compile_cache),
             batched_decode_caches: HashMap::new(),
             batched_ragged_caches: HashMap::new(),
             batched_gpu_kv_binding: HashMap::new(),
@@ -1291,7 +1311,9 @@ impl Qwen3Generator {
     /// generation runs — the second + Nth run skip the compile +
     /// param-attach roundtrip (~30-50ms per call on CPU).
     pub fn with_prefill_cache(mut self, capacity: usize) -> Self {
-        self.prefill_compile_cache = Some(CompileCache::new(self.device, capacity));
+        let mut cache = CompileCache::new(self.device, capacity);
+        cache.set_param_sharing_scope(self.native_packed_gguf.clone());
+        self.prefill_compile_cache = Some(cache);
         self
     }
 
@@ -1348,7 +1370,10 @@ impl Qwen3Generator {
     /// smallest bucket).
     /// Override the bucketed decode compile cache after construction.
     /// Passing `None` forces the naive (O(N²)) generation path.
-    pub fn set_decode_compile_cache(&mut self, cache: Option<BucketedCompileCache>) {
+    pub fn set_decode_compile_cache(&mut self, mut cache: Option<BucketedCompileCache>) {
+        if let Some(c) = cache.as_mut() {
+            c.set_param_sharing_scope(self.native_packed_gguf.clone());
+        }
         self.decode_compile_cache = cache;
     }
 
@@ -1361,7 +1386,7 @@ impl Qwen3Generator {
             decode_bucket_floor().min(max_past),
             max_past,
         );
-        self.decode_compile_cache = Some(cache);
+        self.set_decode_compile_cache(Some(cache));
         self
     }
 
@@ -1734,13 +1759,19 @@ impl Qwen3Generator {
     /// compile miss; steady-state decode reuses the cached compiled graph, so
     /// the re-open cost is amortized.
     pub fn enable_native_packed_decode_from_gguf(&mut self, gguf_path: &str) -> Result<()> {
-        use rlx_core::weight_loader::GgufLoader;
         // Validate the path opens now, so a bad path fails here rather than
         // inside a decode-step compile closure (which `expect`s).
-        GgufLoader::from_file(gguf_path)
-            .with_context(|| format!("open GGUF for native packed decode: {gguf_path}"))?;
+        open_packed_gguf(gguf_path)
+            .with_context(|| format!("open weights for native packed decode: {gguf_path}"))?;
         self.native_packed_gguf = Some(gguf_path.to_string());
         self.host_embed = host_embed_for(&self.cfg, Some(gguf_path), self.device);
+        let scope = Some(gguf_path.to_string());
+        if let Some(c) = self.prefill_compile_cache.as_mut() {
+            c.set_param_sharing_scope(scope.clone());
+        }
+        if let Some(c) = self.decode_compile_cache.as_mut() {
+            c.set_param_sharing_scope(scope);
+        }
         Ok(())
     }
 
@@ -4371,10 +4402,10 @@ impl Qwen3Generator {
     /// `RLX_QWEN3_HOST_EMBED`). Each decode bucket then no longer holds its
     /// own F32 copy of the vocab-sized table — for a 158k × 2048 vocabulary
     /// that is 1.3 GB per compiled graph. Native packed generators only;
-    /// returns `false` when the GGUF's `token_embd` cannot be sliced by row.
+    /// returns `false` when the checkpoint's embedding table cannot be sliced by row.
     pub fn enable_host_embed(&mut self) -> Result<bool> {
         let Some(gguf) = self.native_packed_gguf.as_deref() else {
-            anyhow::bail!("enable_host_embed: needs a native packed (GGUF) generator");
+            anyhow::bail!("enable_host_embed: needs a native packed generator");
         };
         self.host_embed =
             crate::host_embed::HostEmbed::open(gguf, self.cfg.hidden_size)?.map(Arc::new);

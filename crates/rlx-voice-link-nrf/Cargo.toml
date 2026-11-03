@@ -1,0 +1,53 @@
+[package]
+name = "rlx-voice-link-nrf"
+version = "0.2.19"
+edition = "2024"
+license = "GPL-3.0-only"
+publish = false
+description = "nRF52840 firmware for rlx-voice-link: PDM microphone → IMA-ADPCM → BLE GATT notifications (Embassy + TrouBLE + Nordic SoftDevice Controller)"
+
+# Outside the workspace (listed in its `exclude`): a bare-metal target with its
+# own linker script, profile and Embassy dependency set.
+
+[dependencies]
+rlx-voice-link = { path = "../rlx-voice-link" }
+
+embassy-executor = { version = "0.10", default-features = false, features = ["platform-cortex-m", "executor-thread", "defmt"] }
+embassy-time = { version = "0.5", default-features = false, features = ["defmt", "defmt-timestamp-uptime"] }
+embassy-nrf = { version = "0.11", default-features = false, features = ["nrf52840", "defmt", "time-driver-rtc1", "gpiote", "unstable-pac", "rt"] }
+embassy-futures = "0.1.1"
+embassy-sync = { version = "0.8", features = ["defmt"] }
+
+nrf-sdc = { version = "0.4", default-features = false, features = ["defmt", "peripheral", "nrf52840"] }
+nrf-mpsl = { version = "0.4", default-features = false, features = ["defmt", "critical-section-impl"] }
+bt-hci = { version = "0.10", default-features = false, features = ["defmt"] }
+trouble-host = { version = "0.8", default-features = false, features = ["derive", "gatt", "peripheral", "default-packet-pool", "default-packet-pool-mtu-251", "defmt"] }
+
+defmt = "1.0"
+defmt-rtt = "1.0"
+panic-probe = { version = "1.0", features = ["print-defmt"] }
+cortex-m = { version = "0.7.6" }
+cortex-m-rt = "0.7.0"
+static_cell = "2"
+fixed = "1.10"
+
+[features]
+default = ["board-xiao"]
+# Seeed XIAO nRF52840 Sense: MSM261D3526H1CPM PDM mic, CLK P1.00, DIN P0.16,
+# power enable P1.10; user button on D1 (P0.03, to GND).
+board-xiao = []
+# Arduino Nano 33 BLE Sense (rev1 MP34DT05 / rev2 MP34DT06JTR): CLK P0.26,
+# DIN P0.25, power P0.17; no user button, so start/stop comes from the phone.
+board-nano33 = []
+
+[[bin]]
+name = "voice-link-nrf"
+path = "src/main.rs"
+test = false
+bench = false
+
+[profile.release]
+debug = 2
+lto = true
+opt-level = "s"
+codegen-units = 1

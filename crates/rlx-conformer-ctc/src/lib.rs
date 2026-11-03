@@ -59,6 +59,7 @@ pub mod ctc;
 pub mod encoder;
 #[cfg(feature = "export")]
 pub mod export;
+pub mod mcu;
 pub mod mel;
 pub mod runner;
 pub mod tokenizer;

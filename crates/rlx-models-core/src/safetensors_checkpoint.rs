@@ -145,8 +145,61 @@ impl SafetensorsCheckpoint {
             .tensor(name)
             .with_context(|| format!("tensor {name} missing in shard {shard}"))?;
         let shape = view.shape().to_vec();
-        let data = tensor_view_to_f32(name, view)?;
+        let fp8 = matches!(
+            view.dtype(),
+            safetensors::Dtype::F8_E4M3 | safetensors::Dtype::F8_E5M2
+        );
+        let mut data = tensor_view_to_f32(name, view)?;
+        if fp8 && let Some(skey) = self.fp8_scale_key(name) {
+            let (scale, sshape) = self.load_tensor_f32(&skey)?;
+            rlx_ir::lowp_codec::apply_weight_scales(
+                &mut data,
+                &shape,
+                &scale,
+                &sshape,
+                self.fp8_block(),
+            )
+            .map_err(|e| anyhow::anyhow!("{name}: {e}"))?;
+        }
         Ok((data, shape))
+    }
+
+    /// The scale an HF FP8 checkpoint stores beside FP8 weight `name`
+    /// (`<name>_scale_inv`, or compressed-tensors' `<name>_scale`).
+    pub fn fp8_scale_key(&self, name: &str) -> Option<String> {
+        ["_scale_inv", "_scale"]
+            .iter()
+            .map(|s| format!("{name}{s}"))
+            .find(|k| self.index.contains_key(k))
+    }
+
+    /// Whether `name` is the stored scale of an FP8 weight — folded into that
+    /// weight by [`Self::load_tensor_f32`], so not a tensor of its own.
+    pub fn is_fp8_scale(&self, name: &str) -> bool {
+        ["_scale_inv", "_scale"].iter().any(|s| {
+            name.strip_suffix(s)
+                .filter(|w| self.index.contains_key(*w))
+                .and_then(|w| self.stored_dtype(w))
+                .is_some_and(|d| {
+                    matches!(d, safetensors::Dtype::F8_E4M3 | safetensors::Dtype::F8_E5M2)
+                })
+        })
+    }
+
+    /// `quantization_config.weight_block_size` from the checkpoint's
+    /// `config.json`; `None` lets the scale shape decide.
+    pub fn fp8_block(&self) -> Option<[usize; 2]> {
+        let raw = std::fs::read(self.dir.join("config.json")).ok()?;
+        let cfg: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+        match cfg
+            .get("quantization_config")?
+            .get("weight_block_size")?
+            .as_array()?
+            .as_slice()
+        {
+            [r, c] => Some([r.as_u64()? as usize, c.as_u64()? as usize]),
+            _ => None,
+        }
     }
 
     /// Load selected rows from a rank-2 tensor without materializing the full matrix.
@@ -398,6 +451,18 @@ pub fn raw_to_f32(name: &str, dtype: safetensors::Dtype, bytes: &[u8]) -> Result
             .iter()
             .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32)
             .collect(),
+        // HF FP8 checkpoints: the raw codes. `load_tensor_f32` applies the
+        // stored scale.
+        safetensors::Dtype::F8_E4M3 | safetensors::Dtype::F8_E5M2 => {
+            let fmt = if dtype == safetensors::Dtype::F8_E4M3 {
+                rlx_ir::quant::ScaledFormat::F8E4M3
+            } else {
+                rlx_ir::quant::ScaledFormat::F8E5M2
+            };
+            let mut out = vec![0f32; bytes.len()];
+            rlx_ir::lowp_codec::decode_slice(fmt, bytes, &mut out);
+            out
+        }
         safetensors::Dtype::C64 => return Ok(vec![]),
         other => anyhow::bail!("{name}: unsupported dtype {other:?}"),
     })
@@ -409,6 +474,10 @@ pub fn raw_to_f32(name: &str, dtype: safetensors::Dtype, bytes: &[u8]) -> Result
 pub struct SafetensorsMmapLoader {
     ckpt: SafetensorsCheckpoint,
     taken: HashSet<String>,
+    /// Hand `BF16` matrices to [`WeightLoader::take_packed`] as
+    /// `QuantScheme::GgufBF16` (raw bf16 rows), like
+    /// [`crate::weight_loader::GgufLoader::keep_bf16`].
+    keep_bf16: bool,
 }
 
 impl SafetensorsMmapLoader {
@@ -416,6 +485,7 @@ impl SafetensorsMmapLoader {
         Ok(Self {
             ckpt: SafetensorsCheckpoint::open(dir)?,
             taken: HashSet::new(),
+            keep_bf16: false,
         })
     }
 
@@ -424,7 +494,16 @@ impl SafetensorsMmapLoader {
         Ok(Self {
             ckpt: SafetensorsCheckpoint::open_file(file)?,
             taken: HashSet::new(),
+            keep_bf16: false,
         })
+    }
+
+    /// Report `BF16` `[out, in]` tensors to `take_packed` as
+    /// `QuantScheme::GgufBF16`, so a builder keeps them at 2 bytes as a
+    /// `DequantMatMul` weight — with `RLX_PACKED_LM_HEAD`, a tied bf16
+    /// embedding serves as the LM head without an f32 `[hidden, vocab]` copy.
+    pub fn keep_bf16(&mut self, on: bool) {
+        self.keep_bf16 = on;
     }
 
     /// `key`, or the Hunyuan norm alias the eager [`WeightMap`] would accept.
@@ -452,10 +531,7 @@ impl crate::weight_loader::WeightLoader for SafetensorsMmapLoader {
     }
 
     fn len(&self) -> usize {
-        self.ckpt
-            .keys()
-            .filter(|k| !self.taken.contains(*k))
-            .count()
+        self.remaining_keys().len()
     }
 
     fn take(&mut self, key: &str) -> Result<(Vec<f32>, Vec<usize>)> {
@@ -482,6 +558,46 @@ impl crate::weight_loader::WeightLoader for SafetensorsMmapLoader {
         ))
     }
 
+    /// HF FP8 linears (`F8_E4M3` / `F8_E5M2`, `[out, in]` or an `[E, out, in]`
+    /// bank) as `Fp8E4m3B128` / `Fp8E5m2B128` blocks for `DequantMatMul`, the
+    /// stored scale folded in. `None` for everything else, or an FP8 layout
+    /// the blocks can't hold — the caller then takes it as f32.
+    fn take_packed(&mut self, key: &str) -> Result<Option<crate::weight_map::PackedWeightTensor>> {
+        use rlx_ir::lowp_codec::fp8_b128;
+        let Some(real) = self.resolve(key).filter(|r| !self.taken.contains(r)) else {
+            return Ok(None);
+        };
+        let scheme = match self.ckpt.stored_dtype(&real) {
+            Some(safetensors::Dtype::F8_E4M3) => rlx_ir::quant::QuantScheme::Fp8E4m3B128,
+            Some(safetensors::Dtype::F8_E5M2) => rlx_ir::quant::QuantScheme::Fp8E5m2B128,
+            Some(safetensors::Dtype::BF16) if self.keep_bf16 => {
+                let (bytes, _, shape) = self.ckpt.tensor_raw(&real)?;
+                if shape.len() != 2 {
+                    return Ok(None);
+                }
+                self.taken.insert(real);
+                return Ok(Some((bytes, rlx_ir::quant::QuantScheme::GgufBF16, shape)));
+            }
+            _ => return Ok(None),
+        };
+        let (codes, _, shape) = self.ckpt.tensor_raw(&real)?;
+        let scale = match self.ckpt.fp8_scale_key(&real) {
+            Some(skey) => Some(self.ckpt.load_tensor_f32(&skey)?),
+            None => None,
+        };
+        let packed = fp8_b128::pack_scaled(
+            &codes,
+            &shape,
+            scale.as_ref().map(|(s, sh)| (s.as_slice(), sh.as_slice())),
+            self.ckpt.fp8_block(),
+        )
+        .map_err(|e| anyhow::anyhow!("{key}: {e}"))?;
+        Ok(packed.map(|w_q| {
+            self.taken.insert(real);
+            (w_q, scheme, shape)
+        }))
+    }
+
     fn stored_dtype(&self, key: &str) -> Option<rlx_ir::DType> {
         use safetensors::Dtype as S;
         Some(match self.ckpt.stored_dtype(&self.resolve(key)?)? {
@@ -492,11 +608,77 @@ impl crate::weight_loader::WeightLoader for SafetensorsMmapLoader {
         })
     }
 
+    /// Untaken tensors, less the scales of FP8 weights (part of their weight).
     fn remaining_keys(&self) -> Vec<String> {
         self.ckpt
             .keys()
-            .filter(|k| !self.taken.contains(*k))
+            .filter(|k| !self.taken.contains(*k) && !self.ckpt.is_fp8_scale(k))
             .map(|s| s.to_string())
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod fp8_tests {
+    use super::*;
+    use crate::weight_loader::WeightLoader;
+    use safetensors::tensor::{Dtype, TensorView};
+
+    /// An HF block-FP8 linear (`F8_E4M3` + bf16 `weight_scale_inv` 128×128
+    /// grid, as Qwen3-FP8 ships): `take` gives the scaled f32, `take_packed`
+    /// the `Fp8E4m3B128` blocks that dequantize to the same values, and the
+    /// scale tensor is not a key of its own.
+    #[test]
+    fn fp8_linear_takes_scaled_and_packed() {
+        let (n, k) = (130usize, 256usize);
+        let codes: Vec<u8> = (0..n * k).map(|i| (i % 0x7e) as u8).collect();
+        let grid: Vec<u8> = (0..2 * 2)
+            .flat_map(|t| half::bf16::from_f32(0.25 * (t as f32 + 1.0)).to_le_bytes())
+            .collect();
+        let bias: Vec<u8> = [1.0f32, 2.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let tensors = [
+            (
+                "l.weight",
+                TensorView::new(Dtype::F8_E4M3, vec![n, k], &codes).unwrap(),
+            ),
+            (
+                "l.weight_scale_inv",
+                TensorView::new(Dtype::BF16, vec![2, 2], &grid).unwrap(),
+            ),
+            (
+                "l.bias",
+                TensorView::new(Dtype::F32, vec![2], &bias).unwrap(),
+            ),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("model.safetensors");
+        safetensors::serialize_to_file(tensors, None, &file).unwrap();
+
+        let mut f32_loader = SafetensorsMmapLoader::open_file(&file).unwrap();
+        let mut keys = f32_loader.remaining_keys();
+        keys.sort();
+        assert_eq!(keys, ["l.bias", "l.weight"]);
+        let (w, shape) = f32_loader.take("l.weight").unwrap();
+        assert_eq!(shape, vec![n, k]);
+        for (t, v) in w.iter().enumerate() {
+            let (i, j) = (t / k, t % k);
+            let s = 0.25 * (((i / 128) * 2 + j / 128) as f32 + 1.0);
+            let want = rlx_ir::quant::ScaledFormat::F8E4M3.decode(codes[t]) * s;
+            assert_eq!(*v, want, "({i}, {j})");
+        }
+
+        let mut packed = SafetensorsMmapLoader::open_file(&file).unwrap();
+        let (w_q, scheme, pshape) = packed.take_packed("l.weight").unwrap().expect("FP8 packs");
+        assert_eq!(
+            (scheme, pshape),
+            (rlx_ir::quant::QuantScheme::Fp8E4m3B128, vec![n, k])
+        );
+        let back = rlx_ir::lowp_codec::fp8_b128::dequant_scheme(scheme, &w_q, n * k).unwrap();
+        assert_eq!(back, w);
+        assert!(
+            packed.take_packed("l.bias").unwrap().is_none(),
+            "f32 stays unpacked"
+        );
+        assert_eq!(packed.remaining_keys(), ["l.bias"]);
     }
 }

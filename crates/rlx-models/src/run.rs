@@ -269,6 +269,23 @@ fn build_builtin(name: &str, path: &Path, opts: &AutoOptions) -> Result<Box<dyn 
                 );
             }
         }
+        "mistral-large4" => {
+            #[cfg(feature = "mistral-large4")]
+            {
+                // Any shard of the split GGUF; the routed experts stay on disk
+                // and are paged per token (~26 GB resident).
+                let po = rlx_mistral_large4::runner::options(opts);
+                Box::new(rlx_mistral_large4::MistralLarge4Runner::open(weights, &po)?)
+                    as Box<dyn LmRunner>
+            }
+            #[cfg(not(feature = "mistral-large4"))]
+            {
+                bail!(
+                    "auto_runner: runner `mistral-large4` requires feature `mistral-large4` \
+                     (enable rlx-models/mistral-large4)"
+                );
+            }
+        }
         "qwen4exp" => {
             #[cfg(feature = "qwen4exp")]
             {
@@ -455,6 +472,7 @@ builtin_ctor!(ctor_llama4, "llama4");
 builtin_ctor!(ctor_mllama, "mllama");
 builtin_ctor!(ctor_minimax_m3, "minimax-m3");
 builtin_ctor!(ctor_flint, "flint");
+builtin_ctor!(ctor_mistral_large4, "mistral-large4");
 
 /// Register every builtin family's constructor.
 ///
@@ -495,6 +513,9 @@ pub fn register_builtin_lm_runners() {
                 "the M3 VL variant takes its vision config from the checkpoint's config.json",
             ),
             LmRunnerRegistration::new("flint", ctor_flint).mmproj_note("Flint is text-only"),
+            LmRunnerRegistration::new("mistral-large4", ctor_mistral_large4).mmproj_note(
+                "the Pixtral vision tower of Mistral Large 4 is not ported; text only",
+            ),
         ];
         for reg in regs {
             register_lm_runner(reg);

@@ -13,6 +13,13 @@ repository.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 rlx-search = { workspace = true }
+rlx-nemo = { workspace = true }
+rlx-mcu = { workspace = true, features = ["std"] }
+rlx-citrinet-core = { workspace = true, features = ["std"] }
+serde_yaml = "0.9"
+
+[dev-dependencies]
+rlx-core = { workspace = true }
 
 [lints]
 workspace = true

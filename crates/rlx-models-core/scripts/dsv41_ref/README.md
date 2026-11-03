@@ -59,6 +59,36 @@ RLX_DSV41_WEIGHTS=/tmp/dsv41w cargo test -p rlx-models-core --release \
     --test dsv41_reference_parity
 ```
 
+### Releases
+
+`deepseek-ai/DeepSeek-V4.1-Flash-1017` is a weights-only update: same
+`config.json`, same `inference/` code, same 96,085 tensors at the same byte
+offsets, different bytes (attention output on the same input moves ~7%, and
+the routed experts change). `DSV41_REPO` picks the release for every script
+here:
+
+```sh
+export DSV41_REPO=deepseek-ai/DeepSeek-V4.1-Flash-1017
+./fetch.sh
+python3 fetch_subset.py --out /tmp/dsv41w-1017/layer0.safetensors --layer 0
+python3 fetch_subset.py --out /tmp/dsv41w-1017/layer2.safetensors --layer 2
+python3 fetch_subset.py --out /tmp/dsv41w-1017/quant.safetensors --what quant --tokenizer
+RLX_REF_NOQUANT=1 python3 dump_real_layer.py /tmp/dsv41w-1017/layer0.safetensors 0
+RLX_REF_NOQUANT=1 python3 dump_real_layer.py /tmp/dsv41w-1017/layer2.safetensors 2
+python3 dump_real_quant.py /tmp/dsv41w-1017/quant.safetensors
+python3 dump_real_moe.py --layer 0 --out-weights /tmp/dsv41w-1017/moe.safetensors \
+    --out-ref ../../tests/fixtures/dsv41_1017/dsv41_real_moe_ref.json
+RLX_DSV41_WEIGHTS=/tmp/dsv41w-1017 cargo test -p rlx-models-core --release \
+    --test dsv41_reference_parity
+```
+
+Digests land in `tests/fixtures/dsv41_<rev>/` (the original's stay in
+`tests/fixtures/`). `fetch_subset.py` stamps the output directory with
+`dsv41_repo.txt` and refuses to mix releases in one directory; the tests read
+the stamp to pick the digests, and a directory without one is treated as the
+original. Checking one release's bytes against the other's digests fails at
+the first sample, which is the point of keeping them apart.
+
 About 300 MB in total, and it buys four things:
 
 | test | what real bytes prove |

@@ -63,7 +63,7 @@ fn default_hidden_act() -> String {
 
 impl BertConfig {
     pub fn from_file(path: &Path) -> anyhow::Result<Self> {
-        let data = std::fs::read_to_string(path)?;
+        let data = crate::weight_map::read_file_to_string(path)?;
         Ok(serde_json::from_str(&data)?)
     }
 
@@ -100,7 +100,7 @@ fn default_rotary_emb_base() -> f64 {
 
 impl NomicBertConfig {
     pub fn from_file(path: &Path) -> anyhow::Result<Self> {
-        let data = std::fs::read_to_string(path)?;
+        let data = crate::weight_map::read_file_to_string(path)?;
         Ok(serde_json::from_str(&data)?)
     }
 }
@@ -134,7 +134,7 @@ fn default_vision_ln_eps() -> f64 {
 
 impl NomicVisionConfig {
     pub fn from_file(path: &Path) -> anyhow::Result<Self> {
-        let data = std::fs::read_to_string(path)?;
+        let data = crate::weight_map::read_file_to_string(path)?;
         Ok(serde_json::from_str(&data)?)
     }
     pub fn intermediate_size(&self) -> usize {

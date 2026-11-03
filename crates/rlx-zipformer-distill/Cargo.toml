@@ -1,0 +1,49 @@
+[package]
+name = "rlx-zipformer-distill"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Distill a small streaming Zipformer2 from a larger one with RLX (Metal autodiff), for rlx-kroko-core on MCUs"
+keywords.workspace = true
+categories.workspace = true
+repository.workspace = true
+readme = "README.md"
+publish = false
+
+[features]
+default = ["metal"]
+metal = ["rlx-tensor/eval-metal"]
+# CPU only (always built; this names it for `--features cpu`).
+cpu = []
+cuda = ["rlx-tensor/eval-cuda"]
+# AMD: the Radeon iGPU (ROCm / HIP), native Vulkan, and the Ryzen AI NPU (XDNA).
+rocm = ["rlx-tensor/eval-rocm"]
+vulkan = ["rlx-tensor/eval-vulkan"]
+xdna = ["rlx-tensor/eval-xdna"]
+
+[dependencies]
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+safetensors = { workspace = true }
+rlx-tensor = { workspace = true, features = ["dsl", "optim"] }
+rlx-optim = { workspace = true }
+rlx-driver = { workspace = true }
+half = { workspace = true }
+rlx-core = { workspace = true }
+rlx-kroko = { workspace = true }
+rlx-kroko-core = { workspace = true, features = ["std"] }
+memmap2 = "0.9"
+symphonia = { workspace = true }
+
+[[bin]]
+name = "zipformer-distill-prep"
+path = "src/bin/prep.rs"
+
+[[bin]]
+name = "zipformer-distill-train"
+path = "src/bin/train.rs"
+
+[lints]
+workspace = true

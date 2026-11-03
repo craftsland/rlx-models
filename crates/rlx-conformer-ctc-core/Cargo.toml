@@ -1,0 +1,28 @@
+[package]
+name = "rlx-conformer-ctc-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "no_std int8 Conformer-CTC ASR (NeMo stt_en_conformer_ctc_small) for MCUs: log-mel frontend, int8 encoder, greedy CTC, no allocator"
+keywords.workspace = true
+categories.workspace = true
+repository.workspace = true
+readme = "README.md"
+
+[features]
+default = ["std"]
+# `std` adds the model-file writer (`blob::Writer`) that the host exporter in
+# `rlx-conformer-ctc` uses. Inference never needs it: `Model`, `Frontend` and
+# `transcribe` run from a borrowed byte slice and caller-provided scratch.
+std = ["rlx-mcu/std"]
+# Arm DSP-extension int8 kernels (Cortex-M4/M7/M33); same bits as without.
+dsp = ["rlx-mcu/dsp"]
+
+[dependencies]
+rlx-mcu = { workspace = true }
+libm = { version = "0.2", default-features = false }
+
+[lints]
+workspace = true

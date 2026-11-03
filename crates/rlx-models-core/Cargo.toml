@@ -54,10 +54,10 @@ rlx-rocm = { workspace = true, optional = true }
 
 
 # The workspace pin carries no regex backend (see the root Cargo.toml).
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
 tokenizers = { workspace = true, optional = true, features = ["fancy-regex"] }
 
-[target.'cfg(target_arch = "wasm32")'.dependencies]
+[target.'cfg(target_family = "wasm")'.dependencies]
 tokenizers = { workspace = true, optional = true, features = ["unstable_wasm"] }
 
 [features]

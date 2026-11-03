@@ -37,6 +37,7 @@
 
 #[cfg(feature = "export")]
 pub mod export;
+pub mod mcu;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

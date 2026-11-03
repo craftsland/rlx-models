@@ -1,0 +1,26 @@
+[package]
+name = "rlx-voice-link-bench"
+version = "0.2.19"
+edition = "2024"
+license = "GPL-3.0-only"
+publish = false
+description = "Bare-metal Cortex-M4F instruction counts for the voice link's device-side stages: voice gate, IMA-ADPCM, TEN-VAD"
+
+# Outside the workspace (listed in its `exclude`): bare-metal target.
+
+[dependencies]
+rlx-voice-link = { path = "../rlx-voice-link" }
+rlx-ten-vad-core = { path = "../rlx-ten-vad-core", default-features = false }
+
+[[bin]]
+name = "voice-link-bench"
+path = "src/main.rs"
+test = false
+bench = false
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = false

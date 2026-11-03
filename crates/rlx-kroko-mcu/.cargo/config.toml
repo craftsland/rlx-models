@@ -1,0 +1,12 @@
+[build]
+# ESP32-P4's ISA (rv32imafc). The S3 is Xtensa and needs the esp toolchain;
+# the int8 kernels are the same code either way.
+target = "riscv32imafc-unknown-none-elf"
+
+[target.'cfg(target_arch = "riscv32")']
+rustflags = ["-C", "link-arg=-Tlink.x"]
+
+[target.riscv32imafc-unknown-none-elf]
+# 256 MiB: the 99 MB model is linked in (external NAND on silicon, paged one layer at a time) plus scratch
+# (PSRAM on silicon).
+runner = "qemu-system-riscv32 -machine virt -m 256M -bios none -nographic -kernel"

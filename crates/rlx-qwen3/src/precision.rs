@@ -79,6 +79,8 @@ dequant_forms! {
         QuantScheme::GgufNVFP4, QuantScheme::GgufQ1_0, QuantScheme::GgufQ2_0,
         QuantScheme::GgufFV5, QuantScheme::GgufFV5B, QuantScheme::GgufG8_0,
         QuantScheme::GgufPtq1_0, QuantScheme::GgufBF16,
+        // HF block FP8 (`f32 scale | 128 codes` blocks) rides the GGUF path.
+        QuantScheme::Fp8E4m3B128, QuantScheme::Fp8E5m2B128,
     ],
     // Affine / MLX / int-block / FP8 — separate code + scale + zp/bias operands.
     affine4: [

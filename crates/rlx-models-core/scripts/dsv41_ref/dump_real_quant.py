@@ -61,8 +61,9 @@ def main():
         print(f"{name:<40} {tuple(t.shape)} {out[name]['layout']:<10} "
               f"absmean {out[name]['absmean']:.5g}  n_samples {len(out[name]['samples'])}")
 
-    here = os.path.dirname(os.path.abspath(__file__))
-    dst = os.path.join(here, "..", "..", "tests", "fixtures", "dsv41_real_quant_digest.json")
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from fetch_subset import fixture_dir
+    dst = os.path.join(fixture_dir(), "dsv41_real_quant_digest.json")
     json.dump(out, open(dst, "w"), separators=(",", ":"))
     print("wrote", os.path.relpath(dst))
 

@@ -31,6 +31,8 @@
 //! the encoder can reuse the streaming Conformer machinery in
 //! `rlx-wav2vec2-bert` / `rlx-nemotron-asr`.
 
+pub mod mcu;
+
 use anyhow::{Result, ensure};
 pub use rlx_audio_blocks::decoders::transducer::{
     GreedyTransducerResult, StatelessTransducerCore, TransducerStep,

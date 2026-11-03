@@ -2,7 +2,7 @@
 # portable `exp`.
 [package]
 name = "rlx-tts-program-vmath"
-version = "0.2.19"
+version = "0.2.20"
 edition = "2024"
 publish = false
 

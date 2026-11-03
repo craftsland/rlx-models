@@ -95,6 +95,7 @@ pub mod prompt_cache;
 pub mod resource;
 pub mod safetensors_checkpoint;
 pub mod standard_decoder;
+pub mod tokenizer;
 pub mod vision_ops_ir;
 pub mod voice_clone;
 pub mod weight_graph;

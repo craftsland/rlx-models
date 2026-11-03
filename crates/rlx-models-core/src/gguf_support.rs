@@ -466,13 +466,26 @@ fn prefer_first_split_shard(ggufs: Vec<PathBuf>) -> Vec<PathBuf> {
     if firsts.is_empty() { ggufs } else { firsts }
 }
 
+/// `split.count` / `split.no`: llama.cpp's `gguf-split` writes them as `u16`,
+/// which [`MetaValue::as_u32`] does not accept.
+fn split_u32(v: &MetaValue) -> Option<u32> {
+    match v {
+        MetaValue::U8(v) => Some(u32::from(*v)),
+        MetaValue::U16(v) => Some(u32::from(*v)),
+        MetaValue::I16(v) => u32::try_from(*v).ok(),
+        other => other.as_u32(),
+    }
+}
+
 /// Other parts of the same multi-file GGUF split in `path`'s directory (sorted by `split.no`).
+///
+/// Reads headers only: a shard of a large split is tens of GB.
 pub fn gguf_split_siblings(path: &Path) -> Result<Option<Vec<PathBuf>>> {
-    let raw = GgufFile::from_path(path).with_context(|| format!("opening GGUF {path:?}"))?;
+    let raw = GgufFile::header_from_path(path).with_context(|| format!("opening GGUF {path:?}"))?;
     let count = raw
         .metadata
         .get("split.count")
-        .and_then(MetaValue::as_u32)
+        .and_then(split_u32)
         .unwrap_or(1);
     if count <= 1 {
         return Ok(None);
@@ -480,12 +493,12 @@ pub fn gguf_split_siblings(path: &Path) -> Result<Option<Vec<PathBuf>>> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let mut parts: Vec<(u32, PathBuf)> = Vec::new();
     for candidate in list_gguf_files_in_dir(dir)? {
-        let other = GgufFile::from_path(&candidate)
+        let other = GgufFile::header_from_path(&candidate)
             .with_context(|| format!("opening split candidate {candidate:?}"))?;
         let other_count = other
             .metadata
             .get("split.count")
-            .and_then(MetaValue::as_u32)
+            .and_then(split_u32)
             .unwrap_or(1);
         if other_count != count {
             continue;
@@ -493,7 +506,7 @@ pub fn gguf_split_siblings(path: &Path) -> Result<Option<Vec<PathBuf>>> {
         let no = other
             .metadata
             .get("split.no")
-            .and_then(MetaValue::as_u32)
+            .and_then(split_u32)
             .unwrap_or(0);
         parts.push((no, candidate));
     }
@@ -560,7 +573,7 @@ pub fn load_gguf_file(path: &Path) -> Result<GgufFile> {
     let count = raw
         .metadata
         .get("split.count")
-        .and_then(MetaValue::as_u32)
+        .and_then(split_u32)
         .unwrap_or(1);
     if count <= 1 {
         return Ok(raw);
@@ -592,11 +605,11 @@ pub fn load_gguf_file(path: &Path) -> Result<GgufFile> {
 
 /// If the file is a multi-part GGUF split, return an error hint when merge is not possible.
 pub fn gguf_split_hint(path: &Path) -> Result<Option<String>> {
-    let raw = GgufFile::from_path(path).with_context(|| format!("opening GGUF {path:?}"))?;
+    let raw = GgufFile::header_from_path(path).with_context(|| format!("opening GGUF {path:?}"))?;
     let count = raw
         .metadata
         .get("split.count")
-        .and_then(MetaValue::as_u32)
+        .and_then(split_u32)
         .unwrap_or(1);
     if count <= 1 {
         return Ok(None);
@@ -604,7 +617,7 @@ pub fn gguf_split_hint(path: &Path) -> Result<Option<String>> {
     let no = raw
         .metadata
         .get("split.no")
-        .and_then(MetaValue::as_u32)
+        .and_then(split_u32)
         .unwrap_or(0);
     let mut msg = format!(
         "{path:?} is part {no} of a {count}-file GGUF split; \

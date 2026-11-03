@@ -20,7 +20,7 @@ rlx-ir = { workspace = true }
 rlx-runtime = { workspace = true }
 rlx-qwen35 = { workspace = true }
 rlx-torch-ckpt = { workspace = true }
-rlx-tune = { path = "../rlx-tune", version = "0.2.19", optional = true }
+rlx-tune = { path = "../rlx-tune", version = "0.2.20", optional = true }
 rlx-autodiff = { workspace = true, optional = true }
 rlx-compile = { workspace = true, optional = true }
 rlx-fusion = { workspace = true, optional = true }

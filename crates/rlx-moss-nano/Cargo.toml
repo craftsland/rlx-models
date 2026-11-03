@@ -25,7 +25,7 @@ rlx-runtime = { workspace = true, default-features = false, features = ["cpu"] }
 rlx-gguf = { workspace = true }
 rlx-assets = { workspace = true, features = ["rlxp", "native-pack"] }
 # Native RLX runtime: imports the ONNX graphs → rlx-ir → compiled graphs (no ORT).
-rlx-tiny-tts = { path = "../rlx-tiny-tts", version = "0.2.19", default-features = false }
+rlx-tiny-tts = { path = "../rlx-tiny-tts", version = "0.2.20", default-features = false }
 rlx-core = { workspace = true, optional = true }
 
 [dependencies.hf-hub]

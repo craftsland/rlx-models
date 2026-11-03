@@ -185,6 +185,47 @@ impl ConformerCtc {
         Ok((out[..keep].to_vec(), real_t))
     }
 
+    /// Encoder output `[t, d_model]` for `pcm` with the graph built at the
+    /// exact mel length (no bucket padding, which the reference attention
+    /// would otherwise see). For parity checks of the MCU port.
+    #[doc(hidden)]
+    pub fn encode_unpadded(&mut self, pcm: &[f32]) -> Result<(Vec<f32>, usize)> {
+        ensure!(!pcm.is_empty(), "empty audio");
+        let mel = mel::log_mel(&self.cfg, pcm, self.frontend.as_ref());
+        let frames = mel.n_frames;
+        self.ensure_encoder(frames)?;
+        let key = frames as u64;
+        let params = Arc::clone(
+            self.enc_params
+                .get(&key)
+                .context("encoder params missing after ensure")?,
+        );
+        let cg = self
+            .enc_cache
+            .get_or_compile(key, || panic!("encoder cache missing after ensure"));
+        for (name, data) in params.iter() {
+            cg.set_param(name, data);
+        }
+        let out = cg
+            .run(&[("mel", mel.data.as_slice())])
+            .into_iter()
+            .next()
+            .context("encoder produced no output")?;
+        self.slice_encoder_out(out, frames, frames)
+    }
+
+    /// CTC greedy ids for encoder output `enc` (`[t, d_model]`).
+    #[doc(hidden)]
+    pub fn ctc_ids(&self, enc: &[f32], t: usize) -> Result<Vec<u32>> {
+        let logits = self.ctc.logits(enc, t)?;
+        Ok(ctc::greedy_decode(
+            &logits,
+            t,
+            self.cfg.num_classes,
+            self.cfg.blank_id,
+        ))
+    }
+
     /// Transcribe mono PCM at the model's sample rate (see [`AsrConfig::sample_rate`]).
     ///
     /// Resample with [`crate::wav::resample`] when the source rate differs.

@@ -60,7 +60,7 @@ tokenizer = ["dep:tokenizers", "qwen35-tokenizer"]
 # Alias matching the cfg gates in src/tokenizer.rs / src/chat.rs — those
 # checks use `feature = "qwen35-tokenizer"` and would otherwise always
 # fall through to the "support not compiled" branch.
-qwen35-tokenizer = ["dep:tokenizers"]
+qwen35-tokenizer = ["dep:tokenizers", "rlx-core/tokenizer"]
 qwen35-vlm = ["dep:image"]
 # `export::export_rlxp`: a GGUF as an `.rlxp` package rlx runs alone.
 export = ["rlx-core/export", "qwen35-tokenizer"]

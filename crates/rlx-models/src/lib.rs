@@ -165,6 +165,11 @@ pub mod pplx_decider {
     pub use rlx_pplx_decider::*;
 }
 
+#[cfg(feature = "lfm3-audio")]
+pub mod lfm3_audio {
+    pub use rlx_lfm3_audio::*;
+}
+
 #[cfg(feature = "kev")]
 pub mod kev {
     pub use rlx_kev::*;

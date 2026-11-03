@@ -50,7 +50,12 @@ pub struct WeightFormatRegistration {
     pub open: WeightLoaderFactory,
 }
 
-fn open_safetensors(path: &Path) -> Result<Box<dyn WeightLoader>> {
+/// The lazily-mapped safetensors loader for a checkpoint file, a sharded
+/// directory (or any of its shards), or a directory holding one
+/// `model.safetensors`; `None` when `path` is none of those.
+pub fn open_safetensors_mmap(
+    path: &Path,
+) -> Result<Option<crate::safetensors_checkpoint::SafetensorsMmapLoader>> {
     // HuggingFace sharded checkpoints: prefer mmap index over a single shard file
     // so callers can pass either the directory or any shard path.
     let dir = if path.is_dir() {
@@ -61,7 +66,7 @@ fn open_safetensors(path: &Path) -> Result<Box<dyn WeightLoader>> {
             .unwrap_or_else(|| path.to_path_buf())
     };
     if dir.join("model.safetensors.index.json").is_file() {
-        return Ok(Box::new(
+        return Ok(Some(
             crate::safetensors_checkpoint::SafetensorsMmapLoader::open(&dir)?,
         ));
     }
@@ -81,10 +86,22 @@ fn open_safetensors(path: &Path) -> Result<Box<dyn WeightLoader>> {
     // any builder asked for a tensor, and builders that keep weights at their
     // stored width (`WeightStorage`) need the dtype it erased.
     if file.is_file() {
-        return Ok(Box::new(
+        return Ok(Some(
             crate::safetensors_checkpoint::SafetensorsMmapLoader::open_file(&file)?,
         ));
     }
+    Ok(None)
+}
+
+fn open_safetensors(path: &Path) -> Result<Box<dyn WeightLoader>> {
+    if let Some(loader) = open_safetensors_mmap(path)? {
+        return Ok(Box::new(loader));
+    }
+    let file = if path.is_dir() {
+        path.join("model.safetensors")
+    } else {
+        path.to_path_buf()
+    };
     let path_str = file
         .to_str()
         .ok_or_else(|| anyhow!("non-utf8 path {:?}", file))?;

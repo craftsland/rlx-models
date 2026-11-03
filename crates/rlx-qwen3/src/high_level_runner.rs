@@ -283,7 +283,9 @@ impl Qwen3RunnerBuilder {
         // straight from the GGUF — so the low-memory path gets a real m=1 decode
         // loop rather than re-running the prefill graph every token.
         let mut generator = if packed {
-            if matches!(format, WeightFormat::Gguf) {
+            // An HF FP8 safetensors checkpoint rides the same generator: its
+            // loader packs the FP8 linears as block-FP8 `DequantMatMul` weights.
+            if matches!(format, WeightFormat::Gguf | WeightFormat::Safetensors) {
                 // Packed K-quant executes on the packed execution device (CPU
                 // where GPU packed is not yet verified).
                 let exec = rlx_core::flow_bridge::packed_gguf_execution_device(device);
@@ -566,6 +568,13 @@ impl Qwen3Runner {
     /// packed/quantized weights, which don't build the F32 generator.
     pub fn into_generator(self) -> Option<Qwen3Generator> {
         self.generator
+    }
+
+    /// Whether generation re-runs the packed prefill graph for every token
+    /// (formats without a native packed generator, e.g. MLX) rather than
+    /// decoding one token at a time against a KV cache.
+    pub fn reruns_prefill_per_token(&self) -> bool {
+        self.packed.is_some()
     }
 
     /// Bypass the cached decode path; every generated token re-runs the full
@@ -1096,6 +1105,8 @@ fn load_safetensors_config(
         Some(Qwen3ConfigSource::Embedded) => {
             bail!("Qwen3ConfigSource::Embedded only valid for GGUF; pass JsonFile for safetensors")
         }
+        // A sharded checkpoint resolves to its directory, which holds the config.
+        None if path.is_dir() => path.join("config.json"),
         None => path
             .parent()
             .ok_or_else(|| anyhow!("weights path has no parent dir"))?
@@ -1107,6 +1118,17 @@ fn load_safetensors_config(
 }
 
 fn default_st_size_estimate(path: &Path) -> u64 {
+    if path.is_dir() {
+        // A sharded checkpoint: its shards together.
+        return std::fs::read_dir(path)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "safetensors"))
+            .filter_map(|e| e.metadata().ok())
+            .map(|m| m.len())
+            .sum();
+    }
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 

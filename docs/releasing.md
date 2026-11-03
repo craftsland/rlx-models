@@ -31,12 +31,12 @@ Both are checked by `python3 scripts/check-publishable.py --release`.
 
 ### Pin the upstream version deliberately
 
-Upstream is **0.2.19**; this workspace is 0.2.19 and pins every upstream
-crate at `^0.2.19` (`rlx-program` included, in the standalone `program/`
-manifests). The local `../rlx` checkout is 0.2.19 too, so the patched build
+Upstream is **0.2.20**; this workspace is 0.2.20 and pins every upstream
+crate at `^0.2.20` (`rlx-program` included, in the standalone `program/`
+manifests). The local `../rlx` checkout is 0.2.20 too, so the patched build
 and a registry build resolve to the same thing — there is no drift of the kind
 that bit the 0.2.14 cycle. When upstream moves again, bump the pins and the
-workspace version together, or pin `=0.2.19` on purpose. Leaving it implicit
+workspace version together, or pin `=0.2.20` on purpose. Leaving it implicit
 is how the two lines drift apart.
 
 ## Gates

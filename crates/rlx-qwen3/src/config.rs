@@ -77,9 +77,10 @@ pub struct Qwen3Config {
 
     // ─── MoE fields (PLAN.md M1 — for `qwen3-30b-a3b-instruct`) ───
     /// Total number of routed experts per MoE layer (0 = dense model).
-    /// HF key: `num_experts` / `n_routed_experts`. GGUF key:
+    /// HF key: `num_experts` / `n_routed_experts`, or `num_local_experts` as
+    /// transformers 5 saves a Qwen3-MoE config. GGUF key:
     /// `qwen3.expert_count`.
-    #[serde(default, alias = "n_routed_experts")]
+    #[serde(default, alias = "n_routed_experts", alias = "num_local_experts")]
     pub num_experts: usize,
     /// Number of experts activated per token (top-k routing).
     /// HF key: `num_experts_per_tok`. GGUF key: `qwen3.expert_used_count`.

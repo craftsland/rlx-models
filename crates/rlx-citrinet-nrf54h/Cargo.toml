@@ -1,0 +1,32 @@
+[package]
+name = "rlx-citrinet-nrf54h"
+version = "0.2.19"
+edition = "2024"
+license = "GPL-3.0-only"
+publish = false
+description = "Bare-metal Cortex-M33 firmware (nRF54H20 application core) running int8 Citrinet CTC speech recognition on rlx-citrinet-core"
+
+# Outside the workspace (listed in its `exclude`): bare-metal target with its
+# own linker script and profile.
+
+[features]
+default = ["dsp"]
+# SXTB16/SMLAD int8 kernels. `--no-default-features` builds the portable loops
+# for comparison; both must give the same bits.
+dsp = ["rlx-citrinet-core/dsp"]
+
+[dependencies]
+rlx-citrinet-core = { path = "../rlx-citrinet-core", default-features = false }
+
+[[bin]]
+name = "citrinet-nrf54h"
+path = "src/main.rs"
+test = false
+bench = false
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = false

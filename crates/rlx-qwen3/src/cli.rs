@@ -183,10 +183,10 @@ pub fn run(args: &[String]) -> Result<()> {
 
     let t0 = std::time::Instant::now();
     let mut printed = 0;
-    if packed {
+    if runner.reruns_prefill_per_token() {
         eprintln!(
             "[rlx-qwen3] packed streaming: each token costs ~one full prefill \
-             (low-memory path for large Q4_K_M GGUFs)"
+             (no native packed decode for this format)"
         );
     }
     // Without streaming the tokens are printed once generation finishes.

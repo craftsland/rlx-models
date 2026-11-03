@@ -14,7 +14,7 @@ repository.workspace = true
 anyhow = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 rlx-runtime = { workspace = true, default-features = false, features = ["cpu"] }
-rlx-wespeaker = { path = "../rlx-wespeaker", version = "0.2.19", default-features = false, features = ["native"], optional = true }
+rlx-wespeaker = { path = "../rlx-wespeaker", version = "0.2.20", default-features = false, features = ["native"], optional = true }
 
 [features]
 default = []

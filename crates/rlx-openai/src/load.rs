@@ -63,6 +63,47 @@ impl EngineSpec {
         }
     }
 
+    /// `--eos`, else the checkpoint's own `eos_token_id`s from
+    /// `config.json` and `generation_config.json` (number or list). Without
+    /// this an HF directory served with no `--eos` never stopped early: the
+    /// stop list was empty, so replies ran to `--max-tokens` and on into
+    /// invented turns.
+    fn eos_ids(&self) -> Vec<u32> {
+        if !self.eos.is_empty() {
+            return self.eos.clone();
+        }
+        let dir = if self.weights.is_dir() {
+            self.weights.clone()
+        } else {
+            self.weights
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_default()
+        };
+        let mut ids = Vec::new();
+        for f in ["config.json", "generation_config.json"] {
+            let Some(v) = std::fs::read_to_string(dir.join(f))
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            else {
+                continue;
+            };
+            let e = &v["eos_token_id"];
+            let found = e.as_u64().into_iter().chain(
+                e.as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_u64),
+            );
+            for id in found {
+                if !ids.contains(&(id as u32)) {
+                    ids.push(id as u32);
+                }
+            }
+        }
+        ids
+    }
+
     fn template_dir(&self) -> PathBuf {
         self.tokenizer_dir
             .clone()
@@ -113,13 +154,42 @@ fn parse_device(s: &str) -> Result<Device> {
     Device::from_str(s).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
+/// The chat template of a Hugging Face checkpoint directory:
+/// `tokenizer_config.json`'s `chat_template`, else `chat_template.jinja`,
+/// with its BOS/EOS strings. `auto_chat_template` reads GGUF metadata only,
+/// so without this every safetensors directory fell back to plain roles and
+/// instruct models answered by echoing the prompt.
+fn hf_chat_template(dir: &Path) -> Option<rlx_text::ChatTemplate> {
+    let dir = if dir.is_dir() { dir } else { dir.parent()? };
+    let cfg: serde_json::Value = std::fs::read_to_string(dir.join("tokenizer_config.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let source = cfg["chat_template"]
+        .as_str()
+        .map(String::from)
+        .or_else(|| std::fs::read_to_string(dir.join("chat_template.jinja")).ok())?;
+    // Special tokens are strings or `{"content": …}` objects.
+    let token = |k: &str| {
+        let v = &cfg[k];
+        v.as_str()
+            .or_else(|| v["content"].as_str())
+            .map(String::from)
+    };
+    let t = rlx_text::ChatTemplate::from_source(source).ok()?;
+    eprintln!("[rlx-openai] chat template from {dir:?}");
+    Some(t.with_tokens(token("bos_token"), token("eos_token")))
+}
+
 fn load_tokenizer_and_template(
     tok_path: &Path,
     template_dir: &Path,
 ) -> Result<(rlx_text::TokenizerHandle, Option<rlx_text::ChatTemplate>)> {
     let tokenizer =
         load_tokenizer(tok_path).with_context(|| format!("loading tokenizer {tok_path:?}"))?;
-    let chat_template = auto_chat_template(template_dir).ok();
+    let chat_template = auto_chat_template(template_dir)
+        .ok()
+        .or_else(|| hf_chat_template(template_dir));
     if chat_template.is_none() {
         eprintln!("[rlx-openai] no chat template under {template_dir:?}; plain roles");
     }
@@ -136,7 +206,7 @@ fn single_lm(
         runner,
         tokenizer,
         chat_template,
-        spec.eos.clone(),
+        spec.eos_ids(),
         spec.model_id.clone(),
     );
     if spec.prompt_cache_mb > 0 {
@@ -188,7 +258,7 @@ fn load_qwen3(spec: &EngineSpec) -> Result<Arc<dyn Engine>> {
             Box::new(FusedBatchRunner::with_kv_quant(generator, kv_quant)),
             tokenizer,
             chat_template,
-            spec.eos.clone(),
+            spec.eos_ids(),
             spec.model_id.clone(),
             spec.batch_tokens,
             spec.max_batch,
@@ -204,7 +274,7 @@ fn load_qwen3(spec: &EngineSpec) -> Result<Arc<dyn Engine>> {
             Box::new(br),
             tokenizer,
             chat_template,
-            spec.eos.clone(),
+            spec.eos_ids(),
             spec.model_id.clone(),
             spec.batch_tokens,
             spec.max_batch,

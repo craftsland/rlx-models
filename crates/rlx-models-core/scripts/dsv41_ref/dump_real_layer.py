@@ -190,10 +190,10 @@ def main():
             "samples": f.reshape(-1)[::977].tolist(),
         }
 
-    dst = os.path.join(here, "..", "..", "tests", "fixtures",
-                       f"dsv41_real_layer{LAYER}_digest.json")
+    from fetch_subset import REPO, fixture_dir
+    dst = os.path.join(fixture_dir(), f"dsv41_real_layer{LAYER}_digest.json")
     json.dump(
-        {"seq": SEQ, "layer": LAYER, "compress_ratio": ratio,
+        {"repo": REPO, "seq": SEQ, "layer": LAYER, "compress_ratio": ratio,
          "attn_out": digest(attn_out), "attn_norm_out": digest(xa),
          "attn_pre": attn_pre.reshape(-1).tolist()},
         open(dst, "w"), separators=(",", ":"))

@@ -23,8 +23,6 @@ rlx-cpu = { workspace = true }
 rlx-gguf = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-# Text prompts + detokenize via the GGUF-embedded gpt2 BPE (LFM2 uses it).
-rlx-qwen35 = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokenizers = { workspace = true }
@@ -47,8 +45,9 @@ required-features = ["tokenizer"]
 default = []
 # `export::export_rlxp`: a checkpoint as an `.rlxp` package rlx runs alone.
 export = ["rlx-core/export"]
-# Text in / text out for the GGUF runner (reuses the GGUF gpt2 BPE reader).
-tokenizer = ["dep:rlx-qwen35", "rlx-qwen35/tokenizer"]
+# Text in / text out for the GGUF runner (the GGUF-embedded byte-level BPE,
+# `rlx_core::tokenizer`).
+tokenizer = ["rlx-core/tokenizer"]
 metal = ["rlx-runtime/metal"]
 mlx = ["rlx-runtime/mlx"]
 cuda = ["rlx-runtime/cuda"]

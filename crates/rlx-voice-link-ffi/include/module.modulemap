@@ -1,0 +1,5 @@
+module RlxVoiceLinkFFI {
+    header "rlx_voice_link.h"
+    link "rlx_voice_link_ffi"
+    export *
+}

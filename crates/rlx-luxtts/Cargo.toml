@@ -23,7 +23,7 @@ rlx-runtime = { workspace = true, default-features = false, features = ["cpu"] }
 rlx-tiny-tts = { workspace = true }
 # Bundled espeak-ng phonemizer only (reused; LuxTTS is a char-level espeak-IPA
 # tokenizer like KittenTTS).
-rlx-kittentts = { path = "../rlx-kittentts", version = "0.2.19", default-features = false }
+rlx-kittentts = { path = "../rlx-kittentts", version = "0.2.20", default-features = false }
 rlx-core = { workspace = true, optional = true }
 espeak-ng = { version = "0.2.0", optional = true, default-features = false, features = ["bundled-data-en"] }
 tempfile = { version = "3", optional = true }

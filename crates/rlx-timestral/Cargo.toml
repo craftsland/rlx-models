@@ -16,7 +16,7 @@ rlx-cli = { workspace = true }
 rlx-core = { workspace = true }
 rlx-ir = { workspace = true }
 rlx-runtime = { workspace = true }
-rlx-tune = { path = "../rlx-tune", version = "0.2.19" }
+rlx-tune = { path = "../rlx-tune", version = "0.2.20" }
 anyhow = { workspace = true }
 ndarray = "0.16"
 serde = { workspace = true, features = ["derive"] }

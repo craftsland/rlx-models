@@ -225,9 +225,21 @@ impl WeightMap {
     /// Load weights, skipping tensor names present in `exclude` (saves RAM when
     /// bf16/NVFP4 linears are loaded separately for GPU upload).
     pub fn from_file_excluding(path: &str, exclude: &HashSet<String>) -> Result<Self> {
-        let data = std::fs::read(path).with_context(|| format!("reading {path}"))?;
+        let data =
+            read_file(std::path::Path::new(path)).with_context(|| format!("reading {path}"))?;
+        Self::from_bytes_excluding(&data, exclude)
+    }
+
+    /// [`Self::from_file`] over safetensors bytes already in memory (a file
+    /// the caller read itself, e.g. one mounted in a browser).
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        Self::from_bytes_excluding(data, &HashSet::new())
+    }
+
+    /// [`Self::from_file_excluding`] over safetensors bytes already in memory.
+    pub fn from_bytes_excluding(data: &[u8], exclude: &HashSet<String>) -> Result<Self> {
         let st =
-            safetensors::SafeTensors::deserialize(&data).with_context(|| "parsing safetensors")?;
+            safetensors::SafeTensors::deserialize(data).with_context(|| "parsing safetensors")?;
 
         let mut tensors = HashMap::new();
         let mut stored = HashMap::new();
@@ -568,4 +580,30 @@ mod tests {
         // Original: [[1,2,3],[4,5,6]] → Transposed: [[1,4],[2,5],[3,6]]
         assert_eq!(data, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
     }
+}
+
+/// How the model loaders read a file: `std::fs` unless [`set_file_reader`]
+/// installed another (a browser build points it at its virtual file system,
+/// where fetched checkpoints are mounted, since `std::fs` always fails on wasm).
+static FILE_READER: std::sync::OnceLock<fn(&std::path::Path) -> std::io::Result<Vec<u8>>> =
+    std::sync::OnceLock::new();
+
+/// Route [`WeightMap::from_file`] and the config loaders through `reader`.
+/// Process-wide and set once; returns false if a reader was already set.
+pub fn set_file_reader(reader: fn(&std::path::Path) -> std::io::Result<Vec<u8>>) -> bool {
+    FILE_READER.set(reader).is_ok()
+}
+
+/// Read `path` through the installed reader (`std::fs::read` by default).
+pub fn read_file(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    match FILE_READER.get() {
+        Some(r) => r(path),
+        None => std::fs::read(path),
+    }
+}
+
+/// [`read_file`] as UTF-8.
+pub fn read_file_to_string(path: &std::path::Path) -> std::io::Result<String> {
+    String::from_utf8(read_file(path)?)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }

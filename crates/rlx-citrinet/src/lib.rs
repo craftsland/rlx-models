@@ -25,6 +25,8 @@
 //! CTC decode ([`ctc_greedy_decode`] / [`ctc_greedy_decode_logits`]), which any CTC
 //! model (Conformer-CTC, Wav2Vec2-CTC, …) can reuse.
 
+pub mod mcu;
+
 use anyhow::{Result, ensure};
 
 /// Citrinet config. The canonical models are `Citrinet-512` / `Citrinet-1024`.

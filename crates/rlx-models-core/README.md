@@ -215,6 +215,12 @@ revision, so it has its own modules:
 | [`dsv41_dspark`] | the speculative draft head — seed, step, Markov bias, confidence |
 | [`dsv41_quant`] | the fp8/fp4 checkpoint reader (three scale layouts) and `DsV41Loader` |
 
+`deepseek-ai/DeepSeek-V4.1-Flash-1017` is a weights-only update of the same
+model: `config.json`, the `inference/` code and all 96,085 tensor names, dtypes,
+shapes and byte offsets are identical to the original release, so it loads
+through the same code with no switch. Only the bytes differ, which is why the
+real-weight digests below are kept per release.
+
 A pipeline stage boundary carries **both** the hidden state and the
 Hyper-Connection pre-mix, because V4.1 threads the mix forward across blocks; a
 boundary that dropped it would silently restart from the one-hot mix. Stage
@@ -263,7 +269,12 @@ tensor's byte range, so nothing else is downloaded):
   multiplier is derived from.
 
 See `scripts/dsv41_ref/README.md`; set `RLX_DSV41_WEIGHTS` to run them, otherwise
-each checks its committed digest and skips.
+each checks its committed digest and skips. The digests are per release: the
+original's sit in `tests/fixtures`, the -1017 update's in
+`tests/fixtures/dsv41_1017`, and the test picks by the `dsv41_repo.txt` stamp
+`fetch_subset.py` writes beside the subsets (`DSV41_REPO` selects the release).
+Both releases pass, along with `real_moe_matches_reference_on_routed_experts`
+on each one's own routed experts.
 
 ### Backends
 

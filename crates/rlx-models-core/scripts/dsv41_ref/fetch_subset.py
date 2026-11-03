@@ -6,13 +6,52 @@ gives every tensor's byte range, so a real-weight test only has to pay for the
 tensors it actually touches. `--layer 0` is ~130 MB.
 
     python3 fetch_subset.py --out /tmp/dsv41_layer0.safetensors --layer 0
+
+`DSV41_REPO` picks the checkpoint (default `deepseek-ai/DeepSeek-V4.1-Flash`).
+`deepseek-ai/DeepSeek-V4.1-Flash-1017` is a weights-only update: same config,
+code and tensor layout, different bytes. Each revision keeps its own real-weight
+digests (`fixture_dir`), and every output directory is stamped with the repo it
+came from (`dsv41_repo.txt`) so the tests compare against the right digests and
+two revisions never share a directory.
 """
 import argparse, json, os, struct, subprocess, sys
 from concurrent.futures import ThreadPoolExecutor
 
-REPO = "deepseek-ai/DeepSeek-V4.1-Flash"
+DEFAULT_REPO = "deepseek-ai/DeepSeek-V4.1-Flash"
+REPO = os.environ.get("DSV41_REPO", DEFAULT_REPO)
 BASE = f"https://huggingface.co/{REPO}/resolve/main/"
 INDEX = f"https://huggingface.co/{REPO}/raw/main/model.safetensors.index.json"
+
+
+def fixture_dir():
+    """Where this revision's committed real-weight digests live: the original
+    release in `tests/fixtures`, `DeepSeek-V4.1-Flash-<rev>` in
+    `tests/fixtures/dsv41_<rev>`. The test maps the repo stamp the same way."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    d = os.path.join(here, "..", "..", "tests", "fixtures")
+    prefix = DEFAULT_REPO + "-"
+    if REPO != DEFAULT_REPO:
+        if not REPO.startswith(prefix):
+            raise SystemExit(f"DSV41_REPO={REPO}: expected {DEFAULT_REPO}[-<revision>]")
+        d = os.path.join(d, "dsv41_" + REPO[len(prefix):])
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def stamp_dir(path):
+    """Record which repo the files in `path`'s directory came from, refusing to
+    mix revisions: the bytes differ, so a mixed directory would be checked
+    against the wrong digests."""
+    d = os.path.dirname(os.path.abspath(path))
+    os.makedirs(d, exist_ok=True)
+    stamp = os.path.join(d, "dsv41_repo.txt")
+    if os.path.exists(stamp):
+        have = open(stamp).read().strip()
+        if have != REPO:
+            raise SystemExit(f"{d} holds {have} subsets; use another directory for {REPO}")
+    else:
+        with open(stamp, "w") as f:
+            f.write(REPO + "\n")
 
 
 def curl(url, rng=None, timeout=600):
@@ -88,6 +127,7 @@ def main():
                     help="slice of embed.weight to include, so the layer can be "
                          "driven by real token embeddings instead of noise")
     args = ap.parse_args()
+    stamp_dir(args.out)
 
     index = json.loads(curl(INDEX))["weight_map"]
     want = []

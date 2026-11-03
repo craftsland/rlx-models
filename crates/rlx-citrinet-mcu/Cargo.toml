@@ -1,0 +1,26 @@
+[package]
+name = "rlx-citrinet-mcu"
+version = "0.2.19"
+edition = "2024"
+license = "GPL-3.0-only"
+publish = false
+description = "Bare-metal RISC-V firmware running int8 Citrinet CTC speech recognition on rlx-citrinet-core"
+
+# Deliberately outside the workspace (listed in its `exclude`), like
+# rlx-ten-vad-mcu: a bare-metal target with its own linker script and profile.
+
+[dependencies]
+rlx-citrinet-core = { path = "../rlx-citrinet-core", default-features = false }
+
+[[bin]]
+name = "citrinet-mcu"
+path = "src/main.rs"
+test = false
+bench = false
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = false

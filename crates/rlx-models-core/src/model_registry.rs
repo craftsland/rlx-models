@@ -507,6 +507,19 @@ fn register_builtin_gguf_models() {
         family: None,
         hint: "rlx-flint (`FlintRunner::open(dir, RunnerOptions::new(device))`; experts paged from disk)",
     });
+    // Mistral Large 4 — no-Q-LoRA MLA + DSA indexer, cross-layer KV sharing,
+    // NoPE layers, LeRoPE, 128-expert MoE. Not a mistral3/4 delta: its own
+    // `general.architecture`. GGUF only (the HF release is block-FP8
+    // safetensors); the runner pages the routed experts off disk.
+    register_gguf_model(GgufModelRegistration {
+        id: "mistral-large4",
+        arches: &["mistral-large4"],
+        hf_model_types: &[],
+        runner: Some("mistral-large4"),
+        family: None,
+        hint: "rlx-mistral-large4 (`MistralLarge4Runner::open(shard, &PagedOptions)`; \
+               GGUF only, experts paged from disk, ~26 GB resident)",
+    });
     register_gguf_model(GgufModelRegistration {
         id: "minimax-m3",
         arches: &["minimax-m3", "minimax_m3"],

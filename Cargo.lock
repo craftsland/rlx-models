@@ -580,6 +580,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "bluez-async"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23a32d8f6aedb42c4ec4ed4e39720ee0e807e72c93feb7cd6483f51d08ca1f65"
+dependencies = [
+ "bitflags 2.13.2",
+ "bluez-generated",
+ "dbus",
+ "dbus-tokio",
+ "futures",
+ "itertools 0.15.0",
+ "log",
+ "serde",
+ "serde-xml-rs",
+ "thiserror 2.0.21",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "bluez-generated"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9676783265eadd6f11829982792c6f303f3854d014edfba384685dcf237dd062"
+dependencies = [
+ "dbus",
+]
+
+[[package]]
 name = "bstr"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -588,6 +617,33 @@ dependencies = [
  "memchr",
  "regex-automata",
  "serde_core",
+]
+
+[[package]]
+name = "btleplug"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d836502de731602ea87cbb307065e8feaed4fd10f0855a75b0b87944ee011dc"
+dependencies = [
+ "async-trait",
+ "bitflags 2.13.2",
+ "bluez-async",
+ "dashmap",
+ "dbus",
+ "futures",
+ "jni 0.22.4",
+ "log",
+ "objc2",
+ "objc2-core-bluetooth",
+ "objc2-foundation",
+ "once_cell",
+ "static_assertions",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-stream",
+ "uuid",
+ "windows 0.62.2",
+ "windows-future 0.3.2",
 ]
 
 [[package]]
@@ -2344,6 +2400,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "dashmap"
+version = "6.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6361d5c062261c78a176addb82d4c821ae42bed6089de0e12603cd25de2059c"
+dependencies = [
+ "cfg-if",
+ "crossbeam-utils",
+ "hashbrown 0.14.5",
+ "lock_api",
+ "once_cell",
+ "parking_lot_core",
+]
+
+[[package]]
 name = "dasp_sample"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2373,6 +2443,30 @@ checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
  "syn 3.0.9",
+]
+
+[[package]]
+name = "dbus"
+version = "0.9.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ab69f03cc8c4340c9c8e315114e1658e6775a9b16a04357973aa21cec22b32e"
+dependencies = [
+ "futures-channel",
+ "futures-util",
+ "libc",
+ "libdbus-sys",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "dbus-tokio"
+version = "0.7.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "007688d459bc677131c063a3a77fb899526e17b7980f390b69644bdbc41fad13"
+dependencies = [
+ "dbus",
+ "libc",
+ "tokio",
 ]
 
 [[package]]
@@ -3734,6 +3828,12 @@ dependencies = [
 
 [[package]]
 name = "hashbrown"
+version = "0.14.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
+
+[[package]]
+name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
@@ -4663,7 +4763,7 @@ dependencies = [
 
 [[package]]
 name = "kitten_tts_mini_rlx"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",
@@ -4700,6 +4800,15 @@ name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
+
+[[package]]
+name = "libdbus-sys"
+version = "0.2.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "328c4789d42200f1eeec05bd86c9c13c7f091d2ba9a6ea35acdf51f31bc0f043"
+dependencies = [
+ "pkg-config",
+]
 
 [[package]]
 name = "libloading"
@@ -5876,6 +5985,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "08849bbd4767dfae9457696856ae1c84fe4e0281bbe4a7abff2d0e06fb7981f8"
 dependencies = [
  "objc2-encode",
+]
+
+[[package]]
+name = "objc2-core-bluetooth"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "79b30b9eacc37434a61377866f68b27acef9fa5496f25cc9ca8b2549032e0394"
+dependencies = [
+ "bitflags 2.13.2",
+ "objc2",
+ "objc2-foundation",
 ]
 
 [[package]]
@@ -7359,7 +7479,7 @@ dependencies = [
 
 [[package]]
 name = "rlx"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-driver",
@@ -7372,7 +7492,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-ace-step"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-audio-blocks",
@@ -7380,7 +7500,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-aec"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "fdaf-aec",
@@ -7398,7 +7518,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-asr"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-gguf",
@@ -7412,7 +7532,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-assets"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "memmap2",
@@ -7425,14 +7545,14 @@ dependencies = [
 
 [[package]]
 name = "rlx-audio-blocks"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
 ]
 
 [[package]]
 name = "rlx-autodiff"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "half",
  "rlx-fusion",
@@ -7442,7 +7562,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-bert"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "hf-hub",
@@ -7459,7 +7579,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-bioclip2"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "half",
@@ -7480,7 +7600,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-birefnet"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "image",
@@ -7495,7 +7615,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-bonsai"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-cli",
@@ -7508,7 +7628,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-carbon"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-cli",
@@ -7526,7 +7646,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-chatterbox"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "half",
@@ -7546,15 +7666,28 @@ dependencies = [
 
 [[package]]
 name = "rlx-citrinet"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
+ "rlx-citrinet-core",
+ "rlx-mcu",
+ "rlx-models-core",
+ "rlx-nemo",
  "rlx-search",
+ "serde_yaml",
+]
+
+[[package]]
+name = "rlx-citrinet-core"
+version = "0.2.20"
+dependencies = [
+ "libm",
+ "rlx-mcu",
 ]
 
 [[package]]
 name = "rlx-cli"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "clap",
@@ -7571,7 +7704,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-clinicalbert"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "candle-core 0.10.2",
@@ -7596,7 +7729,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-cohere"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-cli",
@@ -7606,7 +7739,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-collectives"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "rlx-cpu",
  "rlx-driver",
@@ -7615,7 +7748,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-compile"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "rlx-autodiff",
  "rlx-fusion",
@@ -7624,10 +7757,11 @@ dependencies = [
 
 [[package]]
 name = "rlx-conformer-ctc"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-cli",
+ "rlx-conformer-ctc-core",
  "rlx-flow",
  "rlx-ir",
  "rlx-models-core",
@@ -7640,15 +7774,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "rlx-conformer-ctc-core"
+version = "0.2.20"
+dependencies = [
+ "libm",
+ "rlx-mcu",
+]
+
+[[package]]
 name = "rlx-confucius"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
 ]
 
 [[package]]
 name = "rlx-coreml"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "bytemuck",
  "cc",
@@ -7665,19 +7807,20 @@ dependencies = [
 
 [[package]]
 name = "rlx-cortexm"
-version = "0.2.19"
+version = "0.2.20"
 
 [[package]]
 name = "rlx-cpu"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "gemm 0.19.0",
  "half",
- "libm",
+ "libc",
  "rayon",
  "rlx-fastmath",
  "rlx-gguf",
  "rlx-ir",
+ "rlx-libm",
  "rlx-linux-ref",
  "rlx-mlx-io",
  "rlx-opt",
@@ -7689,7 +7832,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-cuda"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "bytemuck",
  "cudarc 0.19.10",
@@ -7709,7 +7852,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-d1"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "image",
@@ -7730,7 +7873,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-dac"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "hf-hub",
@@ -7752,7 +7895,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-dduf"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "half",
@@ -7763,7 +7906,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-deepseek"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "half",
@@ -7781,14 +7924,14 @@ dependencies = [
 
 [[package]]
 name = "rlx-demucs"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
 ]
 
 [[package]]
 name = "rlx-denoise"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-autodiff",
@@ -7798,7 +7941,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-dflash"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-gguf",
@@ -7811,11 +7954,11 @@ dependencies = [
 
 [[package]]
 name = "rlx-diamond"
-version = "0.2.19"
+version = "0.2.20"
 
 [[package]]
 name = "rlx-diarize"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "hound",
@@ -7826,7 +7969,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-diffusiongemma"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "half",
@@ -7842,7 +7985,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-dinov2"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "image",
@@ -7861,7 +8004,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-dinov3"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "image",
@@ -7879,7 +8022,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-distributed"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "libc",
@@ -7894,14 +8037,14 @@ dependencies = [
 
 [[package]]
 name = "rlx-dramabox"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
 ]
 
 [[package]]
 name = "rlx-driver"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "half",
  "iroh",
@@ -7911,7 +8054,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-dsv41"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-cli",
@@ -7922,7 +8065,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-eagle3"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -7940,7 +8083,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-embed"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "half",
@@ -7965,7 +8108,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-embeddinggemma"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-cli",
@@ -7982,7 +8125,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-encodec"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "half",
@@ -8000,7 +8143,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-eval"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-qwen3",
@@ -8008,11 +8151,11 @@ dependencies = [
 
 [[package]]
 name = "rlx-f0"
-version = "0.2.19"
+version = "0.2.20"
 
 [[package]]
 name = "rlx-f5tts"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "half",
@@ -8030,7 +8173,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-facodec"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-ir",
@@ -8047,7 +8190,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-fara"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "hf-hub",
@@ -8064,11 +8207,11 @@ dependencies = [
 
 [[package]]
 name = "rlx-fastmath"
-version = "0.2.19"
+version = "0.2.20"
 
 [[package]]
 name = "rlx-fft"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "getrandom 0.3.4",
@@ -8091,7 +8234,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-fgd"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "image",
@@ -8103,7 +8246,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-fireredaudio"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-cli",
@@ -8122,7 +8265,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-fish"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "clap",
@@ -8145,7 +8288,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-flint"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "half",
@@ -8167,7 +8310,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-florence2"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "half",
@@ -8187,7 +8330,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-flow"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "half",
@@ -8198,7 +8341,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-flux1"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "half",
@@ -8219,7 +8362,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-flux2"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -8244,7 +8387,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-flux3"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "half",
@@ -8267,7 +8410,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-fpga"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "rlx-cortexm",
  "rlx-ir",
@@ -8275,7 +8418,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-funasr"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "half",
@@ -8298,7 +8441,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-fusion"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "rlx-ir",
  "rlx-pocketfft",
@@ -8306,7 +8449,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-gemini-nano"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "flatbuffers",
@@ -8316,7 +8459,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-gemma"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "half",
@@ -8342,7 +8485,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-gemma-inflect-nano"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "cpal",
@@ -8358,7 +8501,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-genmoji"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "image",
@@ -8381,7 +8524,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-gepard"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "clap",
@@ -8406,7 +8549,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-gguf"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -8419,7 +8562,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-glm"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-cli",
@@ -8429,7 +8572,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-glm-tts"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-audio-blocks",
@@ -8437,7 +8580,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-glm4moe"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-cli",
@@ -8452,7 +8595,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-glm5next"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-cli",
@@ -8470,7 +8613,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-gpt-oss"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-cli",
@@ -8481,11 +8624,11 @@ dependencies = [
 
 [[package]]
 name = "rlx-gpu-dispatch"
-version = "0.2.19"
+version = "0.2.20"
 
 [[package]]
 name = "rlx-gpu-host"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "bytemuck",
  "half",
@@ -8498,7 +8641,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-gpu-kernels"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "rlx-gpu-dispatch",
  "rlx-ir",
@@ -8507,7 +8650,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-granite"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-cli",
@@ -8517,7 +8660,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-grounding-dino"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "hf-hub",
@@ -8540,7 +8683,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-guardrails"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "serde",
@@ -8549,7 +8692,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-heartmula"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-audio-blocks",
@@ -8557,7 +8700,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-higgs"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-audio-blocks",
@@ -8565,7 +8708,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-hoct"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -8586,7 +8729,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-hviske"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-whisper",
@@ -8594,7 +8737,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-hy-mt"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "hf-hub",
@@ -8610,7 +8753,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-index-tts"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-audio-blocks",
@@ -8618,7 +8761,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-indra"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "image",
@@ -8639,7 +8782,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-inflect-nano"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "hf-hub",
@@ -8660,7 +8803,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-inflect-v2"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-audio-blocks",
@@ -8668,7 +8811,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-inkling"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "hf-hub",
@@ -8681,11 +8824,11 @@ dependencies = [
 
 [[package]]
 name = "rlx-ir"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "aes 0.9.3",
  "bincode 1.3.3",
- "libm",
+ "rlx-libm",
  "serde",
  "serde_json",
  "smallvec",
@@ -8693,14 +8836,14 @@ dependencies = [
 
 [[package]]
 name = "rlx-irodori"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
 ]
 
 [[package]]
 name = "rlx-jamba"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-cli",
@@ -8716,7 +8859,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-jina-ocr"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "hf-hub",
@@ -8733,7 +8876,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-jina-v5"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-cli",
@@ -8750,7 +8893,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-jlens"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "half",
@@ -8770,7 +8913,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-kev"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "axum",
@@ -8796,7 +8939,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-kimi-k3"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "clap",
@@ -8824,7 +8967,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-kittentts"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "espeak-ng",
@@ -8846,7 +8989,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-kittentts2"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "flate2",
@@ -8874,7 +9017,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-kokoro"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "espeak-ng",
@@ -8894,15 +9037,27 @@ dependencies = [
 
 [[package]]
 name = "rlx-kroko"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-audio-blocks",
+ "rlx-kroko-core",
+ "rlx-mcu",
+ "rlx-models-core",
+ "serde_json",
+]
+
+[[package]]
+name = "rlx-kroko-core"
+version = "0.2.20"
+dependencies = [
+ "libm",
+ "rlx-mcu",
 ]
 
 [[package]]
 name = "rlx-kyutai-tts"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "candle-core 0.9.2",
@@ -8931,7 +9086,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-laguna"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "hf-hub",
@@ -8953,7 +9108,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-lfm"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-cli",
@@ -8963,7 +9118,6 @@ dependencies = [
  "rlx-ir",
  "rlx-llama-base",
  "rlx-models-core",
- "rlx-qwen35",
  "rlx-runtime",
  "rlx-ssm",
  "serde",
@@ -8973,7 +9127,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-lfm-vl"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "image",
@@ -8992,15 +9146,37 @@ dependencies = [
 ]
 
 [[package]]
-name = "rlx-libm"
-version = "0.2.19"
+name = "rlx-lfm3-audio"
+version = "0.2.20"
 dependencies = [
- "libm",
+ "anyhow",
+ "half",
+ "rlx-cli",
+ "rlx-flow",
+ "rlx-gguf",
+ "rlx-ir",
+ "rlx-models-core",
+ "rlx-runtime",
+ "rustfft",
+ "serde_json",
 ]
 
 [[package]]
+name = "rlx-lfm3-audio-ffi"
+version = "0.2.20"
+dependencies = [
+ "anyhow",
+ "rlx-cli",
+ "rlx-lfm3-audio",
+]
+
+[[package]]
+name = "rlx-libm"
+version = "0.2.20"
+
+[[package]]
 name = "rlx-ling"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "half",
@@ -9019,14 +9195,14 @@ dependencies = [
 
 [[package]]
 name = "rlx-linux-ref"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "rlx-libm",
 ]
 
 [[package]]
 name = "rlx-llada2"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -9046,7 +9222,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-llama-base"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-gguf",
@@ -9056,7 +9232,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-llama32"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-cli",
@@ -9080,7 +9256,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-llama4"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "half",
@@ -9101,7 +9277,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-llm-bench"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "libc",
@@ -9119,7 +9295,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-locateanything"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "hf-hub",
@@ -9137,7 +9313,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-luxtts"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "espeak-ng",
@@ -9157,7 +9333,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-macros"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -9166,7 +9342,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-mamba"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "criterion",
@@ -9184,7 +9360,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-maya1"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "hound",
@@ -9198,8 +9374,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rlx-mcu"
+version = "0.2.20"
+dependencies = [
+ "rlx-libm",
+]
+
+[[package]]
 name = "rlx-melotts"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-ir",
@@ -9211,7 +9394,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-metal"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "bytemuck",
  "half",
@@ -9230,7 +9413,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-metavoice"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -9252,7 +9435,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-mimi"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "candle-core 0.9.2",
@@ -9277,7 +9460,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-minicpm-sala"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-cli",
@@ -9295,7 +9478,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-minicpm-v"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "image",
@@ -9317,7 +9500,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-minicpm5"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "hf-hub",
@@ -9331,7 +9514,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-minimax"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-cli",
@@ -9351,7 +9534,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-minimax-h3"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -9374,7 +9557,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-miotts"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "clap",
@@ -9395,7 +9578,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-miratts"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "hound",
@@ -9414,7 +9597,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-mistral"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-cli",
@@ -9424,8 +9607,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "rlx-mistral-large4"
+version = "0.2.20"
+dependencies = [
+ "anyhow",
+ "rlx-cli",
+ "rlx-distributed",
+ "rlx-flow",
+ "rlx-gguf",
+ "rlx-glm5next",
+ "rlx-ir",
+ "rlx-models-core",
+ "rlx-runtime",
+ "serde",
+ "serde_json",
+ "tokenizers",
+]
+
+[[package]]
 name = "rlx-mistral-vl"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "image",
@@ -9442,7 +9643,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-mllama"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "half",
@@ -9461,7 +9662,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-mlx"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "half",
  "libc",
@@ -9479,7 +9680,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-mlx-io"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "half",
@@ -9496,7 +9697,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-mlx-sys"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "cc",
  "cmake",
@@ -9504,7 +9705,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-model-hub"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "dirs 5.0.1",
@@ -9515,7 +9716,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-models"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -9583,6 +9784,7 @@ dependencies = [
  "rlx-laguna",
  "rlx-lfm",
  "rlx-lfm-vl",
+ "rlx-lfm3-audio",
  "rlx-llada2",
  "rlx-llama-base",
  "rlx-llama32",
@@ -9600,6 +9802,7 @@ dependencies = [
  "rlx-minimax",
  "rlx-miratts",
  "rlx-mistral",
+ "rlx-mistral-large4",
  "rlx-mistral-vl",
  "rlx-mllama",
  "rlx-mlx",
@@ -9700,7 +9903,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-models-core"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -9737,7 +9940,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-models-plugin"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-cli",
@@ -9751,7 +9954,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-models-web"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "console_error_panic_hook",
@@ -9775,7 +9978,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-moonshine"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rayon",
@@ -9794,15 +9997,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "rlx-moonshine-core"
+version = "0.2.20"
+dependencies = [
+ "libm",
+ "rlx-mcu",
+]
+
+[[package]]
 name = "rlx-moonshine-streaming"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-cli",
  "rlx-flow",
  "rlx-ir",
+ "rlx-mcu",
  "rlx-models-core",
  "rlx-moonshine",
+ "rlx-moonshine-core",
  "rlx-runtime",
  "rlx-text",
  "serde_json",
@@ -9812,7 +10025,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-moshi"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "axum",
@@ -9842,7 +10055,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-moss-nano"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "hf-hub",
@@ -9863,7 +10076,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-motif"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-cli",
@@ -9878,7 +10091,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-mt-eval"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "clap",
@@ -9888,7 +10101,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-nanbeige"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "hf-hub",
@@ -9907,7 +10120,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-nanocodec"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "hound",
@@ -9925,7 +10138,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-nanowakeword"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "ort",
@@ -9935,7 +10148,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-narma10"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-ir",
@@ -9944,7 +10157,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-nemo"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-ir",
@@ -9954,7 +10167,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-nemotron"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-cli",
@@ -9973,7 +10186,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-nemotron-asr"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-audio-blocks",
@@ -9993,7 +10206,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-nemotron-omni"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "image",
@@ -10012,7 +10225,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-neuralhash"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "half",
@@ -10029,7 +10242,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-neutrino"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-gguf",
@@ -10042,7 +10255,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-neutts"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "burn",
@@ -10077,7 +10290,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-nllb"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "half",
@@ -10096,7 +10309,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-nomic"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-cpu",
@@ -10111,7 +10324,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-ocr"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -10137,7 +10350,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-ocr2"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -10156,7 +10369,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-omnicoder"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-cli",
@@ -10166,14 +10379,14 @@ dependencies = [
 
 [[package]]
 name = "rlx-omnivoice"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
 ]
 
 [[package]]
 name = "rlx-oneapi"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "half",
  "libloading 0.8.9",
@@ -10188,7 +10401,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-onnx-decompose"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-ir",
@@ -10200,7 +10413,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-onnx-import"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -10217,14 +10430,14 @@ dependencies = [
 
 [[package]]
 name = "rlx-onnx-proto"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "protobuf",
 ]
 
 [[package]]
 name = "rlx-openai"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-gemma",
@@ -10237,12 +10450,13 @@ dependencies = [
  "rlx-runtime",
  "rlx-serve",
  "rlx-text",
+ "serde_json",
  "tokio",
 ]
 
 [[package]]
 name = "rlx-openvoice"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "hound",
@@ -10259,7 +10473,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-openwakeword"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "ort",
@@ -10276,7 +10490,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-opscope"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "rlx-autodiff",
  "rlx-fusion",
@@ -10286,7 +10500,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-opt"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "rlx-autodiff",
  "rlx-compile",
@@ -10296,14 +10510,14 @@ dependencies = [
 
 [[package]]
 name = "rlx-optim"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "rayon",
 ]
 
 [[package]]
 name = "rlx-orpheus"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "hf-hub",
@@ -10334,14 +10548,14 @@ dependencies = [
 
 [[package]]
 name = "rlx-outetts"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
 ]
 
 [[package]]
 name = "rlx-parakeet"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-audio-blocks",
@@ -10357,7 +10571,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-parlertts"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "hound",
@@ -10380,7 +10594,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-phi"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-cli",
@@ -10391,7 +10605,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-piper"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "espeak-ng",
@@ -10410,7 +10624,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-pkg"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "bincode 1.3.3",
@@ -10431,7 +10645,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-pocket-tts"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "clap",
@@ -10456,7 +10670,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-pocketfft"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "rlx-libm",
  "rlx-linux-ref",
@@ -10464,7 +10678,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-porcupine"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-runtime",
@@ -10473,7 +10687,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-pplx-decider"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "image",
@@ -10493,7 +10707,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-ppocrv6"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -10514,14 +10728,14 @@ dependencies = [
 
 [[package]]
 name = "rlx-program"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "rlx-protocol"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "half",
@@ -10531,7 +10745,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-quant-calib"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "half",
@@ -10541,7 +10755,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-qwen25-vl"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "image",
@@ -10562,7 +10776,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-qwen3"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "hf-hub",
@@ -10587,7 +10801,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-qwen3-aligner"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-search",
@@ -10595,7 +10809,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-qwen3-asr"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-cli",
@@ -10617,7 +10831,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-qwen3-tts"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "cpal",
@@ -10650,7 +10864,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-qwen3-tts-train"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "half",
@@ -10672,7 +10886,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-qwen3-vl"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "image",
@@ -10694,7 +10908,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-qwen35"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "image",
@@ -10720,7 +10934,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-qwen4exp"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-cli",
@@ -10739,14 +10953,14 @@ dependencies = [
 
 [[package]]
 name = "rlx-rng"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "rlx-libm",
 ]
 
 [[package]]
 name = "rlx-rocm"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "libloading 0.8.9",
  "rlx-cpu",
@@ -10763,14 +10977,14 @@ dependencies = [
 
 [[package]]
 name = "rlx-roformer-sep"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
 ]
 
 [[package]]
 name = "rlx-runtime"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "half",
@@ -10800,6 +11014,7 @@ dependencies = [
  "rlx-vulkan",
  "rlx-webgl",
  "rlx-wgpu",
+ "rlx-xdna",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -10808,14 +11023,14 @@ dependencies = [
 
 [[package]]
 name = "rlx-rvc"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
 ]
 
 [[package]]
 name = "rlx-s1"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-cli",
@@ -10827,7 +11042,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-sam"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "image",
@@ -10847,7 +11062,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-sam-ir"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-cpu",
@@ -10860,7 +11075,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-sam2"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-cli",
@@ -10879,7 +11094,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-sam3"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-cli",
@@ -10898,7 +11113,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-sanotts"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "clap",
@@ -10919,11 +11134,11 @@ dependencies = [
 
 [[package]]
 name = "rlx-search"
-version = "0.2.19"
+version = "0.2.20"
 
 [[package]]
 name = "rlx-seed-vc"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-audio-blocks",
@@ -10931,7 +11146,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-serve"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "axum",
@@ -10954,7 +11169,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-sesame"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "clap",
@@ -10980,7 +11195,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-siglip2"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "half",
@@ -11000,7 +11215,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-snac"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "ndarray 0.16.1",
@@ -11018,7 +11233,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-soprano"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -11042,7 +11257,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-spacy"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "fancy-regex 0.14.0",
@@ -11052,15 +11267,15 @@ dependencies = [
 
 [[package]]
 name = "rlx-spectral"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
- "libm",
  "rlx-fastmath",
+ "rlx-libm",
 ]
 
 [[package]]
 name = "rlx-speechtokenizer"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-ir",
@@ -11077,7 +11292,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-ssm"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-cpu",
@@ -11087,7 +11302,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-stable-audio"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-audio-blocks",
@@ -11095,7 +11310,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-styletts2"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "clap",
@@ -11109,7 +11324,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-subject-lift"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "image",
@@ -11124,7 +11339,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-supertonic"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "hf-hub",
@@ -11143,7 +11358,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-tada"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "clap",
@@ -11166,7 +11381,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-ten-vad"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "hf-hub",
@@ -11186,14 +11401,14 @@ dependencies = [
 
 [[package]]
 name = "rlx-ten-vad-core"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "libm",
 ]
 
 [[package]]
 name = "rlx-tensor"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "rlx-autodiff",
  "rlx-ir",
@@ -11204,7 +11419,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-termclean"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "axum",
  "rayon",
@@ -11218,7 +11433,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-text"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "minijinja",
@@ -11231,7 +11446,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-timesfm3"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "hf-hub",
@@ -11248,7 +11463,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-timestral"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "hf-hub",
@@ -11265,7 +11480,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-tiny"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "hf-hub",
@@ -11278,7 +11493,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-tiny-tts"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",
@@ -11304,7 +11519,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-tinyllama"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "hf-hub",
@@ -11319,7 +11534,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-tinystories"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "hf-hub",
@@ -11332,7 +11547,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-torch-ckpt"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "flate2",
@@ -11341,7 +11556,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-tpu"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "libloading 0.8.9",
  "prost 0.13.5",
@@ -11359,7 +11574,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-translate"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "fancy-regex 0.18.0",
@@ -11379,7 +11594,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-translategemma"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-cli",
@@ -11392,7 +11607,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-trellis2"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -11414,7 +11629,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-tsac"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "cc",
@@ -11430,7 +11645,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-tts"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "half",
@@ -11453,7 +11668,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-tts-bench"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "clap",
@@ -11492,7 +11707,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-tune"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-autodiff",
@@ -11508,14 +11723,14 @@ dependencies = [
 
 [[package]]
 name = "rlx-unfuse"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "rlx-ir",
 ]
 
 [[package]]
 name = "rlx-uni2"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "image",
@@ -11533,7 +11748,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-unlimited-ocr"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "half",
@@ -11552,7 +11767,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-upscale"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "image",
@@ -11569,7 +11784,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-vad"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "hf-hub",
@@ -11586,7 +11801,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-vevo"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-audio-blocks",
@@ -11594,7 +11809,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-vibevoice"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-ir",
@@ -11611,7 +11826,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-vibevoice-asr"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-flow",
@@ -11629,7 +11844,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-vision"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-flow",
@@ -11643,7 +11858,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-vision-bench"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "rlx-autodiff",
  "rlx-collectives",
@@ -11655,7 +11870,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-vit-elastic"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "image",
@@ -11673,7 +11888,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-vjepa2"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-cli",
@@ -11690,7 +11905,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-vlash"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "half",
@@ -11713,14 +11928,14 @@ dependencies = [
 
 [[package]]
 name = "rlx-vlm-base"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
 ]
 
 [[package]]
 name = "rlx-voice-gender"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-f0",
@@ -11729,8 +11944,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "rlx-voice-link"
+version = "0.2.20"
+
+[[package]]
+name = "rlx-voice-link-ffi"
+version = "0.2.20"
+dependencies = [
+ "rlx-conformer-ctc-core",
+ "rlx-voice-link",
+]
+
+[[package]]
+name = "rlx-voice-link-host"
+version = "0.2.20"
+dependencies = [
+ "anyhow",
+ "btleplug",
+ "futures",
+ "rlx-conformer-ctc",
+ "rlx-conformer-ctc-core",
+ "rlx-ten-vad-core",
+ "rlx-voice-link",
+ "serde_json",
+ "tokio",
+ "ureq 2.12.1",
+ "uuid",
+]
+
+[[package]]
 name = "rlx-voxcpm"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-audio-blocks",
@@ -11738,7 +11982,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-voxrt"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-runtime",
@@ -11747,7 +11991,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-voxtral"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-cli",
@@ -11769,7 +12013,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-voxtral-tts"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -11795,7 +12039,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-voxtral-tts-train"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "half",
@@ -11820,7 +12064,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-vulkan"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "ash",
  "bytemuck",
@@ -11838,7 +12082,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-wake"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-cli",
@@ -11853,7 +12097,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-wakeword"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-nanowakeword",
@@ -11870,14 +12114,14 @@ dependencies = [
 
 [[package]]
 name = "rlx-wakeword-core"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "rlx-wake",
 ]
 
 [[package]]
 name = "rlx-wakeword-wasm"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "js-sys",
  "rlx-wakeword-core",
@@ -11887,7 +12131,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-wav2vec2-asr"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "fancy-regex 0.14.0",
@@ -11900,7 +12144,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-wav2vec2-bert"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-cli",
@@ -11917,7 +12161,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-wavtokenizer"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-ir",
@@ -11934,8 +12178,9 @@ dependencies = [
 
 [[package]]
 name = "rlx-webgl"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
+ "half",
  "js-sys",
  "rlx-autodiff",
  "rlx-compile",
@@ -11948,7 +12193,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-wespeaker"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "hound",
@@ -11964,7 +12209,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-wgpu"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "bytemuck",
  "half",
@@ -11985,7 +12230,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-whisper"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "half",
@@ -12012,7 +12257,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-xcodec"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "rlx-ir",
@@ -12028,8 +12273,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "rlx-xdna"
+version = "0.2.20"
+dependencies = [
+ "libc",
+ "libloading 0.8.9",
+ "rlx-ir",
+]
+
+[[package]]
+name = "rlx-zipformer-distill"
+version = "0.2.20"
+dependencies = [
+ "anyhow",
+ "half",
+ "memmap2",
+ "rlx-driver",
+ "rlx-kroko",
+ "rlx-kroko-core",
+ "rlx-models-core",
+ "rlx-optim",
+ "rlx-tensor",
+ "safetensors 0.7.0",
+ "serde_json",
+ "symphonia",
+]
+
+[[package]]
 name = "rlx-zipvoice"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "hound",
@@ -12044,7 +12316,7 @@ dependencies = [
 
 [[package]]
 name = "rlx-zonos"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "anyhow",
  "espeak-ng",
@@ -12066,7 +12338,7 @@ dependencies = [
 
 [[package]]
 name = "rlxsl"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "rlx-ir",
 ]
@@ -12503,6 +12775,18 @@ checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
 dependencies = [
  "serde_core",
  "serde_derive",
+]
+
+[[package]]
+name = "serde-xml-rs"
+version = "0.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc2215ce3e6a77550b80a1c37251b7d294febaf42e36e21b7b411e0bf54d540d"
+dependencies = [
+ "log",
+ "serde",
+ "thiserror 2.0.21",
+ "xml",
 ]
 
 [[package]]
@@ -15428,6 +15712,12 @@ dependencies = [
  "libc",
  "rustix",
 ]
+
+[[package]]
+name = "xml"
+version = "1.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f45bb2c13fec6a6cb4c0f76a7e94839e110a14ec803ec2940777a94c347bc52"
 
 [[package]]
 name = "xml-rs"

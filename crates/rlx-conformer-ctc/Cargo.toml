@@ -20,6 +20,7 @@ rlx-ir      = { workspace = true }
 rlx-search  = { workspace = true }
 rlx-runtime = { workspace = true }
 rlx-nemo    = { workspace = true }
+rlx-conformer-ctc-core = { workspace = true, features = ["std"] }
 rustfft     = "6"
 serde_json  = { workspace = true }
 

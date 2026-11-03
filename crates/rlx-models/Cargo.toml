@@ -45,19 +45,20 @@ rlx-llada2 = { workspace = true, optional = true }
 rlx-qwen35 = { workspace = true, optional = true }
 rlx-qwen4exp = { workspace = true, optional = true }
 rlx-flint = { workspace = true, optional = true }
+rlx-mistral-large4 = { workspace = true, optional = true }
 rlx-minimax = { workspace = true, optional = true }
 rlx-fara = { workspace = true, optional = true }
 rlx-qwen25-vl = { workspace = true, optional = true }
 rlx-siglip2 = { workspace = true, optional = true }
-rlx-snac = { path = "../rlx-snac", version = "0.2.19", optional = true }
-rlx-nanocodec = { path = "../rlx-nanocodec", version = "0.2.19", optional = true }
-rlx-wavtokenizer = { path = "../rlx-wavtokenizer", version = "0.2.19", optional = true }
-rlx-xcodec = { path = "../rlx-xcodec", version = "0.2.19", optional = true }
-rlx-vibevoice = { path = "../rlx-vibevoice", version = "0.2.19", optional = true }
-rlx-facodec = { path = "../rlx-facodec", version = "0.2.19", optional = true }
-rlx-encodec = { path = "../rlx-encodec", version = "0.2.19", optional = true }
-rlx-speechtokenizer = { path = "../rlx-speechtokenizer", version = "0.2.19", optional = true }
-rlx-dac = { path = "../rlx-dac", version = "0.2.19", optional = true, default-features = false }
+rlx-snac = { path = "../rlx-snac", version = "0.2.20", optional = true }
+rlx-nanocodec = { path = "../rlx-nanocodec", version = "0.2.20", optional = true }
+rlx-wavtokenizer = { path = "../rlx-wavtokenizer", version = "0.2.20", optional = true }
+rlx-xcodec = { path = "../rlx-xcodec", version = "0.2.20", optional = true }
+rlx-vibevoice = { path = "../rlx-vibevoice", version = "0.2.20", optional = true }
+rlx-facodec = { path = "../rlx-facodec", version = "0.2.20", optional = true }
+rlx-encodec = { path = "../rlx-encodec", version = "0.2.20", optional = true }
+rlx-speechtokenizer = { path = "../rlx-speechtokenizer", version = "0.2.20", optional = true }
+rlx-dac = { path = "../rlx-dac", version = "0.2.20", optional = true, default-features = false }
 # A package's tokenizer, for `export::check_package` (as the language bindings
 # load it).
 rlx-text = { workspace = true, optional = true }
@@ -159,6 +160,7 @@ rlx-jina-v5 = { workspace = true, optional = true }
 rlx-timesfm3 = { workspace = true, optional = true }
 rlx-timestral = { workspace = true, optional = true }
 rlx-pplx-decider = { workspace = true, optional = true }
+rlx-lfm3-audio = { workspace = true, optional = true }
 rlx-kev = { workspace = true, optional = true }
 rlx-carbon = { workspace = true, optional = true }
 rlx-f0 = { workspace = true, optional = true }
@@ -187,7 +189,7 @@ bytemuck = { workspace = true }
 llama-cpp-2 = { workspace = true, optional = true }
 hf-hub = { workspace = true, optional = true }
 tokenizers = { workspace = true, optional = true }
-rlx-tune = { path = "../rlx-tune", version = "0.2.19", optional = true }
+rlx-tune = { path = "../rlx-tune", version = "0.2.20", optional = true }
 rlx-metal = { workspace = true, optional = true }
 rlx-mlx = { workspace = true, optional = true }
 # Adapter introspection for the wgpu/vulkan backend checks in tests/.
@@ -251,6 +253,7 @@ jina-v5 = ["dep:rlx-jina-v5"]
 timesfm3 = ["dep:rlx-timesfm3"]
 timestral = ["dep:rlx-timestral"]
 pplx-decider = ["dep:rlx-pplx-decider"]
+lfm3-audio = ["dep:rlx-lfm3-audio"]
 kev = ["dep:rlx-kev"]
 carbon = ["dep:rlx-carbon"]
 f0 = ["dep:rlx-f0"]
@@ -262,6 +265,7 @@ dual-encoder = ["mmap-kv", "rlx-qwen3?/dual-encoder"]
 qwen35 = ["dep:rlx-qwen35"]
 qwen4exp = ["dep:rlx-qwen4exp"]
 flint = ["dep:rlx-flint"]
+mistral-large4 = ["dep:rlx-mistral-large4"]
 minimax = ["dep:rlx-minimax"]
 fara = ["dep:rlx-fara", "qwen35"]
 llama32 = ["dep:rlx-llama32"]
@@ -501,6 +505,7 @@ runner = [
     "mllama",
     "minimax",
     "flint",
+    "mistral-large4",
     "dinov2",
     "dinov3",
     "uni2",
@@ -660,6 +665,7 @@ metal = [
     "rlx-granite?/metal",
     "rlx-llada2?/metal",
     "rlx-flint?/metal",
+    "rlx-mistral-large4?/metal",
     "rlx-llama32?/metal",
     "rlx-lfm?/metal",
     "rlx-locateanything?/metal",
@@ -755,6 +761,7 @@ mlx = [
     "rlx-granite?/mlx",
     "rlx-llada2?/mlx",
     "rlx-flint?/mlx",
+    "rlx-mistral-large4?/mlx",
     "rlx-llama32?/mlx",
     "rlx-lfm?/mlx",
     "rlx-locateanything?/mlx",
@@ -858,6 +865,7 @@ coreml = [
     "rlx-piper?/coreml",
 ]
 gpu = [
+    "rlx-mistral-large4?/gpu",
     "embed",
     "ocr",
     "dep:rlx-wgpu",
@@ -956,6 +964,7 @@ nvidia-gpu = ["cuda"]
 amd-gpu = ["rocm"]
 portable-gpu = ["gpu"]
 vulkan = [
+    "rlx-mistral-large4?/vulkan",
     "embed",
     "ocr",
     "dep:rlx-wgpu",
@@ -1037,6 +1046,7 @@ vulkan = [
     "rlx-voxrt?/vulkan",
 ]
 cuda = [
+    "rlx-mistral-large4?/cuda",
     "embed",
     "ocr",
     "rlx-runtime/cuda",
@@ -1130,6 +1140,7 @@ cuda = [
     "rlx-voxrt?/cuda",
 ]
 rocm = [
+    "rlx-mistral-large4?/rocm",
     "embed",
     "ocr",
     "rlx-runtime/rocm",

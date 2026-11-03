@@ -705,6 +705,37 @@ glm5next-real: fetch-glm5next-subset
     RLX_GLM5NEXT_GGUF="{{real_weights_dir}}/glm5next/GLM-5.3-Flash-blk0-blk3-e8.gguf" \
       cargo test -p rlx-glm5next --test real_weights --test packed_weights -- --nocapture
 
+# Tiny random checkpoint: sparse DSA, KV sharing, NoPE, shared indexers.
+# Mistral Large 4 logits parity vs a torch port of modular_mistral_large4.py
+test-mistral-large4-parity dir="/tmp/ml4-ref":
+    python3 scripts/mistral_large4_reference.py "{{dir}}"
+    RLX_ML4_REF_DIR="{{dir}}" cargo test -p rlx-mistral-large4 --release --test reference_parity --test contract -- --nocapture
+
+# ~1.1 GB of range reads out of the 233 GB UD-IQ1_S split. Then: just mistral-large4-real
+# Fetch Mistral Large 4 GGUF blocks 35, 38, 39 (6 of 128 experts) for real-weight tests
+fetch-mistral-large4-subset:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dest="{{real_weights_dir}}/mistral-large4"
+    mkdir -p "$dest"
+    out="$dest/ml4-35-38-39-e6.gguf"
+    if [ ! -s "$out" ]; then
+      python3 scripts/mistral_large4_subset.py --experts 6 "$out"
+    fi
+    ls -lh "$dest"
+
+# PY needs `gguf` and `torch` (pip install gguf torch).
+# Mistral Large 4 real-weight blocks vs gguf-py dequant + torch port (dense and packed)
+mistral-large4-real py="python3": fetch-mistral-large4-subset
+    {{py}} scripts/mistral_large4_reference.py --gguf "{{real_weights_dir}}/mistral-large4/ml4-35-38-39-e6.gguf" /tmp/ml4-real
+    RLX_ML4_REAL_DIR=/tmp/ml4-real cargo test -p rlx-mistral-large4 --release --test real_weights -- --nocapture --test-threads=1
+    {{py}} scripts/mistral_large4_reference.py --gguf "{{real_weights_dir}}/mistral-large4/ml4-35-38-39-e6.gguf" --topk 2048 /tmp/ml4-real-dense
+    RLX_ML4_REAL_DENSE_DIR=/tmp/ml4-real-dense cargo test -p rlx-mistral-large4 --release --test paged -- --nocapture
+
+# Mistral Large 4 whole model, experts paged from disk (pass --weights SHARD1 --prompt-ids … etc.)
+mistral-large4 *args:
+    cargo run -p rlx-mistral-large4 --release --features "{{features}}" -- {{args}}
+
 # unsloth/Qwen3.8-Flash-Next-GGUF, but only the parts worth testing. The model
 # is 512x56B; `per_layer_token_embd` alone — the 51-billion-weight n-gram table
 # — is ~28 GB. A GGUF header carries every tensor's byte offset, so `blk.1`
@@ -1212,6 +1243,191 @@ test-conformer-ctc *ARGS:
 # Cross-backend Conformer-CTC transcription (skips unavailable devices).
 test-conformer-ctc-backends *ARGS:
     cargo run -p rlx-conformer-ctc --release --example backend_matrix --features all-backends {{ARGS}}
+
+# int8 Conformer-CTC for MCUs (no_std, rlx-conformer-ctc-core): export the .nemo to an .rcc blob.
+export-conformer-ctc-mcu:
+    mkdir -p .cache/conformer-ctc-mcu
+    cargo run -p rlx-conformer-ctc --release -- export-mcu --nemo .cache/conformer-ctc/stt_en_conformer_ctc_small.nemo --out .cache/conformer-ctc-mcu/small-int8.rcc
+
+# Run the int8 MCU pipeline on the host and compare with the f32 model.
+conformer-ctc-mcu WAV="assets/harness/jfk_16k.wav":
+    cargo run -p rlx-conformer-ctc --release -- transcribe-mcu --rcc .cache/conformer-ctc-mcu/small-int8.rcc --wav {{WAV}} --nemo .cache/conformer-ctc/stt_en_conformer_ctc_small.nemo
+
+# WER of int8 vs f32 over a list (lines: <file.wav>\t<lowercase transcript>).
+bench-conformer-ctc-mcu-wer LIST:
+    cargo run -p rlx-conformer-ctc --release --example mcu_wer -- --nemo .cache/conformer-ctc/stt_en_conformer_ctc_small.nemo --rcc .cache/conformer-ctc-mcu/small-int8.rcc --list {{LIST}}
+
+# Bare-metal firmware on QEMU rv32imafc (ESP32-P4 ISA): bit-identical check + instruction count.
+conformer-ctc-mcu-qemu:
+    cd crates/rlx-conformer-ctc-mcu && cargo build --release
+    qemu-system-riscv32 -machine virt -m 64M -bios none -nographic -plugin crates/rlx-ten-vad-mcu/libinsn.dylib \
+        -kernel crates/rlx-conformer-ctc-mcu/target/riscv32imafc-unknown-none-elf/release/conformer-ctc-mcu
+
+# Moonshine streaming tiny for MCUs (rlx-moonshine-core): export .rms and compare with f32 on a clip.
+moonshine-mcu-check WAV="assets/harness/jfk_16k.wav" *ARGS:
+    mkdir -p .cache/moonshine-mcu
+    cargo run -p rlx-moonshine-streaming --release --example mcu_check -- --weights weights/asr/moonshine-streaming-tiny --wav {{WAV}} --out .cache/moonshine-mcu/tiny.rms {{ARGS}}
+
+# WER of the MCU .rms against f32 over a list (lines: <file.wav>\t<transcript>).
+bench-moonshine-mcu-wer LIST:
+    cargo run -p rlx-moonshine-streaming --release --example mcu_wer -- --weights weights/asr/moonshine-streaming-tiny --rms .cache/moonshine-mcu/tiny.rms --list {{LIST}}
+
+# Moonshine firmware on QEMU rv32imafc (ESP32-P4 ISA): bit-identity + instruction count.
+moonshine-mcu-qemu:
+    cd crates/rlx-moonshine-mcu && cargo build --release
+    qemu-system-riscv32 -machine virt -m 128M -bios none -nographic -plugin crates/rlx-ten-vad-mcu/libinsn.dylib \
+        -kernel crates/rlx-moonshine-mcu/target/riscv32imafc-unknown-none-elf/release/moonshine-mcu
+
+# Citrinet-256 for MCUs (rlx-citrinet-core): export .rct and compare int8 with the f32 reference.
+citrinet-mcu-check WAV="assets/harness/jfk_16k.wav" *ARGS:
+    mkdir -p .cache/citrinet-mcu
+    cargo run -p rlx-citrinet --release --example mcu_check -- --nemo .cache/citrinet/stt_en_citrinet_256_ls.nemo --wav {{WAV}} --out .cache/citrinet-mcu/c256-int8.rct {{ARGS}}
+
+# Citrinet firmware on QEMU rv32imafc: bit-identity + instruction count.
+citrinet-mcu-qemu:
+    cd crates/rlx-citrinet-mcu && cargo build --release
+    qemu-system-riscv32 -machine virt -m 64M -bios none -nographic -plugin crates/rlx-ten-vad-mcu/libinsn.dylib \
+        -kernel crates/rlx-citrinet-mcu/target/riscv32imafc-unknown-none-elf/release/citrinet-mcu
+
+# Writes .cache/citrinet-mcu/splitN/stage<i>ofN.rct; `--cuts 0,7,23` sets the boundaries by hand.
+# Citrinet as STAGES balanced pipeline stages: plan + check the chained stages give the whole model's bits.
+citrinet-mcu-split STAGES="2" *ARGS:
+    cargo run -p rlx-citrinet --release --example mcu_split -- \
+        --nemo .cache/citrinet/stt_en_citrinet_256_ls.nemo --stages {{STAGES}} \
+        --out-dir .cache/citrinet-mcu/split{{STAGES}} {{ARGS}}
+
+# QEMU MPS2 AN505; model in external flash, scratch in 768 KB RAM, long audio cut at pauses. Regenerate
+# crates/rlx-citrinet-nrf54h/data with `--example mcu_vectors -- ... --f32s 180224 --i8s 4096`.
+# Citrinet on the nRF54H20 app core (Cortex-M33 + DSP): bit-identity + instruction count.
+citrinet-nrf54h-qemu *ARGS:
+    cd crates/rlx-citrinet-nrf54h && cargo build --release {{ARGS}}
+    qemu-system-arm -machine mps2-an505 -nographic -semihosting-config enable=on,target=native \
+        -plugin crates/rlx-ten-vad-mcu/libinsn.dylib \
+        -kernel crates/rlx-citrinet-nrf54h/target/thumbv8m.main-none-eabihf/release/citrinet-nrf54h
+
+# Citrinet across STAGES simulated nRF54H20s, one QEMU per stage, chained UART to UART.
+citrinet-nrf54h-pipeline STAGES="2": (citrinet-mcu-split STAGES)
+    crates/rlx-citrinet-nrf54h/qemu-pipeline.sh $(for i in $(seq 0 $(({{STAGES}} - 1))); do \
+        echo .cache/citrinet-mcu/split{{STAGES}}/stage${i}of{{STAGES}}.rct; done)
+
+# Kroko-L for MCUs with NAND-paged layers (rlx-kroko-core): export .rkr (BITS 8 or 4) and run on a clip.
+kroko-mcu-check WAV="assets/harness/jfk_16k.wav" BITS="4" *ARGS:
+    mkdir -p .cache/kroko-mcu
+    cargo run -p rlx-kroko --release --example mcu_check -- --dir .cache/kroko/en64-native --wav {{WAV}} --bits {{BITS}} --out .cache/kroko-mcu/en64-int{{BITS}}.rkr {{ARGS}}
+
+# Compare every Kroko chunk (and the tokens) with Kroko's own encoder.onnx in onnxruntime.
+kroko-mcu-onnx-reference WAV="assets/harness/jfk_16k.wav" BITS="4":
+    cargo run -p rlx-kroko --release --example mcu_check -- --dir .cache/kroko/en64-native --wav {{WAV}} --bits {{BITS}} --dump /tmp/kroko-mcu-dump
+    python3 scripts/kroko_onnx_reference.py .cache/kroko/en64 /tmp/kroko-mcu-dump
+
+# Kroko firmware on QEMU rv32imafc (256 MiB): bit-identity with paged layers + instruction count.
+kroko-mcu-qemu:
+    cd crates/rlx-kroko-mcu && cargo build --release
+    qemu-system-riscv32 -machine virt -m 256M -bios none -nographic -plugin crates/rlx-ten-vad-mcu/libinsn.dylib \
+        -kernel crates/rlx-kroko-mcu/target/riscv32imafc-unknown-none-elf/release/kroko-mcu
+
+# Fetch icefall's streaming Zipformer2 (medium, 66M, LibriSpeech; sherpa-onnx int8 export) and convert it
+# for rlx-kroko (scripts/sherpa_zipformer_to_kroko.py wraps audio.cpp's converter).
+fetch-zipformer-m:
+    mkdir -p .cache/zipformer-m/onnx
+    for f in encoder decoder joiner; do curl -sL -o .cache/zipformer-m/onnx/$f-epoch-99-avg-1-chunk-16-left-64.int8.onnx \
+        https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-26/resolve/main/$f-epoch-99-avg-1-chunk-16-left-64.int8.onnx; done
+    curl -sL -o .cache/zipformer-m/onnx/bpe.model \
+        https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-26/resolve/main/bpe.model
+    python3 -I scripts/sherpa_zipformer_to_kroko.py --converter ../audio.cpp/tools/community_models/convert_kroko_onnx.py \
+        --encoder .cache/zipformer-m/onnx/encoder-epoch-99-avg-1-chunk-16-left-64.int8.onnx \
+        --decoder .cache/zipformer-m/onnx/decoder-epoch-99-avg-1-chunk-16-left-64.int8.onnx \
+        --joiner .cache/zipformer-m/onnx/joiner-epoch-99-avg-1-chunk-16-left-64.int8.onnx \
+        --bpe .cache/zipformer-m/onnx/bpe.model .cache/zipformer-m/native
+
+# The streaming medium Zipformer2 through the Kroko no_std core (320 ms chunks, fixed memory): export + JFK.
+zipformer-m-check WAV="assets/harness/jfk_16k.wav" BITS="4" *ARGS:
+    cargo run -p rlx-kroko --release --example mcu_check -- --dir .cache/zipformer-m/native \
+        --wav {{WAV}} --bits {{BITS}} --out .cache/zipformer-m/m-int{{BITS}}.rkr {{ARGS}}
+
+# Distillation targets for the 10M student: LibriSpeech audio → fbank → teacher encoder output on 8-chunk windows.
+zipformer-distill-prep AUDIO="weights/asr/LibriSpeech/train-clean-100" HOURS="20" OUT=".cache/zipformer-distill":
+    cargo run -p rlx-zipformer-distill --release --bin zipformer-distill-prep -- \
+        --rkr .cache/zipformer-m/m-int8.rkr --audio {{AUDIO}} --hours {{HOURS}} --chunks 8 --out {{OUT}}
+    cargo run -p rlx-zipformer-distill --release --bin zipformer-distill-prep -- \
+        --contexts --teacher .cache/zipformer-m/native --data {{OUT}}
+
+# Train the ~10M streaming Zipformer2 student with RLX (distilled from the medium model) → .cache/zipformer-s.
+# Uses every local device automatically; add `--cluster` to also train with every
+# `just zipformer-distill-worker` on the LAN. FEATURES = the backends to build (metal, rocm, cuda, …).
+zipformer-distill-train DATA=".cache/zipformer-distill" FEATURES="metal" *ARGS:
+    cargo run -p rlx-zipformer-distill --release --no-default-features --features {{FEATURES}} \
+        --bin zipformer-distill-train -- \
+        --teacher .cache/zipformer-m/native --data {{DATA}} --out .cache/zipformer-s {{ARGS}}
+
+# Join a training job as a worker: finds the coordinator (`zipformer-distill-train … --cluster`)
+# on the LAN and trains on this machine's devices. Needs no data or teacher.
+zipformer-distill-worker FEATURES="metal" *ARGS:
+    cargo run -p rlx-zipformer-distill --release --no-default-features --features {{FEATURES}} \
+        --bin zipformer-distill-train -- --worker {{ARGS}}
+
+# Student encoder inference throughput on the local devices, picked automatically (random weights, no data).
+zipformer-distill-throughput FEATURES="metal" BATCH="32" *ARGS:
+    cargo run -p rlx-zipformer-distill --release --no-default-features --features {{FEATURES}} \
+        --example throughput -- --batch {{BATCH}} {{ARGS}}
+
+# Check the RLX student graph against rlx-kroko-core (teacher config + weights, JFK).
+zipformer-distill-graph-check *ARGS:
+    cargo run -p rlx-zipformer-distill --release --example graph_check -- \
+        --teacher .cache/zipformer-m/native --rkr .cache/zipformer-m/m-int8.rkr {{ARGS}}
+
+# The same on the bare-metal rv32 firmware (needs `just zipformer-m-check` with BITS=4 first).
+zipformer-m-qemu:
+    cargo run -p rlx-kroko --release --example mcu_vectors -- --rkr .cache/zipformer-m/m-int4.rkr \
+        --wav assets/harness/jfk_16k.wav --out .cache/zipformer-m/vectors-int4
+    cd crates/rlx-kroko-mcu && RKR_MODEL=$PWD/../../.cache/zipformer-m/m-int4.rkr \
+        RKR_DATA=$PWD/../../.cache/zipformer-m/vectors-int4 cargo build --release
+    qemu-system-riscv32 -machine virt -m 256M -bios none -nographic -plugin crates/rlx-ten-vad-mcu/libinsn.dylib \
+        -kernel crates/rlx-kroko-mcu/target/riscv32imafc-unknown-none-elf/release/kroko-mcu
+
+# Measures radio duty, speech kept, WER vs clean ASR; `--json duty.json` feeds voice-link-energy.
+# Wearable day through the low-power link: device energy gate → BLE packets → phone TEN-VAD confirm/reject → ASR.
+voice-link-wearable-sim LIST="/tmp/ls-dev-clean/list.tsv" *ARGS:
+    cargo run -p rlx-voice-link-host --release --example wearable_sim -- \
+        --rcc .cache/conformer-ctc-mcu/small-int8.rcc --list {{LIST}} {{ARGS}}
+
+# Average device current and battery life: streaming vs gated vs wake-on-sound mic vs on-device ASR (M33, Ethos-U55).
+voice-link-energy DUTY="/tmp/duty.json" *ARGS:
+    cargo run -p rlx-voice-link-host --release --example energy_model -- --duty {{DUTY}} {{ARGS}}
+
+# Instructions per 16 ms frame on a Cortex-M4F (nRF52840 core): voice gate, ADPCM, TEN-VAD (QEMU + profile plugin).
+voice-link-bench:
+    cd crates/rlx-voice-link-bench && cargo build --release
+    qemu-system-arm -machine mps2-an505 -nographic -semihosting-config enable=on,target=native \
+        -plugin crates/rlx-citrinet-nrf54h/tools/libpcprof.dylib,out=/tmp/voice-link-bench.txt \
+        -kernel crates/rlx-voice-link-bench/target/thumbv7em-none-eabihf/release/voice-link-bench
+    python3 crates/rlx-citrinet-nrf54h/tools/pcprof.py \
+        crates/rlx-voice-link-bench/target/thumbv7em-none-eabihf/release/voice-link-bench /tmp/voice-link-bench.txt 12
+
+# BLE voice link (nRF52840 mic → Mac/iPhone ASR + LM): the whole chain without a radio.
+voice-link-simulate WAV="assets/harness/jfk_16k.wav" *ARGS:
+    cargo run -p rlx-voice-link-host --release -- simulate --rcc .cache/conformer-ctc-mcu/small-int8.rcc --wav {{WAV}} {{ARGS}}
+
+# End-to-end demo, no hardware: simulated nRF52840 → lossy radio → phone ASR → optional LM.
+voice-link-demo *ARGS:
+    cargo run -p rlx-voice-link-host --release --example voice_link_demo -- {{ARGS}}
+
+# Receive from the nRF52840 over BLE on this Mac (Enter = push-to-talk); pass --lm-url … for an LM.
+voice-link-listen *ARGS:
+    cargo run -p rlx-voice-link-host --release -- listen --rcc .cache/conformer-ctc-mcu/small-int8.rcc {{ARGS}}
+
+# Flash the nRF52840 firmware over SWD (probe-rs); FEATURES=board-nano33 for the Arduino board.
+voice-link-nrf-flash FEATURES="board-xiao":
+    cd crates/rlx-voice-link-nrf && cargo run --release --no-default-features --features {{FEATURES}}
+
+# Swift package binary (iOS device + simulator + macOS); IOS=0 for macOS only.
+voice-link-xcframework:
+    crates/rlx-voice-link-ffi/scripts/build-xcframework.sh
+
+# Voice-link tests: protocol units, simulated radio, JFK end to end (needs the .rcc; skips without it), firmware lint.
+test-voice-link:
+    cargo test --release -p rlx-voice-link -p rlx-voice-link-ffi -p rlx-voice-link-host
+    cd crates/rlx-voice-link-nrf && cargo clippy --release -- -D warnings
 
 # CUDA on the remote host — set RLX_CUDA_HOST (sync trees + nemo/wav, then cpu+cuda matrix).
 conformer-ctc-cuda-remote:
@@ -4375,3 +4591,35 @@ web-models-selftest MODEL="moonshine-streaming-tiny": (web-models-build "web")
 # Timing in a headless browser: BROWSER chrome | firefox, BACKEND cpu | webgpu | webgl.
 web-models-bench MODEL="moonshine-streaming-tiny" BACKEND="webgpu" BROWSER="chrome": (web-models-build "web")
     crates/rlx-models-web/web/run_page.sh {{BROWSER}} "bench.html?model={{MODEL}}&backend={{BACKEND}}&runs=3" 900
+
+# LiquidAI LFM3-Audio-2B GGUF: the Q4_K_M LM + F16 mmproj (~1.7 GB). QUANT picks
+# the LM (Q4_0, Q4_K_M, Q8_0, F16, BF16); F16 is what the parity test runs.
+fetch-lfm3-audio QUANT="Q4_K_M" MMPROJ="F16":
+    hf download LiquidAI/LFM3-Audio-2B-GGUF LFM3-Audio-2B-{{QUANT}}.gguf mmproj-LFM3-Audio-2B-{{MMPROJ}}.gguf --local-dir weights/lm/lfm3-audio-2b-gguf
+
+# The bf16 checkpoint (4 GB + codec) — only needed to regenerate the parity reference.
+fetch-lfm3-audio-hf:
+    hf download LiquidAI/LFM3-Audio-2B --local-dir weights/lm/lfm3-audio-2b
+
+# `just lfm3-audio asr --wav clip.wav`, `just lfm3-audio tts --text "Hi." -o hi.wav`,
+# `just lfm3-audio chat --wav q.wav --speak` (add `--device metal` with features=metal).
+lfm3-audio *ARGS:
+    cargo run -p rlx-lfm3-audio --release {{feature_args}} -- {{ARGS}}
+
+# Stage-by-stage parity vs `scripts/lfm3_audio_reference.py` (mel, encoder, LM,
+# greedy ASR, depth decoder, greedy TTS, codec) on the F16 LM.
+test-lfm3-audio-parity DEVICE="cpu":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dir="$PWD/weights/lm/lfm3-audio-2b-gguf"
+    [ -f "$dir/LFM3-Audio-2B-F16.gguf" ] || just fetch-lfm3-audio F16
+    LFM3_AUDIO_DEVICE={{DEVICE}} LFM3_AUDIO_GGUF="$dir" \
+        cargo test -p rlx-lfm3-audio --release {{feature_args}} --test reference_parity -- --nocapture --test-threads=1
+
+# LFM3-Audio iOS app (crates/rlx-lfm3-audio-ffi/ios): build the Rust library +
+# app, install, copy the Q4_K_M LM + Q8_0 mmproj, run the self-test.
+lfm3-audio-ios-sim SIM="booted":
+    crates/rlx-lfm3-audio-ffi/ios/run.sh sim {{SIM}}
+
+lfm3-audio-ios DEVICE TEAM:
+    TEAM={{TEAM}} crates/rlx-lfm3-audio-ffi/ios/run.sh device {{DEVICE}}

@@ -8,6 +8,9 @@ bytes with the real routing decisions rather than a synthetic stand-in.
 
     python3 dump_real_moe.py --layer 0 --out-weights /tmp/moe.safetensors \
         --out-ref ../../tests/fixtures/dsv41_real_moe_ref.json
+
+For another release set `DSV41_REPO` and write `--out-ref` into that revision's
+fixture directory (`tests/fixtures/dsv41_1017/` for the -1017 update).
 """
 
 import argparse
@@ -17,7 +20,7 @@ import struct
 import numpy as np
 import torch
 
-from fetch_subset import BASE, INDEX, curl, header
+from fetch_subset import BASE, INDEX, curl, header, stamp_dir
 
 # e2m1 nibbles are 4 bits *including* the sign, so the table is 16 wide —
 # indexing an 8-entry magnitude table drops every negative weight.
@@ -84,6 +87,7 @@ def main() -> None:
     ap.add_argument("--out-weights", required=True)
     ap.add_argument("--out-ref", required=True)
     a = ap.parse_args()
+    stamp_dir(a.out_weights)
 
     cfg = json.load(open("config.json"))
     t = cfg.get("text_config", cfg)

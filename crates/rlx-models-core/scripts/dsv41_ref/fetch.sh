@@ -6,7 +6,9 @@
 # currently says, and a stale vendored copy would quietly stop doing that.
 set -euo pipefail
 cd "$(dirname "$0")"
-REPO="https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/raw/main"
+# DSV41_REPO picks the release (default deepseek-ai/DeepSeek-V4.1-Flash; the
+# -1017 update ships the same inference code and config).
+REPO="https://huggingface.co/${DSV41_REPO:-deepseek-ai/DeepSeek-V4.1-Flash}/raw/main"
 BASE="$REPO/inference"
 for f in model.py engram.py vision.py image_processor.py; do
   echo "fetching $f"

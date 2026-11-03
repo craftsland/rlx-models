@@ -129,9 +129,9 @@ fn resolve_prompt_ids(
     }
     let text = prompt.ok_or_else(|| anyhow!("provide --prompt or --prompt-ids"))?;
     if gguf.is_dir() {
-        rlx_qwen35::encode_prompt_auto(gguf, None, text)
+        rlx_core::tokenizer::encode_prompt_auto(gguf, None, text)
     } else {
-        rlx_qwen35::encode_prompt_from_gguf(gguf, text)
+        rlx_core::tokenizer::encode_prompt_from_gguf(gguf, text)
     }
 }
 
@@ -189,9 +189,9 @@ fn generate(
 #[cfg(feature = "tokenizer")]
 fn detokenize(weights: &std::path::Path, ids: &[u32], skip_special: bool) -> Result<String> {
     if weights.is_dir() {
-        rlx_qwen35::decode_ids_auto(weights, None, ids, skip_special)
+        rlx_core::tokenizer::decode_ids_auto(weights, None, ids, skip_special)
     } else {
-        rlx_qwen35::decode_ids_from_gguf(weights, ids, skip_special)
+        rlx_core::tokenizer::decode_ids_from_gguf(weights, ids, skip_special)
     }
 }
 

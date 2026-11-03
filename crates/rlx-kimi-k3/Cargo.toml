@@ -24,7 +24,7 @@ rlx-llada2 = { workspace = true }
 rlx-distributed = { workspace = true }
 # Training (LoRA injection, optimizers, data-parallel gradient reduction) and
 # the layer VJPs the streamed trainer chains.
-rlx-tune = { path = "../rlx-tune", version = "0.2.19" }
+rlx-tune = { path = "../rlx-tune", version = "0.2.20" }
 rlx-autodiff = { workspace = true }
 rlx-optim = { workspace = true }
 serde = { workspace = true }

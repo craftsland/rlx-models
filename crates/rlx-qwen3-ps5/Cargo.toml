@@ -1,6 +1,6 @@
 [package]
 name = "rlx-qwen3-ps5"
-version = "0.2.19"
+version = "0.2.20"
 edition = "2024"
 publish = false
 license = "GPL-3.0-only"
@@ -17,7 +17,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 rlx-qwen3 = { path = "../rlx-qwen3" }
-rlx-gguf = "^0.2.19"
+rlx-gguf = "^0.2.20"
 # The PS5 platform layer (thread count, weight locking, _exit, compat shims,
 # portable-gemm). Expects rlx checked out next to rlx-models.
 rlx-ps5 = { path = "../../../rlx/crates/backends/rlx-ps5" }
